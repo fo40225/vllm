@@ -147,6 +147,7 @@ if TYPE_CHECKING:
     VLLM_MUSE_SPARK_SM120_DECODE_MAX_TOKENS: int = 128
     VLLM_MUSE_SPARK_SM120_EXACT_GEMM1: bool = True
     VLLM_MUSE_SPARK_SM120_PREFILL_LOCAL_ROWS: bool = True
+    VLLM_MUSE_SPARK_SM120_PREFILL_LATENT_FP4: bool = True
     VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL: bool | None = True
     VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_MIN_TOKENS: int = 512
     VLLM_MUSE_SPARK_SM120_L2_PREFETCH: bool = True
@@ -1374,6 +1375,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # engine or the exact GEMM1 loads it). Read once, when a layer is constructed.
     "VLLM_MUSE_SPARK_SM120_PREFILL_LOCAL_ROWS": lambda: bool(
         int(os.getenv("VLLM_MUSE_SPARK_SM120_PREFILL_LOCAL_ROWS", "1"))
+    ),
+    # Muse Spark on SM120 with the sequence-parallel stream: quantize the pooled
+    # latent (after the pre-expert norm) to NVFP4 on the rank that owns the rows and
+    # all-gather the packed fp4 codes and e4m3 block scales (2304 B per row) in place
+    # of the bf16 latent (8192 B per row), which the experts would quantize anyway:
+    # a third of the all-gather traffic of a prefill step goes away. The quantization
+    # of a row depends on the row alone (one static global scale), so the experts get
+    # the bytes they would have made: bitwise identical results. The BF16 layers keep
+    # the bf16 gather. Needs the local-rows prefill path (the flag above) and the
+    # _muse_C extension; a layer without them gathers bf16. 0 gathers bf16
+    # everywhere. Read when the first sequence-parallel batch runs.
+    "VLLM_MUSE_SPARK_SM120_PREFILL_LATENT_FP4": lambda: bool(
+        int(os.getenv("VLLM_MUSE_SPARK_SM120_PREFILL_LATENT_FP4", "1"))
     ),
     # Muse Spark on SM120 with expert parallel: keep the residual stream sharded
     # along the sequence for large prefill batches. Attention output and expert

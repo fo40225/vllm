@@ -29,9 +29,11 @@ from vllm.models.muse_spark.common.layers import (
     MuseSpark1xRMSNormWithInputScale,
 )
 from vllm.models.muse_spark.nvidia import model as muse_model
+from vllm.models.muse_spark.nvidia.ops import muse_c
 from vllm.platforms import current_platform
 
 FLAG = "VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL"
+LATENT_FP4 = "VLLM_MUSE_SPARK_SM120_PREFILL_LATENT_FP4"
 MIN_TOKENS = "VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_MIN_TOKENS"
 
 
@@ -898,6 +900,16 @@ def _sharded_branch_worker(rank: int, world: int, port: int, out_path: str) -> N
         initialize_model_parallel(tensor_model_parallel_size=world)
     init_workspace_manager(torch.device("cuda", rank))
     expert_bias = torch.linspace(-0.5, 0.5, E, dtype=torch.float32, device="cuda")
+    # The packed latent needs the local-rows path, which needs the extension.
+    muse_c.load()
+    packed_calls: list[int] = []
+    gather_packed = muse_c.gather_packed_fp4_experts
+
+    def spy(*args, **kwargs):
+        packed_calls.append(1)
+        return gather_packed(*args, **kwargs)
+
+    muse_c.gather_packed_fp4_experts = spy
 
     results = {}
     for kind in BRANCH_KINDS:
@@ -940,6 +952,10 @@ def _sharded_branch_worker(rank: int, world: int, port: int, out_path: str) -> N
             moe_router=router,
             router=gate,
             experts=runner,
+            _latent_scale=muse_model._UNDECIDED,
+        )
+        layer._packed_latent_scale = lambda layer=layer: (
+            muse_model.MuseSpark1xMoE._packed_latent_scale(layer)
         )
 
         def sharded(local, num_tokens, layer=layer, router_input=None):
@@ -966,8 +982,16 @@ def _sharded_branch_worker(rank: int, world: int, port: int, out_path: str) -> N
                 rows = -(-num_tokens // world)
                 padded = F.pad(x, (0, 0, 0, rows * world - num_tokens))
                 local = padded[rank * rows : (rank + 1) * rows].contiguous()
+                packed_calls.clear()
                 first = sharded(local, num_tokens)
                 second = sharded(local, num_tokens)
+                packed_used = len(packed_calls)
+                # The same rows with the bf16 latent gathered, as the flag off does.
+                layer._latent_scale = muse_model._UNDECIDED
+                os.environ[LATENT_FP4] = "0"
+                bf16_latent = sharded(local, num_tokens)
+                os.environ[LATENT_FP4] = "1"
+                layer._latent_scale = muse_model._UNDECIDED
                 # The boundary kernel's fp32 copy of the rows is what the router
                 # would cast itself.
                 widened = sharded(local, num_tokens, router_input=local.float())
@@ -991,6 +1015,8 @@ def _sharded_branch_worker(rank: int, world: int, port: int, out_path: str) -> N
                 nonzero=float((reference != 0).float().mean()),
                 finite=bool(torch.isfinite(output).all()),
                 deterministic=bool(torch.equal(first, second)),
+                packed_calls=packed_used,
+                packed_equal=bool(torch.equal(first, bf16_latent)),
                 router_input_equal=bool(torch.equal(first, widened)),
                 graph_equal=bool(torch.equal(captured, first)),
                 graph_rel_l2=float(
@@ -1033,6 +1059,15 @@ def test_sharded_branch_matches_the_replicated_one(tmp_path, world: int) -> None
             assert result["graph_equal"], (key, result)
         else:
             assert result["graph_rel_l2"] < 1e-2, (key, result)
+        # The latent gathered as packed NVFP4 is the bf16 latent gathered: the same
+        # bits (for the experts that repeat bitwise), and only the CUTLASS NVFP4
+        # experts take it.
+        if not key.startswith("nvfp4_marlin"):
+            assert result["packed_equal"], (key, result)
+        assert (result["packed_calls"] > 0) == key.startswith("nvfp4_cutlass"), (
+            key,
+            result,
+        )
         # Measured on 8 SM120 GPUs: 3.9e-3 to 4.0e-3 and 5.3e-3 to 6.1e-3, the
         # rounding of the collectives and of the pooled rows (which also moves
         # some FP4 codes of the experts' input).

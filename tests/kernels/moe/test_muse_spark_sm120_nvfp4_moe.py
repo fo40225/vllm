@@ -49,6 +49,7 @@ from vllm.models.muse_spark.nvidia.sm120_nvfp4_moe import (
     exact_gemm1_scales,
     fold_sm120_nvfp4_scales,
     make_sm120_nvfp4_quant_config,
+    packed_nvfp4_input,
     swap_gate_up_halves_,
 )
 from vllm.platforms import current_platform
@@ -1231,6 +1232,87 @@ def _run_experts(
     )
     out = experts.apply(x, topk_ids, topk_weights)
     return out, experts.expert_map, experts.a1_gscale, experts.a2_gscale
+
+
+@pytest.mark.parametrize("exact", [False, True], ids=["folded", "exact"])
+@pytest.mark.parametrize("num_tokens", [16, 700])
+@torch.inference_mode()
+def test_sm120_packed_input_leaves_the_layer_output_bitwise_unchanged(
+    dist_init, workspace_init, monkeypatch, num_tokens, exact
+) -> None:
+    """Activations quantized ahead of a gather (``pack_nvfp4_rows``) and handed to
+    the experts instead of the bf16 rows give the output of the quantization inside
+    the experts, bit for bit, with routes that are local, remote and absent. The
+    bf16 argument is only read for its shape (here it is NaN)."""
+    muse_c.load()
+    problem = _Problem()
+    norm = _make_norm()
+    local_experts = torch.tensor(
+        [1, 2, 4, 7, 8, 11, 13, 14], dtype=torch.long, device="cuda"
+    )
+    remote_experts = torch.tensor(
+        [0, 3, 5, 6, 9, 10, 12, 15], dtype=torch.long, device="cuda"
+    )
+    topk_ids, topk_weights = _routes(num_tokens, 8, remote_experts, remote_tokens=3)
+    x = torch.randn(num_tokens, K, device="cuda").to(torch.bfloat16)
+    experts = _Experts(problem, norm, local_experts, 8, exact=exact)
+    scale = experts.experts.packed_input_scale(K)
+    assert scale is not None and scale.shape == (1,)
+
+    expected = experts.apply(x, topk_ids, topk_weights)
+    seen: list[str] = []
+    for label, name in (
+        ("packed", "gather_packed_fp4_experts"),
+        ("gather", "gather_scaled_fp4_experts_quant"),
+    ):
+
+        def spy(*args, _kernel=getattr(muse_c, name), _label=label, **kwargs):
+            seen.append(_label)
+            return _kernel(*args, **kwargs)
+
+        monkeypatch.setattr(muse_c, name, spy)
+    packed = muse_c.pack_nvfp4_rows(x, scale)
+    with packed_nvfp4_input(packed):
+        actual = experts.apply(torch.full_like(x, torch.nan), topk_ids, topk_weights)
+    assert seen == ["packed"]
+    assert torch.isfinite(actual).all() and actual.abs().max() > 0
+    assert torch.equal(actual, expected)
+    # The packed rows apply to the one call inside the block.
+    assert sm120_nvfp4_moe._PACKED_INPUT.get() is None
+    assert torch.equal(experts.apply(x, topk_ids, topk_weights), expected)
+    assert seen == ["packed", "gather"]
+
+
+@torch.inference_mode()
+def test_sm120_packed_input_scale_needs_one_scale_and_the_local_rows_path(
+    dist_init, workspace_init, monkeypatch
+) -> None:
+    """Quantizing a row once, before the experts pick it up, is the quantization
+    every route of it gets only where the experts agree on the scale (the global max
+    of the input scales, as the layer folds them), which is checked, and where the
+    local-rows path takes the packed rows."""
+    muse_c.load()
+    problem = _Problem()
+    norm = _make_norm()
+    local_experts = torch.arange(E // 2, dtype=torch.long, device="cuda")
+    experts = _Experts(problem, norm, local_experts, 8)
+    inner = experts.experts
+    gscale = inner.a1_gscale
+    assert gscale.numel() == E // 2 and (gscale == gscale[0]).all()
+    scale = inner.packed_input_scale(K)
+    assert scale is not None and torch.equal(scale, gscale[:1])
+    assert inner.packed_input_scale(K) is scale
+    assert inner.packed_input_scale(K + 128) is None
+    inner.local_rows = False
+    assert inner.packed_input_scale(K) is None
+    inner.local_rows = True
+    monkeypatch.setattr(muse_c, "is_loaded", lambda: False)
+    assert inner.packed_input_scale(K) is None
+    monkeypatch.undo()
+    # Experts that differ in their input scale cannot share one quantization.
+    differing = _Experts(problem, norm, local_experts, 8)
+    differing.experts.a1_gscale[1] *= 1.5
+    assert differing.experts.packed_input_scale(K) is None
 
 
 @pytest.mark.parametrize("exact", [True, False], ids=["exact", "folded"])
@@ -2518,6 +2600,143 @@ def test_muse_c_gather_quantization_is_bit_identical_to_the_shuffle(
     assert written.any()
     assert torch.equal(
         wrapped_bytes[: stock_bytes.shape[0]][written], stock_bytes[written]
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("hidden", [256, 1280, 4096])
+@pytest.mark.parametrize("num_rows", [1, 37, 1024])
+@pytest.mark.parametrize("tail", [0, 64])
+@torch.inference_mode()
+def test_muse_c_packed_rows_are_the_stock_quantization(
+    num_rows: int, hidden: int, dtype: torch.dtype, tail: int
+) -> None:
+    """A packed row is the e2m1 codes and then the linear e4m3 scale factors of the
+    stock ``scaled_fp4_quant`` of the row, and a tail the caller reserves is left
+    alone."""
+    muse_c.load()
+    g = torch.Generator(device="cuda").manual_seed(num_rows + hidden)
+    x = torch.randn(
+        num_rows, hidden, device="cuda", generator=g, dtype=torch.float32
+    ).to(dtype)
+    # Rows of very different magnitude (scale factors up to 200 or so, in the range
+    # of an e4m3), and a row of zeros.
+    x *= torch.logspace(-3, 0, num_rows, device="cuda").unsqueeze(1).to(dtype)
+    x[0] = 0
+    gscale = 100 + 200 * torch.rand(1, device="cuda", generator=g, dtype=torch.float32)
+    stock_fp4, stock_sf = ops.scaled_fp4_quant(x, gscale, is_sf_swizzled_layout=False)
+    assert stock_fp4.shape == (num_rows, hidden // 2)
+    assert stock_sf.view(torch.uint8).shape == (num_rows, hidden // 16)
+
+    row_bytes = muse_c.packed_fp4_row_bytes(hidden, tail)
+    assert row_bytes % 16 == 0 and row_bytes >= hidden // 2 + hidden // 16 + tail
+    packed = torch.full((num_rows, row_bytes), 0xA5, dtype=torch.uint8, device="cuda")
+    torch.ops._muse_C.pack_nvfp4_rows(packed, x, gscale)
+    assert torch.equal(packed[:, : hidden // 2], stock_fp4)
+    sf_end = hidden // 2 + hidden // 16
+    assert torch.equal(packed[:, hidden // 2 : sf_end], stock_sf.view(torch.uint8))
+    assert (packed[:, sf_end:] == 0xA5).all()
+    wrapped = muse_c.pack_nvfp4_rows(x, gscale, row_bytes)
+    assert torch.equal(wrapped[:, :sf_end], packed[:, :sf_end])
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("hidden", [256, 512, 4096])
+@pytest.mark.parametrize("num_local_experts", [8, 32])
+@pytest.mark.parametrize("num_tokens", [8, 700, 4096])
+@torch.inference_mode()
+def test_muse_c_gather_packed_is_bit_identical_to_the_gather_quantization(
+    num_tokens: int, num_local_experts: int, hidden: int, dtype: torch.dtype
+) -> None:
+    """Quantizing the token rows before they are gathered, and only moving the
+    packed rows into the permuted order afterwards, gives the bytes of the gather
+    quantization of the unquantized rows when every expert has the one global scale:
+    the codes and the swizzled scale factors, padding included, with experts that
+    own no rows among them and the rows past the local routes left alone."""
+    muse_c.load()
+    g = torch.Generator(device="cuda").manual_seed(num_tokens + hidden)
+    routing = _rank_routing(num_tokens, num_local_experts, hidden, 1024, g)
+    num_routes, local_rows = routing.num_routes, routing.local_rows
+    x = torch.randn(
+        num_tokens, hidden, device="cuda", generator=g, dtype=torch.float32
+    ).to(dtype)
+    x *= torch.logspace(-3, 0, num_tokens, device="cuda").unsqueeze(1).to(dtype)
+    gscale = 100 + 200 * torch.rand(1, device="cuda", generator=g, dtype=torch.float32)
+    scale_rows = num_routes + 128 * num_local_experts
+    sf_cols = hidden // 64
+
+    # Zero-filled, so that the padding no kernel writes compares equal too.
+    want_fp4 = torch.zeros(num_routes, hidden // 2, dtype=torch.uint8, device="cuda")
+    want_sf = torch.zeros(scale_rows, sf_cols, dtype=torch.int32, device="cuda")
+    torch.ops._muse_C.gather_scaled_fp4_experts_quant(
+        want_fp4,
+        want_sf,
+        x,
+        routing.a_map,
+        gscale.expand(num_local_experts).contiguous(),
+        routing.expert_offsets,
+        routing.blockscale_offsets,
+    )
+    assert want_fp4[:local_rows].any() and want_sf.any()
+
+    # The rows travel as eight shards of a gather; the tail is another payload.
+    shards = num_tokens // 8 if num_tokens % 8 == 0 else None
+    row_bytes = muse_c.packed_fp4_row_bytes(hidden, 64)
+    if shards is None:
+        packed = muse_c.pack_nvfp4_rows(x, gscale, row_bytes)
+    else:
+        packed = torch.cat(
+            [muse_c.pack_nvfp4_rows(c, gscale, row_bytes) for c in x.chunk(8)]
+        )
+    # A prefix of a bigger buffer, as the gathered rows of a padded batch are.
+    padded = torch.cat([packed, packed[:5]])
+    for rows in (packed, padded[:num_tokens]):
+        fp4 = torch.zeros_like(want_fp4)
+        sf = torch.zeros_like(want_sf)
+        torch.ops._muse_C.gather_packed_fp4_experts(
+            fp4,
+            sf,
+            rows,
+            routing.a_map,
+            routing.expert_offsets,
+            routing.blockscale_offsets,
+            hidden,
+        )
+        assert torch.equal(fp4, want_fp4)
+        assert torch.equal(sf, want_sf)
+
+    # The rows past the local routes are never touched.
+    fill = 0xA5
+    fp4.fill_(fill)
+    torch.ops._muse_C.gather_packed_fp4_experts(
+        fp4,
+        sf,
+        packed,
+        routing.a_map,
+        routing.expert_offsets,
+        routing.blockscale_offsets,
+        hidden,
+    )
+    assert torch.equal(fp4[:local_rows], want_fp4[:local_rows])
+    assert (fp4[local_rows:] == fill).all()
+
+    # The wrapper allocates the scale buffer; the bytes the kernel writes are the same.
+    wrapped_fp4, wrapped_sf = muse_c.gather_packed_fp4_experts(
+        packed,
+        routing.a_map,
+        num_local_experts,
+        hidden,
+        routing.expert_offsets,
+        routing.blockscale_offsets,
+    )
+    assert wrapped_sf.dtype == torch.float8_e4m3fn
+    assert torch.equal(wrapped_fp4[:local_rows], want_fp4[:local_rows])
+    want_bytes = want_sf.view(torch.uint8)
+    wrapped_bytes = wrapped_sf.view(torch.uint8).view(-1, sf_cols * 4)
+    written = want_bytes != 0
+    assert written.any()
+    assert torch.equal(
+        wrapped_bytes[: want_bytes.shape[0]][written], want_bytes[written]
     )
 
 

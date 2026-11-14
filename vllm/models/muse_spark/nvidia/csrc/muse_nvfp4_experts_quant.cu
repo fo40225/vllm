@@ -28,6 +28,13 @@
 // activation matrix straight from the token rows instead of from a shuffled
 // copy. It runs the same per-element arithmetic, so its bytes are those of the
 // stock quantization of the shuffled copy.
+//
+// The last pair (pack_nvfp4_rows / gather_packed_fp4_experts) splits that
+// quantization around a collective: the rows are quantized once on the rank
+// that owns them, travel as packed fp4 codes plus linear fp8 scales, and the
+// consumer only moves the bytes into the permuted rows and the swizzled
+// scale-factor layout. The quantization of a row does not depend on the expert
+// (one static global scale), so the bytes equal those of the gather variant.
 
 // Only c10 headers: <ATen/cuda/CUDAContext.h> needs cusparse.h and cusolverDn.h,
 // which the stock runtime images do not ship.
@@ -474,6 +481,133 @@ void gather_quant_impl(void* output, void* output_scale, void* input,
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+// NVFP4 quantization of dense rows into a packed wire format: row r of `out`
+// (row_stride bytes) holds the numCols / 2 bytes of fp4 codes, then the numCols / 16
+// linear (row-major, unswizzled) e4m3 scale factors, then whatever the caller keeps
+// in the tail. The arithmetic is that of cvt_gather_to_fp4 with one global scale.
+//
+// A block handles whole rows (grid-stride) and every thread converts 8 elements
+// per row. The block size divides the row width, so each warp is wholly inside
+// or outside a row (the scale factor needs the max of a thread pair).
+template <class Type>
+__global__ void __launch_bounds__(512)
+    cvt_rows_to_packed_fp4(int32_t numRows, int32_t numCols, Type const* in,
+                           float const* SFScale, uint8_t* out,
+                           int64_t rowStride) {
+  using PackedVec = PackedVec<Type>;
+  static constexpr int CVT_FP4_NUM_THREADS_PER_SF =
+      (CVT_FP4_SF_VEC_SIZE / CVT_FP4_ELTS_PER_THREAD);
+  static_assert(sizeof(PackedVec) == sizeof(Type) * CVT_FP4_ELTS_PER_THREAD,
+                "Vec size is not matched.");
+
+  int const colsPerRow = numCols / CVT_FP4_ELTS_PER_THREAD;
+  float const SFScaleVal = SFScale[0];
+  for (int row = blockIdx.x; row < numRows; row += gridDim.x) {
+    uint8_t* row_out = out + static_cast<int64_t>(row) * rowStride;
+    uint8_t* row_sf = row_out + numCols / 2;
+    for (int colIdx = threadIdx.x; colIdx < colsPerRow; colIdx += blockDim.x) {
+      PackedVec in_vec =
+          reinterpret_cast<PackedVec const*>(in)[static_cast<int64_t>(row) *
+                                                     colsPerRow +
+                                                 colIdx];
+      // One thread of a pair writes the scale factor (the block size is even,
+      // so the parity of the thread is that of the column).
+      uint8_t* sf_out =
+          threadIdx.x % CVT_FP4_NUM_THREADS_PER_SF == 0
+              ? row_sf + colIdx / CVT_FP4_NUM_THREADS_PER_SF
+              : nullptr;
+      reinterpret_cast<uint32_t*>(row_out)[colIdx] =
+          cvt_warp_fp16_to_fp4<Type, CVT_FP4_NUM_THREADS_PER_SF>(
+              in_vec, SFScaleVal, sf_out);
+    }
+  }
+}
+
+template <typename T>
+void pack_rows_impl(void* packed, void* input, void* input_global_scale,
+                    int num_rows, int k, int64_t row_stride,
+                    int multiProcessorCount, cudaStream_t stream) {
+  if (num_rows == 0) {
+    return;
+  }
+  int const colsPerRow = k / CVT_FP4_ELTS_PER_THREAD;
+  // The largest power of two <= 512 that divides the row width (the caller
+  // checked that it is a multiple of 32).
+  int block = 512;
+  while (colsPerRow % block != 0) {
+    block >>= 1;
+  }
+  int const grid = std::min(num_rows, multiProcessorCount * 8);
+  cvt_rows_to_packed_fp4<T><<<grid, block, 0, stream>>>(
+      num_rows, k, reinterpret_cast<T*>(input),
+      reinterpret_cast<float*>(input_global_scale),
+      reinterpret_cast<uint8_t*>(packed), row_stride);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// Row r of the experts' activations from the packed rows of cvt_rows_to_packed_fp4:
+// the fp4 codes of row `row_map[r]` go to `out` row r, and its scale factors to
+// the swizzled layout of the expert that owns row r (the layout of
+// cvt_quant_to_fp4_get_sf_out_offset, written as the 4 scale factors of one
+// k-tile at a time). Only the first input_offset_by_experts[n_experts] rows are
+// written. A block of 128 threads handles one row at a time.
+__global__ void __launch_bounds__(128)
+    gather_packed_to_fp4(int32_t numRows, int32_t numCols,
+                         uint8_t const* packed, int64_t packedStride,
+                         int32_t const* rowMap, uint8_t* out, uint32_t* SFout,
+                         int32_t const* input_offset_by_experts,
+                         int32_t const* output_scale_offset_by_experts,
+                         int n_experts) {
+  extern __shared__ int32_t shared_row_starts[];
+  for (int i = threadIdx.x; i <= n_experts; i += blockDim.x) {
+    shared_row_starts[i] = input_offset_by_experts[i];
+  }
+  __syncthreads();
+
+  int32_t const numKTiles = (numCols + 63) / 64;
+  int const codeVecs = numCols / 32;  // 16 B vectors of fp4 codes per row
+  int32_t const numValidRows = min(numRows, shared_row_starts[n_experts]);
+
+  for (int row = blockIdx.x; row < numValidRows; row += gridDim.x) {
+    // The expert of the row: the last one that starts at or before it (an
+    // expert without rows shares its start with the next one).
+    int left = 0, right = n_experts - 1;
+    while (left < right) {
+      int mid = (left + right + 1) >> 1;
+      if (shared_row_starts[mid] <= row) {
+        left = mid;
+      } else {
+        right = mid - 1;
+      }
+    }
+    int const expert_idx = left;
+    int32_t const mIdx = row - shared_row_starts[expert_idx];
+    uint8_t const* src =
+        packed + static_cast<int64_t>(rowMap[row]) * packedStride;
+    uint32_t* SFout_in_expert =
+        SFout + static_cast<uint32_t>(output_scale_offset_by_experts[expert_idx]) *
+                    numKTiles;
+    int32_t const mTileIdx = mIdx >> 7;
+    int32_t const outerMIdx = mIdx & 31;
+    int32_t const innerMIdx = (mIdx >> 5) & 3;
+
+    for (int v = threadIdx.x; v < codeVecs; v += blockDim.x) {
+      reinterpret_cast<int4*>(out + static_cast<int64_t>(row) * (numCols / 2))[v] =
+          reinterpret_cast<int4 const*>(src)[v];
+    }
+    uint32_t const* src_sf = reinterpret_cast<uint32_t const*>(src + numCols / 2);
+    for (int kTile = threadIdx.x; kTile < numKTiles; kTile += blockDim.x) {
+      // Byte offset (mTile * numKTiles + kTile) * 512 + outerM * 16 + innerM * 4
+      // of the 4 scale factors kTile * 4 .. kTile * 4 + 3, as a word index.
+      int64_t const word =
+          (((static_cast<int64_t>(mTileIdx) * numKTiles + kTile) << 9) |
+           (outerMIdx << 4) | (innerMIdx << 2)) >>
+          2;
+      SFout_in_expert[word] = src_sf[kTile];
+    }
+  }
+}
+
 #define MUSE_CHECK_INPUT(x, m)                          \
   TORCH_CHECK(x.is_cuda(), m, " must be a CUDA tensor"); \
   TORCH_CHECK(x.is_contiguous(), m, " must be contiguous");
@@ -644,6 +778,104 @@ void gather_scaled_fp4_experts_quant(
         output_scale_offset_by_experts.data_ptr(), m_topk, k, n_experts,
         multiProcessorCount, stream);
   }
+}
+
+void pack_nvfp4_rows(at::Tensor& packed, at::Tensor const& input,
+                     at::Tensor const& input_global_scale) {
+  MUSE_CHECK_INPUT(packed, "packed");
+  MUSE_CHECK_INPUT(input, "input");
+  MUSE_CHECK_INPUT(input_global_scale, "input_global_scale");
+  TORCH_CHECK(input.dim() == 2 && packed.dim() == 2, "input and packed must be 2D");
+  TORCH_CHECK(packed.device() == input.device() &&
+                  input_global_scale.device() == input.device(),
+              "all tensors must be on the same device");
+  TORCH_CHECK(input.scalar_type() == at::kHalf ||
+              input.scalar_type() == at::kBFloat16);
+  TORCH_CHECK(input_global_scale.scalar_type() == at::kFloat &&
+                  input_global_scale.numel() == 1,
+              "input_global_scale must be one float");
+  TORCH_CHECK(packed.scalar_type() == at::kByte, "packed must be uint8");
+  auto const num_rows = input.size(0);
+  auto const k = input.size(1);
+  TORCH_CHECK((k / CVT_FP4_ELTS_PER_THREAD) % 32 == 0,
+              "k must be a multiple of 256");
+  TORCH_CHECK(packed.size(0) == num_rows, "packed must have one row per row");
+  TORCH_CHECK(packed.size(1) >= k / 2 + k / CVT_FP4_SF_VEC_SIZE &&
+                  packed.size(1) % 16 == 0,
+              "a packed row holds k / 2 code bytes and k / 16 scale bytes, and "
+              "its width is a multiple of 16");
+
+  const c10::cuda::CUDAGuard device_guard(input.device());
+  const cudaStream_t stream =
+      c10::cuda::getCurrentCUDAStream(input.get_device()).stream();
+  int const multiProcessorCount = multi_processor_count(input.get_device());
+  if (input.scalar_type() == at::kHalf) {
+    pack_rows_impl<half>(packed.data_ptr(), input.data_ptr(),
+                         input_global_scale.data_ptr(), num_rows, k,
+                         packed.size(1), multiProcessorCount, stream);
+  } else {
+    pack_rows_impl<__nv_bfloat16>(packed.data_ptr(), input.data_ptr(),
+                                  input_global_scale.data_ptr(), num_rows, k,
+                                  packed.size(1), multiProcessorCount, stream);
+  }
+}
+
+void gather_packed_fp4_experts(
+    at::Tensor& output, at::Tensor& output_scale, at::Tensor const& packed,
+    at::Tensor const& row_map, at::Tensor const& input_offset_by_experts,
+    at::Tensor const& output_scale_offset_by_experts, int64_t k) {
+  MUSE_CHECK_INPUT(output, "output");
+  MUSE_CHECK_INPUT(output_scale, "output_scale");
+  MUSE_CHECK_INPUT(packed, "packed");
+  MUSE_CHECK_INPUT(row_map, "row_map");
+  MUSE_CHECK_INPUT(input_offset_by_experts, "input_offset_by_experts");
+  MUSE_CHECK_INPUT(output_scale_offset_by_experts,
+                   "output_scale_offset_by_experts");
+  TORCH_CHECK(output.device() == packed.device() &&
+                  output_scale.device() == packed.device() &&
+                  row_map.device() == packed.device() &&
+                  input_offset_by_experts.device() == packed.device() &&
+                  output_scale_offset_by_experts.device() == packed.device(),
+              "all tensors must be on the same device");
+  TORCH_CHECK(packed.dim() == 2 && output.dim() == 2 && output_scale.dim() == 2 &&
+              row_map.dim() == 1 && input_offset_by_experts.dim() == 1 &&
+              output_scale_offset_by_experts.dim() == 1);
+  TORCH_CHECK(packed.scalar_type() == at::kByte && output.scalar_type() == at::kByte &&
+              output_scale.scalar_type() == at::kInt &&
+              row_map.scalar_type() == at::kInt &&
+              input_offset_by_experts.scalar_type() == at::kInt &&
+              output_scale_offset_by_experts.scalar_type() == at::kInt);
+  TORCH_CHECK((k / CVT_FP4_ELTS_PER_THREAD) % 32 == 0,
+              "k must be a multiple of 256");
+  TORCH_CHECK(packed.size(1) >= k / 2 + k / CVT_FP4_SF_VEC_SIZE &&
+                  packed.size(1) % 16 == 0 &&
+                  reinterpret_cast<uintptr_t>(packed.data_ptr()) % 16 == 0,
+              "packed rows hold k / 2 code bytes and k / 16 scale bytes, and "
+              "their width and base address are multiples of 16");
+  auto const m_topk = row_map.size(0);
+  auto const n_experts = input_offset_by_experts.size(0) - 1;
+  TORCH_CHECK(n_experts >= 1 &&
+              output_scale_offset_by_experts.size(0) == n_experts + 1);
+  TORCH_CHECK(output.size(0) == m_topk && output.size(1) == k / 2);
+  TORCH_CHECK(output_scale.size(1) * 4 == (k / 16 + 3) / 4 * 4);
+  if (m_topk == 0) {
+    return;
+  }
+  const c10::cuda::CUDAGuard device_guard(packed.device());
+  const cudaStream_t stream =
+      c10::cuda::getCurrentCUDAStream(packed.get_device()).stream();
+  int const multiProcessorCount = multi_processor_count(packed.get_device());
+  int const grid = std::min<int64_t>(m_topk, multiProcessorCount * 8);
+  size_t const shared_mem_size = (n_experts + 1) * sizeof(int32_t);
+  gather_packed_to_fp4<<<grid, 128, shared_mem_size, stream>>>(
+      m_topk, k, reinterpret_cast<uint8_t const*>(packed.data_ptr()),
+      packed.size(1), reinterpret_cast<int32_t const*>(row_map.data_ptr()),
+      reinterpret_cast<uint8_t*>(output.data_ptr()),
+      reinterpret_cast<uint32_t*>(output_scale.data_ptr()),
+      reinterpret_cast<int32_t const*>(input_offset_by_experts.data_ptr()),
+      reinterpret_cast<int32_t const*>(output_scale_offset_by_experts.data_ptr()),
+      n_experts);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 }  // namespace muse_spark

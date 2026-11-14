@@ -65,6 +65,28 @@ void gather_scaled_fp4_experts_quant(
     at::Tensor const& input_offset_by_experts,
     at::Tensor const& output_scale_offset_by_experts);
 
+// Dense NVFP4 quantization into packed rows (muse_nvfp4_experts_quant.cu), the
+// producer half of gather_packed_fp4_experts. input [M, K] bf16/fp16 (K a
+// multiple of 256), input_global_scale one float, packed [M, W] u8 with W a
+// multiple of 16 and W >= K / 2 + K / 16: bytes [0, K / 2) of a row are the e2m1
+// codes, [K / 2, K / 2 + K / 16) the linear e4m3 scale factors (the bytes the stock
+// scaled_fp4_quant gives with is_sf_swizzled_layout=False); the tail of the row is
+// left alone.
+void pack_nvfp4_rows(at::Tensor& packed, at::Tensor const& input,
+                     at::Tensor const& input_global_scale);
+
+// gather_scaled_fp4_experts_quant on rows quantized by pack_nvfp4_rows (which may
+// have travelled through a collective): row r of output [M, K / 2] is the code
+// bytes of packed[row_map[r]], and its scale factors are written to the
+// swizzled layout of the expert that owns row r in output_scale (int32,
+// [rows, K / 64]). packed [T, W] as above with a 16 B aligned base address. Only
+// the first input_offset_by_experts[E] rows are written; the bytes are those
+// gather_scaled_fp4_experts_quant gives on the unpacked bf16 rows.
+void gather_packed_fp4_experts(
+    at::Tensor& output, at::Tensor& output_scale, at::Tensor const& packed,
+    at::Tensor const& row_map, at::Tensor const& input_offset_by_experts,
+    at::Tensor const& output_scale_offset_by_experts, int64_t k);
+
 // Routing data of the CUTLASS grouped GEMMs of one expert-parallel rank
 // (muse_moe_route.cu): what remap_topk_to_local and the stock
 // get_cutlass_moe_mm_data give for the NVFP4 path, from the global ids.

@@ -373,6 +373,36 @@ def _register_prefill_moe_fakes() -> None:
 
         _fakes_registered.add("gather_scaled_fp4_experts_quant")
 
+    if "pack_nvfp4_rows" not in _fakes_registered and _op_defined("pack_nvfp4_rows"):
+
+        @torch.library.register_fake("_muse_C::pack_nvfp4_rows")
+        def _pack_nvfp4_rows_fake(
+            packed: torch.Tensor,
+            input: torch.Tensor,
+            input_global_scale: torch.Tensor,
+        ) -> None:
+            return None
+
+        _fakes_registered.add("pack_nvfp4_rows")
+
+    if "gather_packed_fp4_experts" not in _fakes_registered and _op_defined(
+        "gather_packed_fp4_experts"
+    ):
+
+        @torch.library.register_fake("_muse_C::gather_packed_fp4_experts")
+        def _gather_packed_fp4_experts_fake(
+            output: torch.Tensor,
+            output_scale: torch.Tensor,
+            packed: torch.Tensor,
+            row_map: torch.Tensor,
+            input_offset_by_experts: torch.Tensor,
+            output_scale_offset_by_experts: torch.Tensor,
+            k: int,
+        ) -> None:
+            return None
+
+        _fakes_registered.add("gather_packed_fp4_experts")
+
     if "moe_route_local" not in _fakes_registered and _op_defined("moe_route_local"):
 
         @torch.library.register_fake("_muse_C::moe_route_local")
@@ -687,6 +717,95 @@ def gather_scaled_fp4_experts_quant(
         input_global_scale,
         expert_offsets,
         blockscale_offsets,
+    )
+    return output, output_scales.view(torch.float8_e4m3fn)
+
+
+def packed_fp4_row_bytes(k: int, extra_bytes: int = 0) -> int:
+    """Width of a packed row of ``k`` activations plus ``extra_bytes`` of tail,
+    in bytes: the codes, the scale factors, and the tail, rounded up to 16."""
+    return (k // 2 + k // 16 + extra_bytes + 15) // 16 * 16
+
+
+def pack_nvfp4_rows(
+    input_tensor: torch.Tensor,
+    input_global_scale: torch.Tensor,
+    row_bytes: int | None = None,
+) -> torch.Tensor:
+    """Quantize the rows of ``input_tensor`` [m, k] to NVFP4 into packed rows.
+
+    Row ``i`` of the result [m, row_bytes] holds the ``k / 2`` bytes of e2m1 codes of
+    row ``i`` and then its ``k / 16`` linear (unswizzled) e4m3 scale factors, the
+    bytes of ``vllm._custom_ops.scaled_fp4_quant`` with
+    ``is_sf_swizzled_layout=False``; the rest of the row is left uninitialized for
+    the caller. The packed rows can be gathered across ranks as plain bytes and
+    consumed by ``gather_packed_fp4_experts``.
+
+    Args:
+        input_tensor: Activations [m, k], bf16 or fp16, k % 256 == 0
+        input_global_scale: The static global scale, one float
+        row_bytes: Width of a packed row (default ``packed_fp4_row_bytes(k)``)
+    """
+    load()
+    assert input_tensor.ndim == 2 and input_tensor.is_contiguous()
+    m, k = input_tensor.shape
+    packed = torch.empty(
+        m,
+        packed_fp4_row_bytes(k) if row_bytes is None else row_bytes,
+        dtype=torch.uint8,
+        device=input_tensor.device,
+    )
+    torch.ops._muse_C.pack_nvfp4_rows(packed, input_tensor, input_global_scale)
+    return packed
+
+
+def gather_packed_fp4_experts(
+    packed: torch.Tensor,
+    row_map: torch.Tensor,
+    num_experts: int,
+    k: int,
+    expert_offsets: torch.Tensor,
+    blockscale_offsets: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``gather_scaled_fp4_experts_quant`` of rows that ``pack_nvfp4_rows`` quantized.
+
+    Row ``r`` of the result is the packed row ``row_map[r]`` with its scale factors
+    in the swizzled layout of the expert that owns row ``r``; only the first
+    ``expert_offsets[-1]`` rows are computed. The bytes are those of
+    ``gather_scaled_fp4_experts_quant`` on the unquantized rows when ``packed`` was
+    quantized with the (single) global scale of every expert.
+
+    Args:
+        packed: [num_tokens, row_bytes] u8 packed rows, row_bytes from
+            ``packed_fp4_row_bytes``
+        row_map: [num_routes] int32 source row of every permuted row
+        num_experts: Number of local experts
+        k: Activation width
+        expert_offsets: The expert offsets tensor [n_experts+1]
+        blockscale_offsets: The blockscale offsets tensor [n_experts+1]
+    Outputs:
+        output: The quantized tensor in NVFP4 [num_routes, k/2]
+        output_scales: The blockscale tensor in FP8-E4M3
+    """
+    load()
+    num_routes = row_map.shape[0]
+    padded_k = (k // 16 + (4 - 1)) // 4
+    output = torch.empty(num_routes, k // 2, device=packed.device, dtype=torch.uint8)
+    # Each expert's scales start at a multiple of 128 rows.
+    output_scales = torch.empty(
+        num_routes + 128 * num_experts,
+        padded_k,
+        dtype=torch.int32,
+        device=packed.device,
+    )
+    torch.ops._muse_C.gather_packed_fp4_experts(
+        output,
+        output_scales,
+        packed,
+        row_map,
+        expert_offsets,
+        blockscale_offsets,
+        k,
     )
     return output, output_scales.view(torch.float8_e4m3fn)
 

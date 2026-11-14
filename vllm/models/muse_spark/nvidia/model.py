@@ -669,6 +669,22 @@ def _fp32_split_k_reduction() -> Iterator[None]:
         matmul.allow_bf16_reduced_precision_reduction = previous
 
 
+# A decision that has not been made yet (None is a decision).
+_UNDECIDED = object()
+
+
+def _agreed_by_tp_group(verdict: bool) -> bool:
+    """The verdict of the whole TP group, whose ranks must take one branch."""
+    group = get_tp_group()
+    if group.world_size == 1:
+        return verdict
+    flag = torch.tensor([int(verdict)], dtype=torch.int32)
+    torch.distributed.all_reduce(
+        flag, op=torch.distributed.ReduceOp.MIN, group=group.cpu_group
+    )
+    return bool(flag.item())
+
+
 class _SequenceParallelRowGate:
     """Whether a batch of ``num_tokens`` takes the sharded stream without a changed bit.
 
@@ -714,15 +730,7 @@ class _SequenceParallelRowGate:
 
     @staticmethod
     def _agreed(verdict: bool) -> bool:
-        """The verdict of the whole TP group, whose ranks must take one branch."""
-        group = get_tp_group()
-        if group.world_size == 1:
-            return verdict
-        flag = torch.tensor([int(verdict)], dtype=torch.int32)
-        torch.distributed.all_reduce(
-            flag, op=torch.distributed.ReduceOp.MIN, group=group.cpu_group
-        )
-        return bool(flag.item())
+        return _agreed_by_tp_group(verdict)
 
     @torch.no_grad()
     def _rows_match(self, num_tokens: int) -> bool:
@@ -947,6 +955,8 @@ class MuseSpark1xMoE(nn.Module):
             config, "muse_spark_tep_aux_stream_routing", tep_default
         )
         self.all_gather_norm_quant: Any | None = None
+        # See _packed_latent_scale.
+        self._latent_scale: Any = _UNDECIDED
         # Whether the TP communicator may run the pre-expert norm as the epilogue
         # of the pooler all-gather (ops/fused_boundary.py).
         self.fuses_boundary_collectives = (
@@ -1507,6 +1517,28 @@ class MuseSpark1xMoE(nn.Module):
 
         return experts_out
 
+    def _packed_latent_scale(self) -> torch.Tensor | None:
+        """The global scale of the latent this layer gathers as NVFP4, or None.
+
+        The decision is made once per layer, on the first sequence-parallel batch,
+        and agreed by the TP group: ranks that gathered rows of different widths
+        would hang in the collective.
+        """
+        if self._latent_scale is _UNDECIDED:
+            scale = None
+            if envs.VLLM_MUSE_SPARK_SM120_PREFILL_LATENT_FP4:
+                scale = self.experts.packed_latent_scale()
+            self._latent_scale = (
+                scale if _agreed_by_tp_group(scale is not None) else None
+            )
+            if self._latent_scale is not None:
+                logger.info_once(
+                    "MuseSpark SM120 sequence parallel: the pooled latent is "
+                    "quantized to NVFP4 before its all-gather "
+                    "(VLLM_MUSE_SPARK_SM120_PREFILL_LATENT_FP4=1)."
+                )
+        return self._latent_scale
+
     def forward_sequence_parallel(
         self,
         hidden_states: torch.Tensor,
@@ -1552,13 +1584,28 @@ class MuseSpark1xMoE(nn.Module):
         # Not the sharded projections: those need the same rows on every rank.
         with _fp32_split_k_reduction():
             pooled = self.pooler(hidden_states)[0]
-        pooled = sp_all_gather(self.pre_expert_norm(pooled))[:num_tokens]
+        pooled = self.pre_expert_norm(pooled)
+        # The experts quantize the latent to NVFP4 row by row: quantized here, ahead
+        # of the gather, it travels as 2304 B per row instead of 8192 B.
+        latent_scale = self._packed_latent_scale()
+        if latent_scale is not None:
+            packed = sp_all_gather(muse_c.pack_nvfp4_rows(pooled, latent_scale))
+            packed = packed[:num_tokens]
+        else:
+            pooled = sp_all_gather(pooled)[:num_tokens]
         routes = sp_all_gather(routes)[:num_tokens]
         topk_ids = routes[:, :top_k].contiguous()
         topk_weights = routes[:, top_k:].contiguous().view(torch.float32)
         if router.capture_fn is not None:
             router.capture_fn(topk_ids)
-        partial = self.experts.forward_routed_partial(pooled, topk_weights, topk_ids)
+        if latent_scale is not None:
+            partial = self.experts.forward_routed_partial_packed(
+                packed, topk_weights, topk_ids
+            )
+        else:
+            partial = self.experts.forward_routed_partial(
+                pooled, topk_weights, topk_ids
+            )
         rows = sp_reduce_scatter(partial)
         with _fp32_split_k_reduction():
             return self.unpooler(rows)[0]

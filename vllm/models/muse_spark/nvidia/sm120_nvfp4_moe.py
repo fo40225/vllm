@@ -38,7 +38,9 @@ local routes only (``_local_rows_usable``): an EP rank owns about one route in
 eight, and the stock sort and shuffle spend their time on the rest.
 """
 
-from collections.abc import Callable
+import contextlib
+from collections.abc import Callable, Iterator
+from contextvars import ContextVar
 from typing import NamedTuple
 
 import torch
@@ -434,6 +436,31 @@ def _capturing() -> bool:
     return torch.cuda.is_current_stream_capturing()
 
 
+# The packed activation rows (``muse_c.pack_nvfp4_rows``) the next CUTLASS-path call
+# of this thread takes in place of its bf16 hidden states. A context variable and not
+# an attribute of the experts: the microbatches of a prefill step run on threads that
+# share the layer.
+_PACKED_INPUT: ContextVar[torch.Tensor | None] = ContextVar(
+    "muse_sm120_packed_input", default=None
+)
+
+
+@contextlib.contextmanager
+def packed_nvfp4_input(packed: torch.Tensor) -> Iterator[None]:
+    """Run the experts on activations that ``muse_c.pack_nvfp4_rows`` quantized.
+
+    Inside the block, the CUTLASS path of ``MuseSparkSm120NvFp4Experts`` takes the
+    NVFP4 codes and scale factors from ``packed`` [num_tokens, row_bytes] instead of
+    quantizing its ``hidden_states`` argument, which is then only read for its
+    shape. The caller checked ``MuseSparkSm120NvFp4Experts.packed_input_scale``.
+    """
+    token = _PACKED_INPUT.set(packed)
+    try:
+        yield
+    finally:
+        _PACKED_INPUT.reset(token)
+
+
 def _shuffle_rows_into(
     src: torch.Tensor, dst2src_map: torch.Tensor, out: torch.Tensor
 ) -> None:
@@ -498,6 +525,8 @@ class MuseSparkSm120NvFp4Experts(mk.FusedMoEExpertsModular):
         self.exact_gemm1 = False
         self.exact_scales: ExactGemm1Scales | None = None
         self.local_rows = envs.VLLM_MUSE_SPARK_SM120_PREFILL_LOCAL_ROWS
+        # The input scale of packed_input_scale, once verified.
+        self._packed_scale: torch.Tensor | None = None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         # The layer tensors seen here are not always the ones ``apply`` receives:
@@ -779,6 +808,11 @@ class MuseSparkSm120NvFp4Experts(mk.FusedMoEExpertsModular):
                 and capturing
                 and hidden_states.shape[0] <= B12X_MAX_TOKENS
             )
+        packed = _PACKED_INPUT.get()
+        if packed is not None:
+            # Prefill, which runs eagerly: the decode engines are not involved.
+            assert not (use_muse or use_b12x)
+            assert packed.shape[0] == hidden_states.shape[0]
         if use_muse:
             unfinalized = self._apply_muse(
                 hidden_states, topk_weights, topk_ids, expert_map
@@ -789,7 +823,14 @@ class MuseSparkSm120NvFp4Experts(mk.FusedMoEExpertsModular):
             )
         else:
             unfinalized = self._apply_cutlass(
-                hidden_states, w1, w2, topk_weights, topk_ids, expert_map, workspace2
+                hidden_states,
+                w1,
+                w2,
+                topk_weights,
+                topk_ids,
+                expert_map,
+                workspace2,
+                packed,
             )
         if self.after_gemm2_hook is not None:
             self.after_gemm2_hook(hidden_states.shape[0])
@@ -931,6 +972,28 @@ class MuseSparkSm120NvFp4Experts(mk.FusedMoEExpertsModular):
             gate_first=not self.up_gate_layout,
         )
 
+    def packed_input_scale(self, hidden: int) -> torch.Tensor | None:
+        """The global scale to quantize activations of width ``hidden`` with, for
+        ``packed_nvfp4_input``, or None where this layer cannot take them packed.
+
+        The packed rows are quantized once, before they are gathered, while the
+        CUTLASS path quantizes them per route with the scale of the route's
+        expert. They are the same bytes where every expert has one scale (the global
+        max of the input scales, as ``fold_sm120_nvfp4_scales`` makes them), which
+        is checked once per layer. It needs the local-rows path, whose sort and
+        row gather the packed rows are fed to.
+        """
+        if self.a1_gscale is None or not self._local_rows_usable(
+            hidden, self.moe_config.num_local_experts
+        ):
+            return None
+        if self._packed_scale is None:
+            gscale = self.a1_gscale
+            if not bool((gscale == gscale[:1]).all()):
+                return None
+            self._packed_scale = gscale[:1].clone()
+        return self._packed_scale
+
     def _local_rows_usable(self, hidden: int, num_experts: int) -> bool:
         """Whether the CUTLASS path works on the local routes only.
 
@@ -956,12 +1019,15 @@ class MuseSparkSm120NvFp4Experts(mk.FusedMoEExpertsModular):
         topk_ids: torch.Tensor,
         expert_map: torch.Tensor | None,
         workspace2: torch.Tensor,
+        packed: torch.Tensor | None = None,
     ) -> UnfinalizedMoEOutput:
         """Both grouped GEMMs; returns the unweighted, un-normed GEMM2 rows.
 
         It reads the swizzled block scales and the folded scales from the quant
         config, or, with ``exact_scales``, GEMM1 runs with the gate and up alphas
         apart (see ``_gemm1_exact``); ``w1`` is stored as ``up_gate_layout`` says.
+        With ``packed`` (see ``packed_nvfp4_input``), the activations are quantized
+        already and only reordered; that needs the local-rows path.
         """
         assert self.w1_scale is not None and self.w2_scale is not None
         assert self.g1_alphas is not None and self.g2_alphas is not None
@@ -998,14 +1064,25 @@ class MuseSparkSm120NvFp4Experts(mk.FusedMoEExpertsModular):
                 intermediate,
                 hidden,
             )
-            a_fp4, a_blockscale = muse_c.gather_scaled_fp4_experts_quant(
-                hidden_states.contiguous(),
-                a_map,
-                self.a1_gscale,
-                expert_offsets,
-                blockscale_offsets,
-            )
+            if packed is not None:
+                a_fp4, a_blockscale = muse_c.gather_packed_fp4_experts(
+                    packed,
+                    a_map,
+                    num_experts,
+                    hidden,
+                    expert_offsets,
+                    blockscale_offsets,
+                )
+            else:
+                a_fp4, a_blockscale = muse_c.gather_scaled_fp4_experts_quant(
+                    hidden_states.contiguous(),
+                    a_map,
+                    self.a1_gscale,
+                    expert_offsets,
+                    blockscale_offsets,
+                )
         else:
+            assert packed is None, "packed activations need the local-rows path"
             # Non-local routes become -1 and are placed after every local row.
             if expert_map is not None:
                 local_ids = remap_topk_to_local(

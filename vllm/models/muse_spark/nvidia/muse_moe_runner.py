@@ -86,6 +86,7 @@ from vllm.models.muse_spark.nvidia.sm120_nvfp4_moe import (
     check_sm120_nvfp4_supported,
     fold_sm120_nvfp4_scales,
     make_sm120_nvfp4_quant_config,
+    packed_nvfp4_input,
     select_decode_engine,
     swap_gate_up_halves_,
 )
@@ -1160,6 +1161,36 @@ class MuseMoERunner(MoERunner):
         # The fused finalize + all-reduce is for decode-sized batches only.
         assert not self.post_expert_finalize.output_reduced
         return self._maybe_apply_routed_scale_to_output(None, output)[1]
+
+    def packed_latent_scale(self) -> torch.Tensor | None:
+        """The global scale to quantize this layer's latent with before it is
+        gathered (``forward_routed_partial_packed``), or None where the layer takes
+        the bf16 latent: the BF16 layers, and those without the local-rows path."""
+        experts = self._sm120_native_experts()
+        if experts is None:
+            return None
+        return experts.packed_input_scale(self.moe_config.hidden_dim)
+
+    def forward_routed_partial_packed(
+        self,
+        packed: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """``forward_routed_partial`` on a latent that ``muse_c.pack_nvfp4_rows``
+        quantized with ``packed_latent_scale`` (and that may have been gathered
+        since) instead of the bf16 latent.
+
+        The modular kernel only reads the shape of its input here, so an
+        uninitialized bf16 tensor of that shape stands in for it.
+        """
+        latent = torch.empty(
+            (packed.shape[0], self.moe_config.hidden_dim),
+            dtype=torch.bfloat16,
+            device=packed.device,
+        )
+        with packed_nvfp4_input(packed):
+            return self.forward_routed_partial(latent, topk_weights, topk_ids)
 
     @property
     def supports_routed_forward(self) -> bool:

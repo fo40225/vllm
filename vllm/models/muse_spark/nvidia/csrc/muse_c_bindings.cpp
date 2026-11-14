@@ -36,6 +36,16 @@ TORCH_LIBRARY(_muse_C, m) {
       "Tensor input_offset_by_experts, "
       "Tensor output_scale_offset_by_experts) -> ()");
 
+  // Split of the gather quantization around a collective: pack the rows as fp4
+  // codes + linear scales, then gather them into the experts' permuted rows.
+  m.def(
+      "pack_nvfp4_rows(Tensor! packed, Tensor input, Tensor "
+      "input_global_scale) -> ()");
+  m.def(
+      "gather_packed_fp4_experts(Tensor! output, Tensor! output_scale, "
+      "Tensor packed, Tensor row_map, Tensor input_offset_by_experts, "
+      "Tensor output_scale_offset_by_experts, int k) -> ()");
+
   // Routing data of the CUTLASS grouped GEMMs of an EP rank.
   m.def(
       "moe_route_local(Tensor topk_ids, Tensor? expert_map, "
@@ -93,6 +103,8 @@ TORCH_LIBRARY_IMPL(_muse_C, CUDA, m) {
   m.impl("split_gemm1_prepare", &muse_spark::split_gemm1_prepare);
   m.impl("gather_scaled_fp4_experts_quant",
          &muse_spark::gather_scaled_fp4_experts_quant);
+  m.impl("pack_nvfp4_rows", &muse_spark::pack_nvfp4_rows);
+  m.impl("gather_packed_fp4_experts", &muse_spark::gather_packed_fp4_experts);
   m.impl("moe_route_local", &muse_spark::moe_route_local);
   m.impl("nvfp4_decode_moe", &muse_spark::nvfp4_decode_moe);
   m.impl("nvfp4_decode_moe_large", &muse_spark::nvfp4_decode_moe_large);
