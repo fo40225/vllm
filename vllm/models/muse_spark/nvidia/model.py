@@ -3773,6 +3773,54 @@ class MuseSpark1xForCausalLM(LlamaForCausalLM, SupportsLoRA, MixtureOfExperts):
             threshold=ties is not None,
         )
 
+    def compute_split_verify_logits(
+        self,
+        hidden_states: torch.Tensor,
+        k: int,
+        topk_rows: torch.Tensor | None,
+        full_rows: torch.Tensor | None,
+    ) -> tuple[TopKLogits | None, torch.Tensor | None]:
+        """What the verification of a step needs when some of its rows verify from the
+        candidates and the others from the whole logits: ``compute_topk_logits`` for the
+        rows ``topk_rows`` and ``compute_logits`` for the rows ``full_rows`` (index
+        tensors into ``hidden_states``; None: no such rows).
+
+        One lm_head projection serves both, over all the rows, as the full path does:
+        every row gets the logits it would get there (the GEMM does not depend on which
+        rows go on), the candidates are taken from the rows ``topk_rows`` of the shard
+        logits and only the rows ``full_rows`` are gathered whole. Two collectives, in
+        this order, on every rank.
+        """
+        assert 0 < k <= self.topk_logits_k
+        head = self.lm_head
+        hidden_states = hidden_states.to(head.weight.dtype)
+        local = self.logits_processor(head, hidden_states, skip_gather=True)
+        topk = None
+        if topk_rows is not None:
+            words = local_topk_candidates(
+                local.index_select(0, topk_rows),
+                k,
+                num_valid=head.shard_indices.num_org_elements,
+            )
+            words = tensor_model_parallel_all_gather(words.view(torch.bfloat16), dim=0)
+            topk = TopKLogits(
+                words=words,
+                capped=self._scale_and_soft_cap(words.contiguous()),
+                num_rows=topk_rows.shape[0],
+                k=k,
+                tp_size=head.tp_size,
+                shard_size=head.num_embeddings_per_partition,
+            )
+        logits = None
+        if full_rows is not None:
+            gathered = self.logits_processor._gather_logits(
+                local.index_select(0, full_rows)
+            )
+            logits = self._scale_and_soft_cap(
+                gathered[..., : self.logits_processor.org_vocab_size]
+            )
+        return topk, logits
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         def interleaved_weights() -> Iterable[tuple[str, torch.Tensor]]:
             config = self.model.config

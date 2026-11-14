@@ -1771,7 +1771,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # request asks for logprobs, penalties, logit bias / allowed token ids / bad words,
     # a thinking budget, a grammar bitmask, or, at temperature > 0, min_p, top_p, or a
     # top_k above K: ONE such request sends all the rows of its step to the full path.
-    # The whole path is off for adaptive verification, a watermark, synthetic
+    # 3: the same decision per request: the rows of a request that needs the logits
+    # (penalties, logit bias, bad words, a thinking budget, a top_k above K, top_p) are
+    # gathered whole and verified by the full path, the other requests of the step
+    # verify from the candidates (one lm_head projection serves both, the outputs are
+    # merged in the batch order; logprobs, a grammar and the sampler features that work
+    # on all rows still send the whole step to the full path); and requests with min_p
+    # (and no top_p) verify from the candidates too: their threshold is the full
+    # path's, bit for bit (vLLM rejects min_p and logit_bias requests under speculative
+    # decoding for now, SamplingParams._validate_spec_decode: no such request reaches
+    # the verification today). 4: also requests with top_p below 1 (and no min_p): the
+    # nucleus of the full path's top-k + top-p kernel over the candidates. That kernel
+    # finds its nucleus by an fp32 pivot search whose result for tokens that tie at the
+    # boundary depends on how an exp / log round trip rounds, and so on the bits of a
+    # sum that depend on the whole row: the candidates reproduce its rule and the tokens
+    # are those of the full path on all of 3014 measured decode rows at top_p up to
+    # 0.95 (and on all but 2 at 0.99), but not on every row of every distribution (a few
+    # percent of the rows of tie-rich logits of small magnitude): a rounding-level
+    # difference of the kept set in the far tail of the nucleus, which the output
+    # distribution does not see. The whole path is off for adaptive verification, a
+    # watermark, synthetic
     # acceptance rates, a rejection sampler of another class, and a draft distribution
     # narrower than the vocabulary; with a draft distribution of another width than
     # the vocabulary, or without one, only the greedy steps take it. Needs

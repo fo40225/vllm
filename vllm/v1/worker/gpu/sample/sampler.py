@@ -38,6 +38,7 @@ from vllm.v1.worker.gpu.sample.thinking_budget import ThinkingBudgetState
 from vllm.v1.worker.gpu.sample.topk_logits import (
     TieDraw,
     TopKLogits,
+    VerifyPlan,
     topk_merge_sample,
 )
 from vllm.v1.worker.gpu.sample.trace_replay import TraceReplayState
@@ -231,6 +232,80 @@ class Sampler:
         if not sampled:
             return "sampled-rows", 0
         return None, k
+
+    def topk_verify_split_plan(
+        self, idx_mapping_np: np.ndarray, k: int, sampled: bool, level: int
+    ) -> VerifyPlan:
+        """`topk_verify_plan` per request: which requests of a speculative step verify
+        their drafts from the ``k`` candidates per rank, and which need the logits.
+
+        A step-level reason sends the whole step to the full path (logprobs, a sampler
+        feature that works on the logits of every row); the others only their own
+        request: penalties, logit bias, bad words, a thinking budget or a custom
+        processor (``needs_full_logits``), a top_k above ``k``, a request with
+        temperature > 0 where the launch cannot verify sampled rows (``sampled``),
+        top_p below 1 (unless ``level`` is at least 4) and top_p below 1 together with
+        min_p (the full path then takes the standalone top-p branch of its top-p
+        kernel, whose ties it treats differently). A greedy request ignores top_k,
+        top_p and min_p. Host state only: every TP rank decides alike.
+        """
+        if (
+            self.compute_nans
+            or self.return_sampling_mask
+            or self.trace_replay_state is not None
+        ):
+            return VerifyPlan("sampler-feature")
+        if self.get_logprobs_dims(idx_mapping_np) is not None:
+            return VerifyPlan("logprobs")
+        states = self.sampling_states
+        random = states.temperature.np[idx_mapping_np] != 0.0
+        top_p_rows = random & (states.top_p.np[idx_mapping_np] != 1.0)
+        min_p_rows = random & (states.min_p.np[idx_mapping_np] != 0.0)
+        # Why a request needs the logits, in the order the reasons are reported.
+        conditions = (
+            ("logits-processing", self.needs_full_logits[idx_mapping_np]),
+            ("sampled-rows", random if not sampled else None),
+            ("top-k-unset-or-above-k", random & (states.top_k.np[idx_mapping_np] > k)),
+            ("top-p-with-min-p", top_p_rows & min_p_rows),
+            ("top-p", top_p_rows if level < 4 else None),
+        )
+        full_mask = np.zeros(idx_mapping_np.shape[0], dtype=bool)
+        for _, mask in conditions:
+            if mask is not None:
+                full_mask |= mask
+        candidate_random = random & ~full_mask
+        if not full_mask.any():
+            return VerifyPlan(
+                None,
+                k if candidate_random.any() else 1,
+                has_sampled=bool(candidate_random.any()),
+                min_p=bool(min_p_rows.any()),
+                top_p=bool(top_p_rows.any()),
+            )
+        # The first reason that applies to each request that needs the logits.
+        counts: dict[str, int] = {}
+        first = None
+        taken = np.zeros_like(full_mask)
+        for reason, mask in conditions:
+            if mask is None:
+                continue
+            new = mask & ~taken
+            if new.any():
+                counts[reason] = int(new.sum())
+                taken |= new
+        if full_mask.all():
+            first = next(r for r, m in conditions if m is not None and m[0])
+            return VerifyPlan(first)
+        return VerifyPlan(
+            None,
+            k if candidate_random.any() else 1,
+            candidate=np.nonzero(~full_mask)[0],
+            full=np.nonzero(full_mask)[0],
+            full_reasons=counts,
+            has_sampled=bool(candidate_random.any()),
+            min_p=bool((min_p_rows & ~full_mask).any()),
+            top_p=bool((top_p_rows & ~full_mask).any()),
+        )
 
     def sample_topk_logits(
         self, topk: TopKLogits, input_batch: InputBatch

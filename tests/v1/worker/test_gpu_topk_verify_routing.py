@@ -128,7 +128,9 @@ def test_the_launch_reason_of_the_rejection_sampler(kwargs, reason):
     assert rejection_sampler(**kwargs).topk_verify_launch_reason == reason
 
 
-def resolve(monkeypatch, level, k=K, width=VOCAB_SIZE, **sampler_kwargs):
+def resolve(
+    monkeypatch, level, k=K, width=VOCAB_SIZE, split_model=True, **sampler_kwargs
+):
     if level is None:
         monkeypatch.delenv("VLLM_MUSE_SPARK_SM120_VERIFY_TOPK_LOGITS", raising=False)
     else:
@@ -142,16 +144,29 @@ def resolve(monkeypatch, level, k=K, width=VOCAB_SIZE, **sampler_kwargs):
         ),
         topk_verify_sampled=False,
         topk_verify_stats=None,
+        model=(
+            SimpleNamespace(compute_split_verify_logits=lambda *a, **kw: None)
+            if split_model
+            else SimpleNamespace()
+        ),
     )
     return GPUModelRunner._resolve_topk_verify_level(runner), runner
 
 
-@pytest.mark.parametrize("level", [0, 1, 2])
+@pytest.mark.parametrize("level", [0, 1, 2, 3, 4])
 def test_the_level_follows_the_flag(monkeypatch, level):
     got, runner = resolve(monkeypatch, level)
     assert got == level
-    assert runner.topk_verify_sampled == (level == 2)
+    assert runner.topk_verify_sampled == (level >= 2)
     assert (runner.topk_verify_stats is not None) == (level > 0)
+
+
+@pytest.mark.parametrize("level", [3, 4])
+def test_the_split_levels_need_a_model_that_splits_the_gather(monkeypatch, level):
+    """Without ``compute_split_verify_logits`` the launch keeps level 2: a step with a
+    request that needs the logits verifies from the full logits as before."""
+    got, runner = resolve(monkeypatch, level, split_model=False)
+    assert got == 2 and runner.topk_verify_sampled
 
 
 def test_the_flag_is_on_by_default(monkeypatch):
@@ -180,7 +195,7 @@ def test_the_flag_is_on_by_default(monkeypatch):
 def test_what_turns_the_path_off(monkeypatch, case, level):
     k, kwargs, width = K, {}, VOCAB_SIZE
     if case == "bad-level":
-        level = 3
+        level = 5
     elif case == "rejection-sampler-subclass":
         # A subclass may override what the path replaces: keep its full path.
         kwargs = {"__class__": type("Sub", (RejectionSampler,), {})}
@@ -413,16 +428,23 @@ def test_the_route_stats_of_verified_steps_say_what_they_count():
     assert line is not None and "sampled-rows: 1" in line
 
 
-def _verify_topk_args(temperature, top_k, k=K):
+def _verify_topk_args(temperature, top_k, k=K, min_p=None, top_p=None):
     rs = rejection_sampler()
     rs.sampler = SimpleNamespace(
         sampling_states=SimpleNamespace(
             temperature=SimpleNamespace(np=np.asarray(temperature, dtype=np.float32)),
             top_k=SimpleNamespace(np=np.asarray(top_k, dtype=np.int32)),
+            min_p=SimpleNamespace(
+                np=np.asarray(min_p or [0.0] * len(temperature), dtype=np.float32)
+            ),
+            top_p=SimpleNamespace(
+                np=np.asarray(top_p or [1.0] * len(temperature), dtype=np.float32)
+            ),
         )
     )
     batch = SimpleNamespace(idx_mapping_np=np.arange(len(temperature), dtype=np.intp))
-    return rs, SimpleNamespace(k=k), batch
+    topk = SimpleNamespace(k=k, tp_size=8, shard_size=25256)
+    return rs, topk, batch
 
 
 def test_verify_topk_refuses_a_top_k_above_the_candidates():
@@ -442,3 +464,31 @@ def test_verify_topk_accepts_what_the_candidates_cover():
     rs, topk, batch = _verify_topk_args([0.0, 0.0], [VOCAB_SIZE, VOCAB_SIZE], k=1)
     with pytest.raises(AttributeError):
         rs.verify_topk(topk, batch, None, False)
+
+
+def test_verify_topk_refuses_a_min_p_or_top_p_the_call_does_not_apply():
+    """A step routed without the kernel variant must fail, not drop the parameter."""
+    rs, topk, batch = _verify_topk_args([1.0, 1.0], [K, K], min_p=[0.0, 0.1])
+    with pytest.raises(ValueError, match="min_p the call does not apply"):
+        rs.verify_topk(topk, batch, None, True)
+    rs, topk, batch = _verify_topk_args([1.0, 1.0], [K, K], top_p=[1.0, 0.9])
+    with pytest.raises(ValueError, match="top_p the call does not apply"):
+        rs.verify_topk(topk, batch, None, True)
+    # Applied: the checks pass and the stub batch fails at the first device access.
+    rs, topk, batch = _verify_topk_args(
+        [1.0, 1.0], [K, K], min_p=[0.0, 0.1], top_p=[1.0, 0.9]
+    )
+    with pytest.raises(AttributeError):
+        rs.verify_topk(topk, batch, None, True, use_min_p=True, use_top_p=True)
+    # A greedy row ignores both.
+    rs, topk, batch = _verify_topk_args([0.0, 1.0], [K, K], min_p=[0.2, 0.0])
+    with pytest.raises(AttributeError):
+        rs.verify_topk(topk, batch, None, True)
+
+
+def test_verify_topk_refuses_a_top_k_the_min_p_emulation_does_not_cover():
+    """The full path's outlier pivot has the sigma for top_k / vocab * 200 < 1."""
+    rs, topk, batch = _verify_topk_args([1.0], [K], min_p=[0.1])
+    topk.shard_size = 100  # a vocabulary of 800: 200 * 64 > 800
+    with pytest.raises(ValueError, match="top_k too large for min_p"):
+        rs.verify_topk(topk, batch, None, True, use_min_p=True)

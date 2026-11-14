@@ -65,8 +65,9 @@ rounding after the division by the temperature, which is at most 2.)
 
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
+import numpy as np
 import torch
 
 from vllm.triton_utils import tl, triton
@@ -640,6 +641,31 @@ def topk_merge_sample(
     return sampled
 
 
+@dataclass(slots=True)
+class VerifyPlan:
+    """How a speculative step verifies its drafts when requests may take different
+    routes (``Sampler.topk_verify_split_plan``): every field is host state, identical
+    on every TP rank.
+
+    ``reason`` is set when no request can verify from the candidates: the whole step
+    takes the full path. Otherwise ``candidate`` lists the batch positions of the
+    requests that verify from the ``k`` candidates per rank (None: all of them) and
+    ``full`` those whose logits are gathered whole (None: none); ``full_reasons``
+    counts those requests by reason. ``has_sampled``, ``min_p`` and ``top_p`` say
+    whether a candidate request needs the sampled branch, a min_p threshold, a top-p
+    nucleus (they select the compiled variant of the verification kernel).
+    """
+
+    reason: str | None
+    k: int = 0
+    candidate: np.ndarray | None = None
+    full: np.ndarray | None = None
+    full_reasons: dict[str, int] = field(default_factory=dict)
+    has_sampled: bool = False
+    min_p: bool = False
+    top_p: bool = False
+
+
 class RouteStats:
     """Host-side counts of the steps that sampled from the top-K logits, and of the
     steps that gathered the logits instead, by the reason.
@@ -666,6 +692,12 @@ class RouteStats:
         self.taken = 0
         self.taken_threshold = 0  # of the taken steps, those that keep every tie
         self.fallbacks: dict[str, int] = {}
+        # Steps taken with some requests on the full logits (per-request routing),
+        # those requests and the requests of those steps, and why.
+        self.split_steps = 0
+        self.split_full_reqs = 0
+        self.split_reqs = 0
+        self.split_reasons: dict[str, int] = {}
         self._interval_s = interval_s
         self._clock = clock
         self._next_log = 0.0
@@ -686,17 +718,42 @@ class RouteStats:
                 f" ({self.taken_threshold} of them on FlashInfer's rule at the top_k "
                 "boundary, the others on exactly top_k tokens)"
             )
+        if self.split_steps:
+            reasons = ", ".join(
+                f"{r}: {n}" for r, n in sorted(self.split_reasons.items())
+            )
+            line += (
+                f"; {self.split_steps} of them with {self.split_full_reqs} of "
+                f"{self.split_reqs} requests on the full logits ({reasons})"
+            )
         if self.fallbacks:
             reasons = ", ".join(f"{r}: {n}" for r, n in sorted(self.fallbacks.items()))
             line += f"; the others gathered the logits ({reasons})"
         return line
 
-    def record(self, reason: str | None, threshold: bool = False) -> str | None:
-        """Count a step that gathered the logits for ``reason``, or (None) did not."""
+    def record(
+        self,
+        reason: str | None,
+        threshold: bool = False,
+        split: dict[str, int] | None = None,
+        num_reqs: int = 0,
+    ) -> str | None:
+        """Count a step that gathered the logits for ``reason``, or (None) did not.
+
+        ``split`` (reason -> requests): the step verified from the candidates but the
+        logits of these requests were gathered whole, ``num_reqs`` requests in all.
+        """
         new_reason = False
         if reason is None:
             self.taken += 1
             self.taken_threshold += threshold
+            if split:
+                self.split_steps += 1
+                self.split_full_reqs += sum(split.values())
+                self.split_reqs += num_reqs
+                for r, n in split.items():
+                    new_reason |= r not in self.split_reasons
+                    self.split_reasons[r] = self.split_reasons.get(r, 0) + n
         else:
             new_reason = reason not in self.fallbacks
             self.fallbacks[reason] = self.fallbacks.get(reason, 0) + 1

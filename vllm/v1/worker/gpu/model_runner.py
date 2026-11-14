@@ -154,7 +154,7 @@ from vllm.v1.worker.gpu.sample.logits_processor import build_custom_logits_proce
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
 from vllm.v1.worker.gpu.sample.sampler import Sampler
-from vllm.v1.worker.gpu.sample.topk_logits import RouteStats
+from vllm.v1.worker.gpu.sample.topk_logits import RouteStats, VerifyPlan
 from vllm.v1.worker.gpu.shutdown import free_before_shutdown
 from vllm.v1.worker.gpu.spec_decode import init_speculator
 from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
@@ -174,6 +174,11 @@ from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 from vllm.v1.worker.gpu.spec_decode.utils import (
     DraftTokensHandler,
     get_drafter_hidden_states,
+)
+from vllm.v1.worker.gpu.spec_decode.verify_split import (
+    SplitIndices,
+    merge_outputs,
+    sampler_view,
 )
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.gpu.structured_outputs import (
@@ -197,6 +202,32 @@ from vllm.v1.worker.utils import (
 from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
 
 logger = init_logger(__name__)
+
+
+def _topk_verify_step_reason(
+    runner: "GPUModelRunner", grammar_output: GrammarOutput | None
+) -> str | None:
+    """The reasons that send a whole speculative step to the full logits, whatever its
+    requests are: a grammar bitmask, context parallelism, adaptive verification."""
+    if grammar_output is not None:
+        return "grammar"
+    if runner.pcp_manager is not None:
+        return "context-parallel"
+    if runner.adaptive_verification is not None:
+        return "adaptive-verification"
+    return None
+
+
+def _log_first_verify_step(
+    runner: "GPUModelRunner", k: int, input_batch: InputBatch
+) -> None:
+    if not runner._topk_verify_logged:
+        runner._topk_verify_logged = True
+        logger.info(
+            "The first verify step took %d candidates per TP rank (%d rows).",
+            k,
+            input_batch.logits_indices.shape[0],
+        )
 
 
 class GPUModelRunner(LoRAModelRunnerMixin):
@@ -1145,14 +1176,61 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # requests are verified from the candidates, a step with sampled rows. The
             # fallback steps keep the full path, so the profile above still covers it.
             del logits
-            shapes = [(1, False)]
+            # (candidates per rank, sampled branch, min_p, top_p): the variants of the
+            # verification kernel that the level can launch.
+            shapes = [(1, False, False, False)]
             if self.topk_verify_sampled:
-                shapes.append((self.topk_logits_k, True))
-            for k, has_sampled in shapes:
+                k = self.topk_logits_k
+                shapes.append((k, True, False, False))
+                if self.topk_verify_level >= 3:
+                    shapes.append((k, True, True, False))
+                if self.topk_verify_level >= 4:
+                    shapes.append((k, True, False, True))
+            for k, has_sampled, use_min_p, use_top_p in shapes:
                 topk = self.model.compute_topk_logits(hidden_states[:num_logits], k=k)
                 rejection_sampler.verify_topk(
-                    topk, batch, self.speculator.draft_logits, has_sampled
+                    topk,
+                    batch,
+                    self.speculator.draft_logits,
+                    has_sampled,
+                    use_min_p=use_min_p,
+                    use_top_p=use_top_p,
                 )
+            if self.topk_verify_level >= 3 and num_reqs >= 2:
+                self._dummy_split_verify(hidden_states[:num_logits], batch)
+
+    def _dummy_split_verify(
+        self, hidden_states: torch.Tensor, batch: InputBatch
+    ) -> None:
+        """One split verification (half of the requests from the candidates, half from
+        the whole logits) before the first request: the kernels it launches compile now
+        and its transients are part of the memory the launch has seen."""
+        assert self.rejection_sampler is not None and self.speculator is not None
+        reqs = np.arange(batch.num_reqs)
+        cand = SplitIndices(batch, reqs[0::2], hidden_states.device)
+        full = SplitIndices(batch, reqs[1::2], hidden_states.device)
+        topk, logits = self.model.compute_split_verify_logits(
+            hidden_states, self.topk_logits_k, cand.rows_t, full.rows_t
+        )
+        draft_logits = self.speculator.draft_logits
+        parts = [
+            (
+                cand,
+                self.rejection_sampler.verify_topk(
+                    topk,
+                    sampler_view(batch, cand),
+                    draft_logits,
+                    self.topk_verify_sampled,
+                ),
+            ),
+            (
+                full,
+                self.rejection_sampler(
+                    logits, sampler_view(batch, full), draft_logits, None
+                ),
+            ),
+        ]
+        merge_outputs(batch.num_reqs, parts)
 
     def _resolve_topk_logits_k(self) -> int:
         """Candidates per TP rank of the top-k logits sampling, 0 when it is off.
@@ -1207,9 +1285,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         level = envs.VLLM_MUSE_SPARK_SM120_VERIFY_TOPK_LOGITS
         if level <= 0:
             return 0
-        if level not in (1, 2):
+        if level not in (1, 2, 3, 4):
             logger.warning(
-                "VLLM_MUSE_SPARK_SM120_VERIFY_TOPK_LOGITS=%d is not 0, 1 or 2: "
+                "VLLM_MUSE_SPARK_SM120_VERIFY_TOPK_LOGITS=%d is not 0, 1, 2, 3 or 4: "
                 "verifying from the full logits.",
                 level,
             )
@@ -1232,6 +1310,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 reason,
             )
             return 0
+        if level >= 3 and not hasattr(self.model, "compute_split_verify_logits"):
+            logger.warning(
+                "VLLM_MUSE_SPARK_SM120_VERIFY_TOPK_LOGITS=%d needs a model that splits "
+                "the verification by request (compute_split_verify_logits): a step "
+                "with a request that needs the logits verifies from the full logits.",
+                level,
+            )
+            level = 2
         self.topk_verify_sampled = (
             level >= 2
             and rejection_sampler.use_block_verification
@@ -1262,12 +1348,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         Decided like `_topk_logits_fallback_reason`: from the batch shape and the host
         copy of the request state, which every TP rank holds alike.
         """
-        if grammar_output is not None:
-            return "grammar", 0
-        if self.pcp_manager is not None:
-            return "context-parallel", 0
-        if self.adaptive_verification is not None:
-            return "adaptive-verification", 0
+        step_reason = _topk_verify_step_reason(self, grammar_output)
+        if step_reason is not None:
+            return step_reason, 0
         assert self.sampler is not None
         return self.sampler.topk_verify_plan(
             input_batch.idx_mapping_np,
@@ -1284,23 +1367,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         """Verify the draft tokens of this step from the top-k logits of each TP rank.
 
         Returns the sampler output, or None when the step takes the full path. Counts
-        the step and logs the counts now and then (``RouteStats``): one single request
-        of a batch that needs the logits sends all its rows down the full path.
+        the step and logs the counts now and then (``RouteStats``): up to level 2 one
+        single request of a batch that needs the logits sends all its rows down the full
+        path; from level 3 on only its own rows go there (``_verify_split``).
         """
-        reason, k = self._topk_verify_plan(input_batch, grammar_output)
         assert self.topk_verify_stats is not None
+        if self.topk_verify_level >= 3:
+            return self._verify_split(sample_hidden_states, input_batch, grammar_output)
+        reason, k = self._topk_verify_plan(input_batch, grammar_output)
         line = self.topk_verify_stats.record(reason)
         if line is not None:
             logger.info("Verifying drafts: %s.", line)
         if reason is not None:
             return None
-        if not self._topk_verify_logged:
-            self._topk_verify_logged = True
-            logger.info(
-                "The first verify step took %d candidates per TP rank (%d rows).",
-                k,
-                input_batch.logits_indices.shape[0],
-            )
+        _log_first_verify_step(self, k, input_batch)
         assert self.sampler is not None and self.rejection_sampler is not None
         assert self.speculator is not None
         topk = self.model.compute_topk_logits(sample_hidden_states, k=k)
@@ -1313,6 +1393,74 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return self.rejection_sampler.verify_topk(
             topk, input_batch, self.speculator.draft_logits, has_sampled
         )
+
+    def _verify_split(
+        self,
+        sample_hidden_states: torch.Tensor,
+        input_batch: InputBatch,
+        grammar_output: GrammarOutput | None,
+    ) -> SamplerOutput | None:
+        """`_verify_from_topk_logits` for levels 3 and 4: every request verifies from
+        the candidates unless it needs the logits (``Sampler.topk_verify_split_plan``),
+        and only the logits of the others are gathered.
+
+        The two groups are verified by their own route on a view of the batch and the
+        outputs are written back to the batch order; a step in which no request can use
+        the candidates (or that has a step-level reason) returns None: the full path.
+        """
+        stats = self.topk_verify_stats
+        assert stats is not None and self.sampler is not None
+        assert self.rejection_sampler is not None and self.speculator is not None
+        step_reason = _topk_verify_step_reason(self, grammar_output)
+        plan = (
+            VerifyPlan(step_reason)
+            if step_reason is not None
+            else self.sampler.topk_verify_split_plan(
+                input_batch.idx_mapping_np,
+                self.topk_logits_k,
+                self.topk_verify_sampled,
+                self.topk_verify_level,
+            )
+        )
+        line = stats.record(
+            plan.reason, split=plan.full_reasons, num_reqs=input_batch.num_reqs
+        )
+        if line is not None:
+            logger.info("Verifying drafts: %s.", line)
+        if plan.reason is not None:
+            return None
+        _log_first_verify_step(self, plan.k, input_batch)
+        draft_logits = self.speculator.draft_logits
+        if plan.full is None:
+            topk = self.model.compute_topk_logits(sample_hidden_states, k=plan.k)
+            return self.rejection_sampler.verify_topk(
+                topk,
+                input_batch,
+                draft_logits,
+                plan.has_sampled,
+                use_min_p=plan.min_p,
+                use_top_p=plan.top_p,
+            )
+        assert plan.candidate is not None
+        device = sample_hidden_states.device
+        cand = SplitIndices(input_batch, plan.candidate, device)
+        full = SplitIndices(input_batch, plan.full, device)
+        topk, logits = self.model.compute_split_verify_logits(
+            sample_hidden_states, plan.k, cand.rows_t, full.rows_t
+        )
+        assert topk is not None and logits is not None
+        cand_out = self.rejection_sampler.verify_topk(
+            topk,
+            sampler_view(input_batch, cand),
+            draft_logits,
+            plan.has_sampled,
+            use_min_p=plan.min_p,
+            use_top_p=plan.top_p,
+        )
+        full_out = self.rejection_sampler(
+            logits, sampler_view(input_batch, full), draft_logits, None
+        )
+        return merge_outputs(input_batch.num_reqs, [(cand, cand_out), (full, full_out)])
 
     def _topk_logits_fallback_reason(
         self, input_batch: InputBatch, grammar_output: GrammarOutput | None
