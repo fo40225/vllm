@@ -53,6 +53,8 @@ def _build(checkpoint: dict[str, torch.Tensor], quant_config=None):
         hidden_size=K,
         intermediate_size=N,
         top_k=TOPK,
+        # SM120 defaults to the native FP4 experts; Marlin is explicit there.
+        moe_backend="auto" if quant_config is None else "marlin",
     )
     experts = runner.routed_experts.quant_method.moe_kernel.fused_experts
     return router, norm, runner, vllm_config, experts

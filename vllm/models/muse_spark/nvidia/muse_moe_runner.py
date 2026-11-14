@@ -76,6 +76,11 @@ from vllm.models.muse_spark.nvidia.ops.mnnvl_fusions import (
     maybe_create_moe_finalize_all_reduce,
     tp_group_spans_nodes,
 )
+from vllm.models.muse_spark.nvidia.sm120_nvfp4_moe import (
+    MuseSparkSm120NvFp4Experts,
+    check_sm120_nvfp4_supported,
+    make_sm120_nvfp4_quant_config,
+)
 from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
@@ -138,7 +143,7 @@ def validate_deployment(moe_config: FusedMoEConfig, *, kernel_routes: bool) -> N
 
 
 # Capability families that run the route-major Marlin (NVFP4) and Triton (BF16)
-# experts: Hopper, and SM120 as the non-native baseline.
+# experts: Hopper, and SM120, where Marlin is the non-native NVFP4 baseline.
 _ROUTE_MAJOR_CAPABILITY_FAMILIES = (90, 120)
 
 
@@ -148,6 +153,21 @@ def supports_route_major_experts() -> bool:
         current_platform.is_device_capability_family(family)
         for family in _ROUTE_MAJOR_CAPABILITY_FAMILIES
     )
+
+
+def uses_sm120_native_nvfp4(
+    moe_backend: str, quant_config: ModelOptNvFp4Config
+) -> bool:
+    """Whether NVFP4 layers run the native-FP4 experts on this device.
+
+    The default on SM120 for W4A4 checkpoints; weight-only (W4A16) checkpoints
+    keep the route-major Marlin experts, and ``marlin`` stays explicit.
+    """
+    if not current_platform.is_device_capability_family(120):
+        return False
+    if moe_backend == "cutlass":
+        return True
+    return moe_backend == "auto" and quant_config.quant_method != "W4A16_NVFP4"
 
 
 def _validate_route_major_deployment(moe_config: FusedMoEConfig) -> None:
@@ -585,8 +605,14 @@ class MuseSparkModelOptNvFp4FusedMoE(ModelOptNvFp4FusedMoE):
         quant_config: ModelOptNvFp4Config,
         moe_config: FusedMoEConfig,
     ) -> None:
+        self.use_sm120_native = uses_sm120_native_nvfp4(
+            moe_config.moe_backend, quant_config
+        )
+        if self.use_sm120_native:
+            self._init_sm120_native(quant_config, moe_config)
+            return
         if supports_route_major_experts() and moe_config.moe_backend == "auto":
-            # The oracle prefers FlashInfer CUTLASS over Marlin on SM120.
+            # The oracle prefers FlashInfer CUTLASS over Marlin.
             moe_config.moe_backend = "marlin"
         super().__init__(quant_config, moe_config)
         self.use_route_major = (
@@ -619,7 +645,40 @@ class MuseSparkModelOptNvFp4FusedMoE(ModelOptNvFp4FusedMoE):
             else MuseSparkTrtLlmNvFp4Experts
         )
 
+    def _init_sm120_native(
+        self,
+        quant_config: ModelOptNvFp4Config,
+        moe_config: FusedMoEConfig,
+    ) -> None:
+        # Bypasses the oracle, which prefers FlashInfer CUTLASS on SM120.
+        FusedMoEMethodBase.__init__(self, moe_config)
+        self.quant_config = quant_config
+        self.use_a16 = quant_config.quant_method == "W4A16_NVFP4"
+        self.per_token_activation = False
+        if (
+            self.use_a16
+            or quant_config.moe_activation_override is not None
+            or not self.moe.is_act_and_mul
+        ):
+            raise NotImplementedError(
+                "MuseSpark native NVFP4 MoE on SM120 requires W4A4 SwiGLU "
+                "checkpoints; use --moe-backend marlin for others."
+            )
+        _validate_route_major_deployment(moe_config)
+        check_sm120_nvfp4_supported(moe_config)
+        self.nvfp4_backend = NvFp4MoeBackend.VLLM_CUTLASS
+        self.experts_cls = MuseSparkSm120NvFp4Experts
+        self.use_route_major = False
+        # Load the input scales of every expert, so that their global max (the
+        # TRT-LLM semantics) is the same on all ranks under EP.
+        self.use_global_sf = True
+        logger.info_once("MuseSpark NVFP4: native FP4 grouped GEMMs on SM120.")
+
     def process_weights_after_loading(self, layer: "MuseSparkRoutedExperts") -> None:
+        if self.use_sm120_native:
+            self._process_sm120_native_weights(layer)
+            _attach_post_expert_finalize(self)
+            return
         if self.use_route_major:
             self._process_hopper_marlin_weights(layer)
             _attach_post_expert_finalize(self)
@@ -685,6 +744,29 @@ class MuseSparkModelOptNvFp4FusedMoE(ModelOptNvFp4FusedMoE):
         )
         _attach_post_expert_finalize(self)
         self.moe_kernel.fused_experts.process_weights_after_loading(layer)
+
+    def _process_sm120_native_weights(self, layer: "MuseSparkRoutedExperts") -> None:
+        # The packed weights are used as loaded. The generic ModelOpt flow would
+        # keep only column 0 of w13_weight_scale_2 [E, 2] and fuse the alphas
+        # into it in place; neither is acceptable here.
+        w13_scale, w2_scale, self.moe_quant_config = make_sm120_nvfp4_quant_config(
+            layer.w13_weight_scale.data,
+            layer.w2_weight_scale.data,
+            layer.w13_weight_scale_2.data,
+            layer.w13_input_scale.data,
+            layer.w2_weight_scale_2.data,
+            layer.w2_input_scale.data,
+        )
+        # Swapping the parameters frees the linear block scales.
+        replace_parameter(layer, "w13_weight_scale", w13_scale)
+        replace_parameter(layer, "w2_weight_scale", w2_scale)
+        self.moe_kernel = make_nvfp4_moe_kernel(
+            moe_quant_config=self.moe_quant_config,
+            moe_config=self.moe,
+            experts_cls=MuseSparkSm120NvFp4Experts,
+            backend=NvFp4MoeBackend.VLLM_CUTLASS,
+            routing_tables=layer._expert_routing_tables(),
+        )
 
     def _process_hopper_marlin_weights(self, layer: "MuseSparkRoutedExperts") -> None:
         # Keep the SiLU gate input exact; the up-side gain is compensated in
