@@ -9,7 +9,7 @@ never addressed by the logical view.
 
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, Mock
 
 import numpy as np
 import pytest
@@ -883,3 +883,94 @@ def test_packed_token_cache_cannot_be_split():
     packed = torch.zeros(3, 1, 2048, 1152, dtype=torch.uint8)[:, :, :1024]
     with pytest.raises(ValueError, match="cannot be split"):
         map_kv_caches_to_kernel_blocks({"layer.0": packed}, [group])
+
+
+class _GroupKeyBackend:
+    @staticmethod
+    def full_cls_name() -> tuple[str, str]:
+        return ("fake.backends", "GroupKeyBackend")
+
+    @staticmethod
+    def supports_batch_invariance() -> bool:
+        return True
+
+
+def _fake_attn_layer(
+    scale: float | None, logits_soft_cap: float | None = None, num_heads: int = 16
+) -> SimpleNamespace:
+    impl = SimpleNamespace(scale=scale, logits_soft_cap=logits_soft_cap)
+    return SimpleNamespace(
+        num_heads=num_heads, impl=impl, get_attn_backend=lambda: _GroupKeyBackend
+    )
+
+
+def test_attn_group_key_splits_on_scale_and_soft_cap():
+    spec = FullAttentionSpec(
+        block_size=16, num_kv_heads=2, head_size=64, dtype=torch.bfloat16
+    )
+
+    def key(layer: SimpleNamespace, kv_spec=spec):
+        return attn_utils.get_attn_group_key(_GroupKeyBackend, kv_spec, layer)
+
+    base = key(_fake_attn_layer(0.68))
+    assert base == key(_fake_attn_layer(0.68))
+    assert base != key(_fake_attn_layer(0.125))
+    assert base != key(_fake_attn_layer(0.68, logits_soft_cap=30.0))
+    assert base != key(_fake_attn_layer(0.68, num_heads=8))
+    other_spec = FullAttentionSpec(
+        block_size=16, num_kv_heads=2, head_size=128, dtype=torch.bfloat16
+    )
+    assert base != key(_fake_attn_layer(0.68), other_spec)
+    # Layers without an impl (or without a scale) still produce a stable key.
+    bare = SimpleNamespace(get_attn_backend=lambda: _GroupKeyBackend)
+    assert key(bare) == key(bare)
+
+
+@pytest.mark.parametrize("draft_scale", [0.125, 0.68])
+def test_init_attn_backend_splits_same_spec_layers_by_scale(
+    monkeypatch: pytest.MonkeyPatch, draft_scale: float
+):
+    """A draft sharing the target's KV cache group but attending with another
+    softmax scale (DFlash2 vs the QK-scaled Muse target) needs its own attention
+    group: FlashInfer plans one sm_scale per metadata builder."""
+    spec = FullAttentionSpec(
+        block_size=16, num_kv_heads=2, head_size=64, dtype=torch.bfloat16
+    )
+    layers = {
+        "t0": _fake_attn_layer(0.68),
+        "d0": _fake_attn_layer(draft_scale),
+        "t1": _fake_attn_layer(0.68),
+        "d1": _fake_attn_layer(draft_scale),
+    }
+    kv_cache_config = SimpleNamespace(
+        kv_cache_groups=[KVCacheGroupSpec(list(layers), spec)]
+    )
+    monkeypatch.setattr(
+        attn_utils,
+        "get_layers_from_vllm_config",
+        lambda cfg, cls, names=None: {n: layers[n] for n in (names or layers)},
+    )
+    monkeypatch.setattr(attn_utils, "add_kv_sharing_layers_to_kv_cache_groups", Mock())
+    monkeypatch.setattr(attn_utils, "get_shared_kv_cache_layers", lambda *a: {})
+    monkeypatch.setattr(
+        attn_utils, "get_kv_sharing_fast_prefill_eligible_layers", lambda *a: set()
+    )
+    monkeypatch.setattr(attn_utils, "prepare_kernel_block_sizes", lambda *a: [16])
+    monkeypatch.setattr(attn_utils, "get_num_ubatches", lambda *a: 1)
+    monkeypatch.setattr(
+        attn_utils, "get_attn_cg_support", lambda *a, **k: "cg_support_info"
+    )
+    monkeypatch.setattr(AttentionGroup, "create_metadata_builders", Mock())
+    vllm_config = SimpleNamespace(parallel_config=None)
+
+    attn_groups, cg_info, _ = attn_utils.init_attn_backend(
+        kv_cache_config, vllm_config, torch.device("cpu")
+    )
+
+    assert cg_info == "cg_support_info"
+    assert len(attn_groups) == 1
+    split = [g.layer_names for g in attn_groups[0]]
+    if draft_scale == 0.68:
+        assert split == [["t0", "d0", "t1", "d1"]]
+    else:
+        assert split == [["t0", "t1"], ["d0", "d1"]]

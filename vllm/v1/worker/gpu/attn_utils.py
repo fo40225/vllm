@@ -194,6 +194,30 @@ def get_kv_sharing_fast_prefill_eligible_layers(
     return eligible_layers
 
 
+def get_attn_group_key(
+    attn_backend: Any, kv_cache_spec: KVCacheSpec, attn_layer: Any
+) -> tuple[Any, ...]:
+    """Key under which a layer shares an attention group, i.e. one metadata builder.
+
+    Besides the backend and the KV cache spec, layers split on:
+    - the per-rank num_heads_q, so layers with different Q-head counts (e.g. a
+      spec-decode draft head and its target) get separate metadata builders;
+    - the softmax scale and the logits soft cap, which builders plan with once
+      per group (FlashInfer asserts that they are equal across the group). A
+      draft with a different scale can share the target's KV cache group: the
+      DFlash2 draft attends with head_dim**-0.5 next to the Muse target's
+      QK-scaled layers and has the same sliding-window KV spec.
+    """
+    impl = getattr(attn_layer, "impl", None)
+    return (
+        attn_backend.full_cls_name(),
+        kv_cache_spec,
+        getattr(attn_layer, "num_heads", 0),
+        getattr(impl, "scale", None),
+        getattr(impl, "logits_soft_cap", None),
+    )
+
+
 def init_attn_backend(
     kv_cache_config: KVCacheConfig,
     vllm_config: VllmConfig,
@@ -227,8 +251,8 @@ def init_attn_backend(
         layer_type = cast(type[Any], AttentionLayerBase)
         attn_layers = get_layers_from_vllm_config(vllm_config, layer_type, layer_names)
 
-        group_map: dict[tuple[tuple[str, str], KVCacheSpec, int], AttentionGroup] = {}
-        group_order: list[tuple[tuple[str, str], KVCacheSpec, int]] = []
+        group_map: dict[tuple[Any, ...], AttentionGroup] = {}
+        group_order: list[tuple[Any, ...]] = []
 
         for layer_name in layer_names:
             attn_backend = attn_layers[layer_name].get_attn_backend()
@@ -249,11 +273,9 @@ def init_attn_backend(
             if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
                 layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[layer_name]
 
-            # Split on per-rank num_heads_q so layers with different Q-head
-            # counts (e.g. a spec-decode draft head and its target) get separate
-            # metadata builders.
-            num_heads_q = getattr(attn_layers[layer_name], "num_heads", 0)
-            key = (attn_backend.full_cls_name(), layer_kv_cache_spec, num_heads_q)
+            key = get_attn_group_key(
+                attn_backend, layer_kv_cache_spec, attn_layers[layer_name]
+            )
             if key not in group_map:
                 group_map[key] = AttentionGroup(
                     attn_backend, [layer_name], layer_kv_cache_spec, kv_cache_group_id
