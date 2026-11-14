@@ -4,7 +4,8 @@
 
 import inspect
 import math
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from itertools import islice
 from typing import Any, cast
@@ -374,6 +375,63 @@ def is_sequence_parallel_enabled(vllm_config: VllmConfig) -> bool:
     )
 
 
+# SM120 sequence-parallel prefill never takes the batches that run in CUDA graphs or
+# use the fused decode-sized all-reduce, which end at 256 tokens.
+_SM120_SEQUENCE_PARALLEL_FLOOR_TOKENS = 257
+
+
+def is_sm120_sequence_parallel_enabled(vllm_config: VllmConfig) -> bool:
+    """Whether large prefill batches shard the stream along the sequence on SM120.
+
+    Opt-in. The stream is sharded only for batches of at least
+    ``sm120_sequence_parallel_min_tokens``; the experts still see every token,
+    through the same runner as the replicated stream.
+    """
+    pc = vllm_config.parallel_config
+    mlp_layer_types = getattr(
+        vllm_config.model_config.hf_text_config, "mlp_layer_types", None
+    )
+    return (
+        envs.VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL
+        and current_platform.is_cuda()
+        and current_platform.is_device_capability_family(120)
+        and vllm_config.kernel_config.moe_backend != "deep_gemm_mega_moe"
+        and pc.pipeline_parallel_size == 1
+        and pc.data_parallel_size == 1
+        and pc.enable_expert_parallel
+        and pc.tensor_parallel_size > 1
+        and not pc.use_sequence_parallel_moe
+        and not envs.VLLM_BATCH_INVARIANT
+        # The sharded FFN branch is the MoE one.
+        and mlp_layer_types is not None
+        and all(layer_type == "sparse" for layer_type in mlp_layer_types)
+    )
+
+
+def sm120_sequence_parallel_min_tokens() -> int:
+    return max(
+        envs.VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_MIN_TOKENS,
+        _SM120_SEQUENCE_PARALLEL_FLOOR_TOKENS,
+    )
+
+
+@contextmanager
+def _fp32_split_k_reduction() -> Iterator[None]:
+    """Keep cuBLAS from reducing split-K partial sums in bf16.
+
+    On the small batches of the sharded stream cuBLAS can split K to fill the GPU
+    and, by default, reduces the slices in bf16: an extra rounding (rel. L2 error
+    2.6e-3 against 1.7e-3 for a single rounding of the fp32 sum).
+    """
+    matmul = torch.backends.cuda.matmul
+    previous = matmul.allow_bf16_reduced_precision_reduction
+    matmul.allow_bf16_reduced_precision_reduction = False
+    try:
+        yield
+    finally:
+        matmul.allow_bf16_reduced_precision_reduction = previous
+
+
 class MuseSpark1xMoE(nn.Module):
     post_norm_routed_experts_cls = MuseSparkRoutedExperts
     post_norm_runner_cls = MuseMoERunner
@@ -497,6 +555,11 @@ class MuseSpark1xMoE(nn.Module):
                 "--enable-expert-parallel, or drop the moe backend."
             )
         self.is_sequence_parallel = is_sequence_parallel_enabled(vllm_config)
+        # Large prefill batches only (see forward_sequence_parallel); this does not
+        # change how a replicated batch runs, so it stays out of the flags below.
+        self.sm120_sequence_parallel = (
+            not self.use_mega_moe and is_sm120_sequence_parallel_enabled(vllm_config)
+        )
         # Only the megakernel takes the shard; FusedMoE gets replicated tokens.
         self.use_sequence_parallel_moe = (
             False
@@ -622,6 +685,15 @@ class MuseSpark1xMoE(nn.Module):
             },
             moe_config_cls=MuseSparkMoEConfig,
         )
+        if (
+            self.sm120_sequence_parallel
+            and self.experts.routed_experts.quant_method.is_monolithic
+        ):
+            raise NotImplementedError(
+                "VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL needs experts that take "
+                "the routing from the caller; the monolithic "
+                f"--moe-backend {vllm_config.kernel_config.moe_backend} does not."
+            )
 
     def finalize_mega_moe_weights(self) -> None:
         if self.use_mega_moe:
@@ -1015,6 +1087,67 @@ class MuseSpark1xMoE(nn.Module):
 
         return experts_out
 
+    def forward_sequence_parallel(
+        self,
+        hidden_states: torch.Tensor,
+        num_tokens: int,
+        router_input: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """This rank's rows of the branch, for a stream sharded along the sequence.
+
+        ``hidden_states`` holds this rank's rows of the pre-FFN norm output (the
+        batch padded to a multiple of the TP size) and ``num_tokens`` is the
+        unpadded batch size. The router, the pooler and the pre-expert norm run on
+        the local rows only. The experts take every row, as in the replicated
+        stream, from the gathered latent and routes; their per-rank partial sums
+        are reduce-scattered to the rows' owners, ahead of the local unpooler.
+        ``router_input``, if given, is ``hidden_states`` widened to fp32 (written by
+        the boundary kernel), which the router would otherwise cast itself.
+        """
+        assert self.sm120_sequence_parallel
+        assert self.pooler is not None and self.unpooler is not None
+        assert self.pre_expert_norm is not None
+        logger.info_once(
+            "MuseSpark SM120: sequence-parallel residual stream for batches of at "
+            "least %d tokens.",
+            sm120_sequence_parallel_min_tokens(),
+        )
+        router = self.moe_router
+        top_k = router.top_k
+        router_logits, _ = self.router(
+            hidden_states if router_input is None else router_input
+        )
+        # Ids and the bits of the fp32 weights share one buffer, so one gather.
+        routes = torch.empty(
+            (hidden_states.shape[0], 2 * top_k),
+            dtype=torch.int32,
+            device=hidden_states.device,
+        )
+        fused_musespark1x_routing(
+            router_logits,
+            router.expert_bias,
+            top_k,
+            router.route_scale,
+            router_output_multiplier=router.router_output_multiplier,
+            router_score_normalization=router.router_score_normalization,
+            router_score_division_eps=router.router_score_division_eps,
+            topk_ids=routes[:, :top_k],
+            topk_weights=routes[:, top_k:].view(torch.float32),
+        )
+        # Not the sharded projections: those need the same rows on every rank.
+        with _fp32_split_k_reduction():
+            pooled = self.pooler(hidden_states)[0]
+        pooled = sp_all_gather(self.pre_expert_norm(pooled))[:num_tokens]
+        routes = sp_all_gather(routes)[:num_tokens]
+        topk_ids = routes[:, :top_k].contiguous()
+        topk_weights = routes[:, top_k:].contiguous().view(torch.float32)
+        if router.capture_fn is not None:
+            router.capture_fn(topk_ids)
+        partial = self.experts.forward_routed_partial(pooled, topk_weights, topk_ids)
+        rows = sp_reduce_scatter(partial)
+        with _fp32_split_k_reduction():
+            return self.unpooler(rows)[0]
+
 
 class MuseSpark1xAttention(nn.Module):
     def __init__(
@@ -1153,6 +1286,8 @@ class MuseSpark1xAttention(nn.Module):
             prefix=f"{prefix}.o_proj",
         )
         self.is_sequence_parallel_output = False
+        # Smallest batch that shards the stream; None: one token per rank.
+        self.sp_min_tokens: int | None = None
         self.gemm_rs = None
 
         # get_rope shares one instance (and its cos/sin cache, ~256 MiB in
@@ -1345,7 +1480,7 @@ class MuseSpark1xAttention(nn.Module):
 
     def _project_output(self, attn_output: torch.Tensor) -> torch.Tensor:
         sp_active = is_sequence_parallel_active(
-            self.is_sequence_parallel_output, attn_output.shape[0]
+            self.is_sequence_parallel_output, attn_output.shape[0], self.sp_min_tokens
         )
         if (
             sp_active
@@ -1472,9 +1607,21 @@ class MuseSpark1xDecoderLayer(nn.Module):
         # Set by the model when the next boundary may consume unpooler shards.
         self.all_gather_dual_norm: Any | None = None
 
-        self.is_sequence_parallel = is_sequence_parallel_enabled(vllm_config)
+        self.sm120_sequence_parallel = (
+            self.is_moe_layer and is_sm120_sequence_parallel_enabled(vllm_config)
+        )
+        self.is_sequence_parallel = (
+            is_sequence_parallel_enabled(vllm_config) or self.sm120_sequence_parallel
+        )
+        # Smallest batch that shards the stream; None: one token per rank.
+        self.sp_min_tokens = (
+            sm120_sequence_parallel_min_tokens()
+            if self.sm120_sequence_parallel
+            else None
+        )
         self.is_sequence_parallel_input = self.is_sequence_parallel
         self.self_attn.is_sequence_parallel_output = self.is_sequence_parallel
+        self.self_attn.sp_min_tokens = self.sp_min_tokens
         if self.is_sequence_parallel:
             self.self_attn.o_proj.reduce_results = False
 
@@ -1515,8 +1662,9 @@ class MuseSpark1xDecoderLayer(nn.Module):
         assert stream.dtype == self.residual_dtype
 
         sp_active = is_sequence_parallel_active(
-            self.is_sequence_parallel, positions.shape[0]
+            self.is_sequence_parallel, positions.shape[0], self.sp_min_tokens
         )
+        sm120_sp = sp_active and self.sm120_sequence_parallel
         if sp_active and self.is_sequence_parallel_input:
             # Positions carries the unpadded length of the gathered sequence.
             attn_input = sp_all_gather(attn_input)[: positions.shape[0]]
@@ -1526,7 +1674,9 @@ class MuseSpark1xDecoderLayer(nn.Module):
         router_input = None
         cast_router_input = False
         if isinstance(self.feed_forward, MuseSpark1xMoE):
-            if self.feed_forward.wants_fp32_router_input(attn_out.shape[0]):
+            if not sm120_sp and self.feed_forward.wants_fp32_router_input(
+                attn_out.shape[0]
+            ):
                 router_input = torch.empty_like(attn_out, dtype=torch.float32)
             elif self.feed_forward.wants_cast_router_input(attn_out.shape[0]):
                 router_input = torch.empty_like(attn_out, dtype=torch.float32)
@@ -1543,7 +1693,13 @@ class MuseSpark1xDecoderLayer(nn.Module):
             router_input=None if cast_router_input else router_input,
             out_fp32=router_input if cast_router_input else None,
         )
-        if sp_active and not self.feed_forward.use_mega_moe:
+        if sm120_sp:
+            # The router reads the boundary's fp32 copy of this rank's rows, when the
+            # boundary wrote one (it never holds the unrounded mega-MoE input here).
+            branch = cast(MuseSpark1xMoE, self.feed_forward).forward_sequence_parallel(
+                ffn_in, positions.shape[0], router_input=router_input
+            )
+        elif sp_active and not self.feed_forward.use_mega_moe:
             # Non-megakernel experts need every token.
             branch = sp_shard(self.feed_forward(sp_all_gather(ffn_in)))
         elif self._defers_column_gather(ffn_in.shape[0]):
@@ -1610,7 +1766,12 @@ class MuseSpark1xModel(LlamaModel):
         self.residual_dtype = torch.float32
 
         self.fuse_across_layers = get_pp_group().world_size == 1
-        self.is_sequence_parallel = is_sequence_parallel_enabled(vllm_config)
+        sm120_sp = is_sm120_sequence_parallel_enabled(vllm_config)
+        self.is_sequence_parallel = (
+            is_sequence_parallel_enabled(vllm_config) or sm120_sp
+        )
+        # Smallest batch that shards the stream; None: one token per rank.
+        self.sp_min_tokens = sm120_sequence_parallel_min_tokens() if sm120_sp else None
         self.make_empty_intermediate_tensors = self._make_empty_intermediate_tensors
         self.is_sequence_parallel_input = self.is_sequence_parallel
         self._configure_replicated_prefix()
@@ -1762,7 +1923,7 @@ class MuseSpark1xModel(LlamaModel):
             self.residual_dtype
         )
         sp_active = is_sequence_parallel_active(
-            self.is_sequence_parallel, positions.shape[0]
+            self.is_sequence_parallel, positions.shape[0], self.sp_min_tokens
         )
         if sp_active and self.is_sequence_parallel_input:
             x = sp_shard(x)

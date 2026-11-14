@@ -1066,6 +1066,27 @@ class MuseMoERunner(MoERunner):
             output, None, self._fused_output_is_reduced
         )
 
+    def forward_routed_partial(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """``forward_routed`` without the EP combine.
+
+        Every rank runs its local experts on all the rows and returns its partial
+        sum; the caller owns the cross-rank sum (a reduce-scatter in the
+        sequence-parallel stream), which ``forward`` does as a late all-reduce.
+        """
+        routed_experts = self.routed_experts
+        assert not routed_experts.quant_method.is_monolithic
+        routed_experts._ensure_moe_quant_config_init()
+        output = routed_experts.forward_modular(hidden_states, topk_weights, topk_ids)
+        assert isinstance(output, torch.Tensor)
+        # The fused finalize + all-reduce is for decode-sized batches only.
+        assert not self.post_expert_finalize.output_reduced
+        return self._maybe_apply_routed_scale_to_output(None, output)[1]
+
     @property
     def supports_routed_forward(self) -> bool:
         """Whether ``forward_routed`` is ``forward`` for routing done by the caller.

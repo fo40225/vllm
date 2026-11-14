@@ -26,13 +26,17 @@ def _custom_collective(name: str, x: torch.Tensor) -> torch.Tensor | None:
 
 
 @lru_cache
-def is_sequence_parallel_active(is_enabled: bool, num_tokens: int) -> bool:
+def is_sequence_parallel_active(
+    is_enabled: bool, num_tokens: int, min_tokens: int | None = None
+) -> bool:
     """Whether a batch of ``num_tokens`` shards the stream along the sequence.
 
-    Below one token per rank the shards are mostly padding, so the batch
-    stays replicated.
+    Below ``min_tokens`` (default: one token per rank, under which the shards
+    are mostly padding) the batch stays replicated.
     """
-    return is_enabled and num_tokens >= get_tensor_model_parallel_world_size()
+    if min_tokens is None:
+        min_tokens = get_tensor_model_parallel_world_size()
+    return is_enabled and num_tokens >= min_tokens
 
 
 def sp_all_gather(x: torch.Tensor) -> torch.Tensor:

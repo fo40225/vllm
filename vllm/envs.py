@@ -146,6 +146,8 @@ if TYPE_CHECKING:
     )
     VLLM_MUSE_SPARK_SM120_EXACT_GEMM1: bool = True
     VLLM_MUSE_SPARK_SM120_PREFILL_LOCAL_ROWS: bool = True
+    VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL: bool = False
+    VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_MIN_TOKENS: int = 512
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
     VLLM_ROCM_USE_AITER_LINEAR_HIPBMM: bool = False
     VLLM_ROCM_USE_AITER_MOE: bool = True
@@ -1342,6 +1344,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # engine loads it). Read once, when a layer is constructed.
     "VLLM_MUSE_SPARK_SM120_PREFILL_LOCAL_ROWS": lambda: bool(
         int(os.getenv("VLLM_MUSE_SPARK_SM120_PREFILL_LOCAL_ROWS", "1"))
+    ),
+    # Muse Spark on SM120 with expert parallel: keep the residual stream sharded
+    # along the sequence for large prefill batches. Attention output and expert
+    # output are reduce-scattered instead of all-reduced, and the norms, the
+    # router, the pooler and the unpooler run on this rank's rows only. The
+    # reduce-scatter + all-gather rounds the bf16 sums differently from the
+    # all-reduce, so outputs are deterministic but not bitwise equal to the
+    # replicated stream. Decode and short prefill batches are unchanged.
+    "VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL": lambda: bool(
+        int(os.getenv("VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL", "0"))
+    ),
+    # Muse Spark on SM120: smallest batch (in tokens) that takes the sharded
+    # stream when VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL is on. Values below
+    # 257 are raised to 257: batches of up to 256 tokens use CUDA graphs and the
+    # fused decode-sized all-reduce. The stream pays three more collectives per
+    # layer than the replicated one; on 8 PCIe GPUs that is repaid from about
+    # 400 tokens on (TTFT at 300 tokens +19%, at 512 tokens -9%).
+    "VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_MIN_TOKENS": lambda: int(
+        os.getenv("VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_MIN_TOKENS", "512")
     ),
     # use aiter linear op if aiter ops are enabled
     # The following list of related ops

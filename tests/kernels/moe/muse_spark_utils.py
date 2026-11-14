@@ -49,11 +49,12 @@ def make_runner(
     intermediate_size: int,
     top_k: int,
     moe_backend: str = "auto",
+    parallel_config: ParallelConfig | None = None,
 ):
     """Build a MuseSpark runner, load ``ckpt`` and finalize its weights."""
     num_experts = expert_bias.numel()
     vllm_config = VllmConfig(
-        parallel_config=ParallelConfig(),
+        parallel_config=parallel_config or ParallelConfig(),
         kernel_config=KernelConfig(moe_backend=moe_backend),
     )
     with set_current_vllm_config(vllm_config):
