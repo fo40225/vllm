@@ -29,6 +29,7 @@ if not torch.cuda.is_available():
     )
 
 from vllm.sampling_params import SamplingParams
+from vllm.v1.worker.gpu import model_runner as model_runner_module
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
@@ -36,6 +37,7 @@ from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.sample.topk_logits import RouteStats, VerifyPlan
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
 from vllm.v1.worker.gpu.spec_decode.verify_split import (
+    SPLIT_MIN_CANDIDATE_REQS,
     SplitIndices,
     merge_outputs,
     request_rows,
@@ -62,10 +64,18 @@ from .test_gpu_topk_verify import (
 STEPS = 7
 
 
-def split_plan(sampler, rows, level=3, sampled=True, k=K):
+def split_plan(sampler, rows, level=3, sampled=True, k=K, min_candidates=1):
     return sampler.topk_verify_split_plan(
-        np.asarray(rows, dtype=np.intp), k, sampled, level
+        np.asarray(rows, dtype=np.intp), k, sampled, level, min_candidates
     )
+
+
+@pytest.fixture(autouse=True)
+def one_candidate_request_is_enough(monkeypatch):
+    """The routing tests use steps of a few requests: the guard that sends a split with
+    fewer than SPLIT_MIN_CANDIDATE_REQS candidate requests to the full path is tested
+    on its own, with the real constant."""
+    monkeypatch.setattr(model_runner_module, "SPLIT_MIN_CANDIDATE_REQS", 1)
 
 
 # --------------------------------------------------------------------------------
@@ -178,6 +188,26 @@ def test_a_step_of_requests_that_all_need_the_logits_has_the_first_reason():
     assert plan.reason == "logits-processing" and plan.k == 0
     plan = split_plan(sampler, [2, 1], 3)
     assert plan.reason == "top-k-unset-or-above-k"
+
+
+def test_a_split_with_few_candidate_requests_takes_the_full_path():
+    # The fixed cost of a split is repaid from about SPLIT_MIN_CANDIDATE_REQS candidate
+    # requests: below that the whole step takes the full path, a step without a full
+    # request is not a split and keeps the candidates whatever its size.
+    n = SPLIT_MIN_CANDIDATE_REQS
+    sampler = sampler_with(*([T1K64] * n), PENALTY)
+    plan = split_plan(sampler, range(n), 3, min_candidates=n)
+    assert plan.reason is None and plan.full is None
+    plan = split_plan(sampler, range(n + 1), 3, min_candidates=n)
+    assert plan.reason is None and plan.full.tolist() == [n]
+    assert plan.candidate.tolist() == list(range(n))
+    plan = split_plan(sampler, [*range(n - 1), n], 3, min_candidates=n)
+    assert plan.reason == "few-candidates" and plan.k == 0 and plan.full is None
+    # A step in which every request needs the logits keeps the reason of the first.
+    assert split_plan(sampler, [n], 3, min_candidates=n).reason == "logits-processing"
+    # Greedy requests count as candidates.
+    sampler = sampler_with(GREEDY, GREEDY, GREEDY, GREEDY, GREEDY, PENALTY)
+    assert split_plan(sampler, range(6), 3, min_candidates=5).full.tolist() == [5]
 
 
 def test_the_plan_reads_only_the_requests_of_the_batch():
@@ -469,6 +499,32 @@ def test_a_step_with_requests_on_the_logits_gathers_both_and_merges():
     }
 
 
+def test_the_runner_keeps_a_split_below_the_candidate_minimum_on_the_full_path(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        model_runner_module, "SPLIT_MIN_CANDIDATE_REQS", SPLIT_MIN_CANDIDATE_REQS
+    )
+    n = SPLIT_MIN_CANDIDATE_REQS
+    for cands, split in ((n - 1, False), (n, True)):
+        events: list = []
+        sampler = sampler_with(*([T1K64] * cands), PENALTY)
+        runner = split_runner(events, sampler, level=3)
+        batch = fake_input_batch([7] * (cands + 1), list(range(cands + 1)))
+        out = run_verify(runner, batch)
+        stats = runner.topk_verify_stats
+        if split:
+            assert out is not None and stats.split_steps == 1
+            assert events == [
+                "compute_split_verify_logits",
+                "verify_topk",
+                "rejection_sampler",
+            ]
+        else:
+            assert out is None and events == []
+            assert stats.fallbacks == {"few-candidates": 1} and stats.taken == 0
+
+
 def test_a_step_without_a_full_row_gathers_the_candidates_only():
     events: list = []
     sampler = sampler_with(T1K64, MIN_P, GREEDY)
@@ -573,12 +629,34 @@ def test_the_split_step_equals_the_full_path_for_every_request(level: int):
     that need the logits (penalty, top_k above K, top_p at level 3). The accepted tokens
     and the resampled token of each equal what the full path gives for the same batch
     (every request is verified by one route only, on its own rows)."""
-    n = 40
-    rng = np.random.default_rng(level)
-    kinds = rng.integers(0, 8, n)
-    kinds[:8] = np.arange(8)
+    kinds = np.random.default_rng(level).integers(0, 9, 40)
+    kinds[:9] = np.arange(9)
+    plan = check_split_equals_full(level, kinds, seed=level)
+    # Every kind of request and both routes took part; a top_p request without a top_k
+    # is on the full route.
+    assert set(kinds.tolist()) == set(range(9))
+    assert all(r in plan.full for r in range(len(kinds)) if kinds[r] == 8)
+    assert len(plan.candidate) >= 10 and len(plan.full) >= 10
+    assert plan.min_p and (plan.top_p == (level == 4))
+
+
+def test_a_top_p_request_without_a_top_k_gets_the_tokens_of_the_whole_step():
+    """The nucleus kernel takes another pipeline for 64 rows or fewer without an active
+    top_k than for a bigger batch: the full subset of 2 such requests (16 rows) next to
+    12 candidate requests (112 rows in all) is such a case. On rows whose nucleus
+    boundary is no tie the tokens equal those of the whole step (the law is the same;
+    at a tie of the boundary the full path alone differs between small and big
+    batches)."""
+    kinds = np.array([1] * 6 + [0] * 6 + [8] * 2)
+    plan = check_split_equals_full(3, kinds, seed=77, num_draft=[7] * len(kinds))
+    assert plan.full.tolist() == [12, 13] and len(plan.candidate) == 12
+
+
+def check_split_equals_full(level, kinds, seed, num_draft=None):
+    n = len(kinds)
+    rng = np.random.default_rng(seed)
     # 0 greedy, 1 plain, 2 min_p, 3 top_p, 4 frequency penalty, 5 top_k above K,
-    # 6 greedy with a logit bias, 7 sampled with a logit bias
+    # 6 greedy with a logit bias, 7 sampled with a logit bias, 8 top_p without a top_k
     params = []
     for r, kind in enumerate(kinds):
         seed = int(rng.integers(1, 1 << 30))
@@ -610,6 +688,8 @@ def test_the_split_step_equals_the_full_path_for_every_request(level: int):
             )
         elif kind == 5:
             p = SamplingParams(temperature=1.0, top_k=200, seed=seed)
+        elif kind == 8:
+            p = SamplingParams(temperature=1.0, top_p=0.9, seed=seed)
         else:
             bias = {
                 SHARED_IDS[int(i)]: float(rng.choice([-4.0, 3.0]))
@@ -635,9 +715,24 @@ def test_the_split_step_equals_the_full_path_for_every_request(level: int):
                 rng.integers(1, 6, 32), dtype=torch.int32, device=DEVICE
             )
             sampler.penalties_state.output_bin_counts[slot, SHARED_IDS] = counts
-    num_draft = rng.choice([0, 7, 7, 7, 3, 1], n).tolist()
+    if num_draft is None:
+        num_draft = rng.choice([0, 7, 7, 7, 3, 1], n).tolist()
     rows = sum(d + 1 for d in num_draft)
     raw = head_logits(rows, seed=level)
+    # The rows of the top_p requests without a top_k: a ladder of 24 distinct logits
+    # (steps of 1.7: the nucleus is the first two tokens, the boundary is no tie), so
+    # that the two pipelines of the nucleus kernel (small subset against whole step)
+    # must agree.
+    start = 0
+    for r in range(n):
+        if kinds[r] == 8:
+            g = torch.Generator(device=DEVICE).manual_seed(900 + r)
+            for row in range(start, start + num_draft[r] + 1):
+                ids = torch.randperm(VOCAB, generator=g, device=DEVICE)[:24]
+                raw[row, ids] = (
+                    60.0 - 1.7 * torch.arange(24, device=DEVICE, dtype=torch.float32)
+                ).to(torch.bfloat16)
+        start += num_draft[r] + 1
     # The drafts and the draft distribution of the kernel tests' batch; the request
     # state of the sampler holds the sampling parameters and seeds.
     harness = Batch(
@@ -687,7 +782,4 @@ def test_the_split_step_equals_the_full_path_for_every_request(level: int):
     bad = [r for r in range(n) if got[r] != want[r]]
     assert not bad, [(r, int(kinds[r]), want[r], got[r]) for r in bad]
     assert merged.num_rejected.tolist() == expected.num_rejected.tolist()
-    # Every kind of request and both routes took part.
-    assert set(kinds.tolist()) == set(range(8))
-    assert len(plan.candidate) >= 10 and len(plan.full) >= 10
-    assert plan.min_p and (plan.top_p == (level == 4))
+    return plan

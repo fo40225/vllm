@@ -1776,24 +1776,34 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # gathered whole and verified by the full path, the other requests of the step
     # verify from the candidates (one lm_head projection serves both, the outputs are
     # merged in the batch order; logprobs, a grammar and the sampler features that work
-    # on all rows still send the whole step to the full path); and requests with min_p
-    # (and no top_p) verify from the candidates too: their threshold is the full
-    # path's, bit for bit (vLLM rejects min_p and logit_bias requests under speculative
-    # decoding for now, SamplingParams._validate_spec_decode: no such request reaches
-    # the verification today). 4: also requests with top_p below 1 (and no min_p): the
-    # nucleus of the full path's top-k + top-p kernel over the candidates. That kernel
-    # finds its nucleus by an fp32 pivot search whose result for tokens that tie at the
-    # boundary depends on how an exp / log round trip rounds, and so on the bits of a
-    # sum that depend on the whole row: the candidates reproduce its rule and the tokens
-    # are those of the full path on all of 3014 measured decode rows at top_p up to
-    # 0.95 (and on all but 2 at 0.99), but not on every row of every distribution (a few
-    # percent of the rows of tie-rich logits of small magnitude): a rounding-level
-    # difference of the kept set in the far tail of the nucleus, which the output
-    # distribution does not see. The whole path is off for adaptive verification, a
-    # watermark, synthetic
-    # acceptance rates, a rejection sampler of another class, and a draft distribution
-    # narrower than the vocabulary; with a draft distribution of another width than
-    # the vocabulary, or without one, only the greedy steps take it. Needs
+    # on all rows still send the whole step to the full path, and so does a step with
+    # fewer than 5 candidate requests: the split costs about 0.5 ms and repays from
+    # about 5 of them). Every request keeps the tokens of level 2, with one exception
+    # that the full path has too: a request without a top_k below the vocabulary and
+    # with top_p below 1 is verified on its own subset of rows, and the top-k + top-p
+    # kernel takes another pipeline for 64 rows or fewer than for a bigger batch, so at
+    # a tie of the nucleus boundary its tokens can differ from those of a whole step
+    # (the full path alone differs in the same way between 8 and 9 requests). Requests
+    # with min_p (and no top_p) verify from the candidates too: their threshold is the
+    # full path's, bit for bit (vLLM rejects logit_bias and a min_p above 1e-5 under
+    # speculative decoding, SamplingParams._validate_spec_decode: no such request
+    # reaches the verification in practice, and min_p adds nothing to the measured
+    # gain). 4: also requests with top_p below 1 (and no min_p): the nucleus of the
+    # full path's top-k + top-p kernel over the candidates. NOT distribution-exact: that
+    # kernel finds its nucleus by an fp32 pivot search whose result for tokens that tie
+    # at the boundary depends on how an exp / log round trip rounds and on the bits of
+    # a sum over the whole row, and the candidates cannot see those. On a small share
+    # of the rows (tie-rich logits of small magnitude, a temperature above 1, top_p
+    # 0.99, a nucleus that reaches the k-th place) the kept set differs from the full
+    # path's in members of a tie group, tokens that carry the boundary probability
+    # (at least (1 - top_p) / N, about 1e-3 at top_p 0.95): such a row's distribution
+    # moves by up to about 1 % in total variation. 0 of 3014 measured decode rows
+    # differ at top_p up to 0.95 (temperature 0.7 and 1), so the measured cost is
+    # nil, but the equality is not guaranteed: opt-in, never the default. The whole
+    # path is off for adaptive verification, a watermark, synthetic acceptance rates, a
+    # rejection sampler of another class, and a draft distribution narrower than the
+    # vocabulary; with a draft distribution of another width than the vocabulary, or
+    # without one, only the greedy steps take it. Needs
     # VLLM_MUSE_SPARK_SM120_TOPK_LOGITS=1. The share of verified steps on the path and
     # the reasons of the others are logged every 30 s ("steps with drafts"; those steps
     # do not count in the lines of the top-k logits sampling). Read once, in load_model.

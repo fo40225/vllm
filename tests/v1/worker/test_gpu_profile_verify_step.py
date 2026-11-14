@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm.v1.worker.gpu import model_runner as model_runner_module
 from vllm.v1.worker.gpu.input_batch import InputBuffers
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
@@ -130,10 +131,8 @@ def test_the_dummy_verify_step_compiles_the_candidate_path_after_the_full_one(
     must cover it), then the verification from the top-k logits once per shape."""
     events: list = []
     sampler = _RecordingRejectionSampler()
-    sampler.verify_topk = (
-        lambda topk, batch, draft_logits, has_sampled, **kwargs: events.append(
-            ("verify_topk", topk, has_sampled)
-        )
+    sampler.verify_topk = lambda topk, batch, draft_logits, has_sampled, **kwargs: (
+        events.append(("verify_topk", topk, has_sampled))
     )
     runner = _runner(sampler)
     runner.topk_verify_level = 2 if sampled else 1
@@ -253,18 +252,20 @@ def _split_output(num_reqs: int):
                 (64, True, False, False),
                 (64, True, True, False),
                 (64, True, False, True),
+                (64, True, True, True),
             ],
         ),
     ],
 )
 def test_the_dummy_verify_step_compiles_every_variant_the_level_can_launch(
-    level, variants
+    level, variants, monkeypatch
 ):
     """The kernel variants (sampled branch, min_p, top_p) a level can launch compile
-    before the first request, and from level 3 one split verification (half of the
-    requests from the candidates, half from the logits) runs on the real dummy batch:
-    its kernels compile and its transients are part of the memory the launch has
-    seen."""
+    before the first request, and from level 3 one split verification (the fewest
+    candidate requests the split allows, the others from the logits) runs on the real
+    dummy batch: its kernels compile and its gathers are allocated once."""
+    # The dummy batch of this test holds 4 requests: a minimum of 2 candidate requests.
+    monkeypatch.setattr(model_runner_module, "SPLIT_MIN_CANDIDATE_REQS", 2)
     events: list = []
     sampler = _RecordingRejectionSampler()
     kinds: list = []
@@ -302,14 +303,33 @@ def test_the_dummy_verify_step_compiles_every_variant_the_level_can_launch(
     if level < 3:
         assert len(events) == len(variants) and not kinds
         return
-    # One split verification: requests 0 and 2 from the candidates, 1 and 3 from the
-    # logits.
+    # One split verification: requests 0 and 1 (the candidate minimum) from the
+    # candidates, the others from the logits.
     (k, cand_rows, full_rows) = kinds[0]
     assert k == 64
-    assert cand_rows == [0, 1, 2, 3, 8, 9, 10, 11]
-    assert full_rows == [4, 5, 6, 7, 12, 13, 14, 15]
+    assert cand_rows == [0, 1, 2, 3, 4, 5, 6, 7]
+    assert full_rows == [8, 9, 10, 11, 12, 13, 14, 15]
     (split,) = [e for e in events if e[5] == 2]
     assert split[1] == "topk"
     # The full path ran once on the whole batch and once on the view of two requests.
     assert [c["batch"].num_reqs for c in calls] == [4, 2]
     assert calls[1]["logits"] == "logits"
+
+
+def test_the_dummy_verify_step_runs_no_split_below_the_candidate_minimum():
+    """A dummy batch of 4 requests cannot hold the 5 candidate requests of the real
+    minimum and a full request: the dummy step runs the whole-batch variants only."""
+    events: list = []
+    sampler = _RecordingRejectionSampler()
+    sampler.verify_topk = lambda topk, batch, draft_logits, has_sampled, **kw: (
+        events.append(batch.num_reqs) or _split_output(batch.num_reqs)
+    )
+    runner = _runner(sampler)
+    runner.topk_verify_level = 3
+    runner.topk_verify_sampled = True
+    runner.model.compute_topk_logits = lambda hidden, k=None: ("topk", k)
+    runner._dummy_split_verify = functools.partial(
+        GPUModelRunner._dummy_split_verify, runner
+    )
+    GPUModelRunner._dummy_rejection_sampler_run(runner, torch.zeros(64, 5))
+    assert events == [4, 4, 4] and [c["batch"].num_reqs for c in sampler.calls] == [4]

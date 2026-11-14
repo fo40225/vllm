@@ -176,6 +176,7 @@ from vllm.v1.worker.gpu.spec_decode.utils import (
     get_drafter_hidden_states,
 )
 from vllm.v1.worker.gpu.spec_decode.verify_split import (
+    SPLIT_MIN_CANDIDATE_REQS,
     SplitIndices,
     merge_outputs,
     sampler_view,
@@ -1186,6 +1187,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     shapes.append((k, True, True, False))
                 if self.topk_verify_level >= 4:
                     shapes.append((k, True, False, True))
+                    shapes.append((k, True, True, True))
             for k, has_sampled, use_min_p, use_top_p in shapes:
                 topk = self.model.compute_topk_logits(hidden_states[:num_logits], k=k)
                 rejection_sampler.verify_topk(
@@ -1196,19 +1198,28 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     use_min_p=use_min_p,
                     use_top_p=use_top_p,
                 )
-            if self.topk_verify_level >= 3 and num_reqs >= 2:
+            if self.topk_verify_level >= 3 and num_reqs > SPLIT_MIN_CANDIDATE_REQS:
                 self._dummy_split_verify(hidden_states[:num_logits], batch)
 
     def _dummy_split_verify(
         self, hidden_states: torch.Tensor, batch: InputBatch
     ) -> None:
-        """One split verification (half of the requests from the candidates, half from
-        the whole logits) before the first request: the kernels it launches compile now
-        and its transients are part of the memory the launch has seen."""
+        """One split verification before the first request, in the split the fewest
+        candidate requests allow (``SPLIT_MIN_CANDIDATE_REQS`` from the candidates, all
+        the others from the whole logits): the kernels it launches compile now and its
+        gathers and views are allocated once. Its sampler states are the dummy ones (no
+        fp32 copy of the logits), so it is smaller than the profile's own full-path
+        verification, which sets the peak: the memory of a mixed step is bounded by
+        the full path's (the full subset is never larger than the whole step) and
+        measured by the stress of the exact-bytes procedure, not by this run."""
         assert self.rejection_sampler is not None and self.speculator is not None
         reqs = np.arange(batch.num_reqs)
-        cand = SplitIndices(batch, reqs[0::2], hidden_states.device)
-        full = SplitIndices(batch, reqs[1::2], hidden_states.device)
+        cand = SplitIndices(
+            batch, reqs[:SPLIT_MIN_CANDIDATE_REQS], hidden_states.device
+        )
+        full = SplitIndices(
+            batch, reqs[SPLIT_MIN_CANDIDATE_REQS:], hidden_states.device
+        )
         topk, logits = self.model.compute_split_verify_logits(
             hidden_states, self.topk_logits_k, cand.rows_t, full.rows_t
         )
@@ -1337,6 +1348,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             threshold_note=False,
             action="verified from",
         )
+        mode = {
+            2: "per step: a request that needs the logits sends its whole step there",
+            3: "per request: a request that needs the logits is verified from the "
+            "whole logits, the others from the candidates",
+            4: "per request, top_p rows from the candidates too (differs from the "
+            "full path in tie groups on a few rows)",
+        }.get(level, "")
+        if not self.topk_verify_sampled:
+            mode = "greedy steps only"
+        logger.info(
+            "Verifying drafts from the top-%d logits of every TP rank: level %d (%s).",
+            self.topk_logits_k,
+            level,
+            mode,
+        )
         return level
 
     def _topk_verify_plan(
@@ -1420,6 +1446,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.topk_logits_k,
                 self.topk_verify_sampled,
                 self.topk_verify_level,
+                SPLIT_MIN_CANDIDATE_REQS,
             )
         )
         line = stats.record(

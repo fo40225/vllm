@@ -24,6 +24,13 @@ from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
+# A split step has a fixed cost of about 0.5 ms (35 small launches: four pinned
+# host-to-device copies, 16 view gathers, two index_select, the merge) and saves about
+# 0.11 ms per candidate request (14 us per row, 8 rows at K = 7): it is repaid from
+# about 5 candidate requests. Fewer than this many candidate requests: the whole step
+# takes the full path.
+SPLIT_MIN_CANDIDATE_REQS = 5
+
 
 def request_rows(cu_num_logits_np: np.ndarray, reqs: np.ndarray) -> np.ndarray:
     """The logit rows of the requests ``reqs`` (batch positions), request by request."""

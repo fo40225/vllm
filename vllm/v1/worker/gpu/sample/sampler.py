@@ -234,7 +234,12 @@ class Sampler:
         return None, k
 
     def topk_verify_split_plan(
-        self, idx_mapping_np: np.ndarray, k: int, sampled: bool, level: int
+        self,
+        idx_mapping_np: np.ndarray,
+        k: int,
+        sampled: bool,
+        level: int,
+        min_candidates: int = 1,
     ) -> VerifyPlan:
         """`topk_verify_plan` per request: which requests of a speculative step verify
         their drafts from the ``k`` candidates per rank, and which need the logits.
@@ -247,7 +252,9 @@ class Sampler:
         top_p below 1 (unless ``level`` is at least 4) and top_p below 1 together with
         min_p (the full path then takes the standalone top-p branch of its top-p
         kernel, whose ties it treats differently). A greedy request ignores top_k,
-        top_p and min_p. Host state only: every TP rank decides alike.
+        top_p and min_p. A split with fewer than ``min_candidates`` candidate requests
+        is not worth its fixed cost (``SPLIT_MIN_CANDIDATE_REQS``): the whole step takes
+        the full path ("few-candidates"). Host state only: every TP rank decides alike.
         """
         if (
             self.compute_nans
@@ -296,6 +303,8 @@ class Sampler:
         if full_mask.all():
             first = next(r for r, m in conditions if m is not None and m[0])
             return VerifyPlan(first)
+        if idx_mapping_np.shape[0] - int(full_mask.sum()) < min_candidates:
+            return VerifyPlan("few-candidates")
         return VerifyPlan(
             None,
             k if candidate_random.any() else 1,
