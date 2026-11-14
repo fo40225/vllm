@@ -22,14 +22,19 @@ KV head) is then sized to one wave of CTAs. The stock launcher divides the SMs b
 batch and the KV heads only, ignores the 2 blocks, and launches twice as many CTAs as
 SMs (376 at a batch of 1; the kernel runs 1 CTA per SM, so that is two waves, each with
 the CTA start-up and the merge of twice as many partial results). One wave halves the
-split count (47 instead of 94 CTAs per block at a batch of 1). It applies where that
-grid fills at least 90% of the SMs (batch 1 to 5 on 188 SMs; at larger batches the
-rounding down leaves SMs idle and a global layer at long context is slower than with the
-stock two waves) and, for a sliding-window layer (9 to 10 tiles per sequence), at every
-batch. The split count sets the order in which the partial results are merged: the
-output is no longer bitwise the stock one (rounding level, deterministic, the same on
-every rank) where a sequence has more tiles than the new split count. Where it has not,
-or where the stock split count is kept, the output is still bitwise the stock one.
+split count (47 instead of 94 CTAs per block at a batch of 1). A global layer takes it
+at a batch of 1 only: the batch of the launch is the padded capture size under CUDA
+graphs (1, 2, 4, 8, 16, 24, ...), the grid is sized for sequences that are all long, and
+a ragged batch or a live batch below the padded one (lanes of sequence length 0) leaves
+the long sequence with half of the stock CTAs, which costs more than the wave saves. A
+sliding-window layer (9 to 10 tiles per sequence whatever the others hold) takes it at
+every batch. Only the launch of the Muse Spark shape is sized: 8 query heads per KV head
+of 64 elements and 5 to 8 query tokens (2 blocks of query rows); any other spec-dec
+module of the process (a drafter's) is the plain shadow module. The split count sets
+the order in which the partial results are merged: the output is no longer bitwise the
+stock one (rounding level, deterministic, the same on every rank) where a sequence has
+more tiles than the new split count. Where it has not, or where the stock split count is
+kept, the output is still bitwise the stock one.
 
 ``install`` routes ``flashinfer.xqa.gen_xqa_module`` through the shadow for every XQA
 module that the process builds afterwards (the model calls it when
@@ -41,6 +46,7 @@ process that did not call ``install``).
 import contextlib
 import functools
 import importlib
+import inspect
 import threading
 from collections.abc import Iterator
 from pathlib import Path
@@ -56,6 +62,11 @@ _TAG = "activemerge"
 # their own: the compile flag is not part of the digest of the sources.
 _ONE_WAVE_TAG = "activemerge_onewave"
 _ONE_WAVE_FLAG = "-DMUSE_XQA_SPEC_ONE_WAVE=1"
+# The launch that is sized (tested and measured): 8 query heads per KV head of 64
+# elements, 5 to 8 query tokens per request.
+_ONE_WAVE_HEAD_GROUP = 8
+_ONE_WAVE_HEAD_DIM = 64
+_ONE_WAVE_Q_LENS = range(5, 9)
 _SPEC_DEC_FLAG = "-DSPEC_DEC=1"
 _SHADOW_DIR = Path(__file__).resolve().parent / "xqa"
 _MANIFEST = _SHADOW_DIR / "stock.md5"
@@ -98,11 +109,24 @@ def _derive(stock_spec: Any, one_wave: bool = False) -> Any | None:
     )
 
 
+def _one_wave_applies(*args: Any, **kwargs: Any) -> bool:
+    """Whether the module of these ``gen_xqa_module`` arguments is the sized one."""
+    bound = inspect.signature(_STOCK_GEN).bind(*args, **kwargs)
+    bound.apply_defaults()
+    arguments = bound.arguments
+    return (
+        arguments["head_group_ratio"] == _ONE_WAVE_HEAD_GROUP
+        and arguments["head_dim"] == _ONE_WAVE_HEAD_DIM
+        and arguments["q_seq_len"] in _ONE_WAVE_Q_LENS
+    )
+
+
 def _gen_xqa_module(
     strict: bool, *args: Any, one_wave: bool = False, **kwargs: Any
 ) -> Any:
     stock_spec = _STOCK_GEN(*args, **kwargs)
     reason = unavailable_reason()
+    one_wave = one_wave and _one_wave_applies(*args, **kwargs)
     shadow_spec = None if reason else _derive(stock_spec, one_wave)
     if shadow_spec is None:
         if strict:
@@ -114,8 +138,9 @@ def _gen_xqa_module(
 def install(one_wave: bool = False) -> bool:
     """Build the XQA modules that follow as shadow modules. True when installed.
 
-    ``one_wave`` builds the spec-dec modules with the one-wave split count (see the
-    module docstring). Has to run before the first XQA call of the process: FlashInfer
+    ``one_wave`` builds the spec-dec modules of the Muse Spark shape with the one-wave
+    split count (see the module docstring). Has to run before the first XQA call of the
+    process: FlashInfer
     caches the module of a configuration, and one that exists already stays stock.
     """
     installed = fi_xqa.gen_xqa_module
@@ -157,7 +182,8 @@ def install(one_wave: bool = False) -> bool:
     if one_wave:
         logger.info_once(
             "MuseSpark SM120: the XQA spec-dec verify launch of 5 to 8 query tokens is "
-            "sized to one wave of CTAs (VLLM_MUSE_SPARK_SM120_XQA_SPEC_ONE_WAVE=1, "
+            "sized to one wave of CTAs at a batch of 1 (global layers) and at every "
+            "batch (sliding-window layers) (VLLM_MUSE_SPARK_SM120_XQA_SPEC_ONE_WAVE=1, "
             "rounding-level: the partial results merge in another order)."
         )
     return True
@@ -180,6 +206,9 @@ def shadow_xqa_module(*module_args: Any, one_wave: bool = False) -> Any:
             "shadow_xqa_module cannot be used after install(): the installed hook "
             "serves the shadow modules through flashinfer.xqa itself"
         )
+    # A module that is not sized is the plain shadow module whatever ``one_wave`` says:
+    # one cache entry, one build (FlashInfer registers the torch op of a name once).
+    one_wave = one_wave and _one_wave_applies(*module_args)
     with _swap_lock:
         module = _shadow_modules.get((module_args, one_wave))
         if module is None:

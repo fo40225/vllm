@@ -773,7 +773,7 @@ SM_COUNT = torch.cuda.get_device_properties(0).multi_processor_count
 GROUP = NUM_Q_HEADS // NUM_KV_HEADS
 ROWS_PER_BLOCK = 32
 TILE = 256
-MIN_FILL_PERCENT = 90  # kOneWaveMinFillPercent of the launcher
+GLOBAL_MAX_BATCH = 1  # kOneWaveGlobalMaxBatch of the launcher
 FEW_TILES = 16  # kOneWaveFewTiles of the launcher
 # The largest difference between the one-wave and the shadow output of a request, in
 # bf16 ulps of the largest element of that request's shadow output. The merge order
@@ -809,7 +809,7 @@ def _expected_grid(
         ctas = batch * NUM_KV_HEADS * blocks
         wave = max(1, SM_COUNT // ctas)
         few_tiles = window == "swa" and -(-(SWA + 1 + q_len) // TILE) + 1 <= FEW_TILES
-        if few_tiles or wave * ctas * 100 >= SM_COUNT * MIN_FILL_PERCENT:
+        if few_tiles or batch <= GLOBAL_MAX_BATCH:
             splits = wave
     return (min(splits, MAX_LEN // TILE), NUM_KV_HEADS * blocks, batch)
 
@@ -862,7 +862,8 @@ def _launched_grid(
 )
 def test_one_wave_launch_grid(rig, batch, q_len, window):
     """The shadow launches the grid of the stock launcher, the one-wave module a wave
-    where the policy applies (and the stock grid elsewhere)."""
+    where the policy applies (a global layer at a batch of 1, a sliding-window layer at
+    every batch) and the stock grid elsewhere."""
     shadow_grid = _launched_grid(rig, "shadow", batch, q_len, window)
     wave_grid = _launched_grid(rig, "wave", batch, q_len, window)
     assert shadow_grid == _expected_grid(batch, q_len, False, window)
@@ -876,21 +877,23 @@ def test_one_wave_launch_grid(rig, batch, q_len, window):
 
 
 def test_one_wave_policy_of_the_grid():
-    """What the launcher decides, from the numbers of the measurements (188 SMs):
-    batch 1 to 5 fit one wave and fill 94 to 100% of the SMs; the global layer keeps the
-    stock split from batch 6 on, where the grid leaves more than 10% of the SMs idle
-    (batch 6: 168 CTAs, batch 8: 160, batch 16: 128), the sliding window layer never."""
+    """What the launcher decides (188 SMs): a global layer takes the one wave at a batch
+    of 1 only, where nothing is idle; above it the grid is sized for sequences that are
+    all long, and a ragged or padded batch would leave the long one with half the CTAs.
+    A sliding-window layer reads 9 to 10 tiles per sequence whatever the others hold:
+    the one wave at every batch."""
     if SM_COUNT != 188:
         pytest.skip("The numbers are those of 188 SMs")
-    batches = (1, 2, 3, 4, 5)
-    assert [_expected_grid(b, 8, True)[0] for b in batches] == [47, 23, 15, 11, 9]
-    assert [_expected_grid(b, 8, False)[0] for b in batches] == [94, 47, 31, 23, 18]
-    for batch in (6, 7, 8, 10, 12, 16, 24):
-        assert _expected_grid(batch, 8, True)[0] == _expected_grid(batch, 8, False)[0]
-    for batch in (9, 11, 15, 23, 47):
-        assert _expected_grid(batch, 8, True)[0] < _expected_grid(batch, 8, False)[0]
-    swa = [_expected_grid(b, 8, True, "swa")[0] for b in (6, 8, 16, 24)]
-    assert swa == [7, 5, 2, 1]
+    assert _expected_grid(1, 8, True) == (47, 4, 1)
+    assert _expected_grid(1, 8, False) == (94, 4, 1)
+    for batch in (2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 15, 16, 23, 24, 32, 47, 48, 64):
+        assert _expected_grid(batch, 8, True) == _expected_grid(batch, 8, False)
+    swa = [_expected_grid(b, 8, True, "swa")[0] for b in (1, 2, 4, 6, 8, 16, 24)]
+    assert swa == [47, 23, 11, 7, 5, 2, 1]
+    for batch in (2, 4, 8, 16, 24):
+        assert _expected_grid(batch, 8, True, "swa")[0] < _expected_grid(
+            batch, 8, False, "swa"
+        )[0]
 
 
 def _per_request(q_lens: list[int]) -> torch.Tensor:
@@ -926,6 +929,34 @@ def _assert_close(shadow, wave, q_lens: list[int], what: str) -> None:
             f"{what}: request {worst} differs by {excess[worst].item():.1f} ulps "
             f"(limit {WAVE_MAX_ULPS})"
         )
+
+
+def _lane_rows(lanes: list[int], q_len: int) -> torch.Tensor:
+    return torch.cat(
+        [torch.arange(i * q_len, (i + 1) * q_len, device=DEVICE) for i in lanes]
+    )
+
+
+def _assert_wave_close(
+    shadow, wave, q_len: int, ctxs: list[int], what: str, window: str | None = None
+) -> None:
+    """The requests are close to the shadow's (rounding level); an empty lane (length 0,
+    a ghost request that pads the batch of a CUDA graph) is bitwise the shadow's, NaN
+    rows included. A launch with one split per sequence does not run the merge: its
+    empty lanes are zeros, not NaN (the model ignores them either way)."""
+    live = [i for i, c in enumerate(ctxs) if c > 0]
+    empty = [i for i, c in enumerate(ctxs) if c == 0]
+    if empty:
+        rows = _lane_rows(empty, q_len)
+        grid = _expected_grid(len(ctxs), q_len, True, window or "full")
+        single_split = window is not None and grid[0] == 1
+        if single_split and not torch.equal(_bits(shadow[rows]), _bits(wave[rows])):
+            assert (wave[rows].float() == 0).all(), f"{what}: empty lanes are not zero"
+        else:
+            _assert_same(shadow[rows], wave[rows], f"{what} (empty lanes)")
+    if live:
+        rows = _lane_rows(live, q_len)
+        _assert_close(shadow[rows], wave[rows], [q_len] * len(live), what)
 
 
 def _run_wave_pair(
@@ -967,7 +998,7 @@ def _run_wave_pair(
     if bitwise:
         _assert_same(outs["shadow"], outs["wave"], what)
     else:
-        _assert_close(outs["shadow"], outs["wave"], [q_len] * batch, what)
+        _assert_wave_close(outs["shadow"], outs["wave"], q_len, ctxs, what, window)
     rig.assert_semaphores_idle(what)
     assert not (outs["wave"] == SENTINEL).all()
     return outs["shadow"], outs["wave"]
@@ -1057,6 +1088,60 @@ def test_model_hook_passes_the_one_wave_flag(monkeypatch):
     assert calls == [{"one_wave": False}, {"one_wave": True}]
 
 
+_DTYPES = SPEC_ARGS[:2]
+OTHER_SHAPES = {
+    "one block of rows (q_len 4)": (*SPEC_ARGS[:7], 4, False),
+    "a drafter's block (q_len 16, 4 blocks)": (*SPEC_ARGS[:7], 16, False),
+    "head dim 128": (*_DTYPES, PAGE, 128, GROUP, True, torch.bfloat16, 8, False),
+    "head group 4": (*_DTYPES, PAGE, HEAD_DIM, 4, True, torch.bfloat16, 8, False),
+    "head group 16": (*_DTYPES, PAGE, HEAD_DIM, 16, True, torch.bfloat16, 5, False),
+}
+
+
+@pytest.mark.parametrize("q_len", [5, 6, 7, 8])
+@pytest.mark.parametrize("ragged", [False, True])
+def test_one_wave_applies_to_the_launch_of_the_muse_shape(q_len, ragged):
+    args = (*SPEC_ARGS[:7], q_len, ragged)
+    assert am._one_wave_applies(*args)
+    # Keywords bind like the positional arguments.
+    assert am._one_wave_applies(
+        *SPEC_ARGS[:6],
+        output_dtype=torch.bfloat16,
+        q_seq_len=q_len,
+        use_ragged_q=ragged,
+    )
+
+
+@pytest.mark.parametrize("shape", list(OTHER_SHAPES))
+def test_one_wave_leaves_other_launches_to_the_plain_shadow(monkeypatch, shape):
+    """A drafter's XQA module of the process (another block width, head group or head
+    dimension) is never built with the one-wave flag: its policy is untested."""
+    args = OTHER_SHAPES[shape]
+    assert not am._one_wave_applies(*args)
+    original = am.fi_xqa.gen_xqa_module
+    monkeypatch.setattr(am.fi_xqa, "gen_xqa_module", original)  # restored afterwards
+    built = []
+    monkeypatch.setattr(
+        shadow,
+        "build_or_stock",
+        lambda spec, stock_spec, strict=False: built.append(spec) or spec,
+    )
+    assert am.install(one_wave=True)
+    spec = am.fi_xqa.gen_xqa_module(*args)
+    assert "_muse_activemerge_onewave_" not in spec.name
+    assert spec.name == am._derive(am._STOCK_GEN(*args)).name
+    assert _ONE_WAVE_CFLAG not in (spec.extra_cuda_cflags or [])
+
+
+_ONE_WAVE_CFLAG = "-DMUSE_XQA_SPEC_ONE_WAVE=1"
+
+
+def test_one_wave_module_of_another_shape_is_the_plain_shadow_module():
+    args = (*SPEC_ARGS[:7], 3, False)
+    plain = am.shadow_xqa_module(*args)
+    assert am.shadow_xqa_module(*args, one_wave=True) is plain
+
+
 WAVE_BATCHES = [1, 2, 3, 4, 5, 6, 8, 12, 16, 23, 24, 31, 32, 47, 48, 64]
 
 
@@ -1098,11 +1183,11 @@ def test_one_wave_is_bitwise_where_the_merge_order_is_the_same(
 
 @pytest.mark.parametrize("sinks", [False, True])
 @pytest.mark.parametrize("q_len", [5, 8])
-@pytest.mark.parametrize("batch", [6, 7, 8, 10, 12, 16, 24, 31])
-def test_one_wave_keeps_the_stock_split_of_a_grid_that_would_not_fill_the_sms(
+@pytest.mark.parametrize("batch", [2, 3, 4, 5, 6, 8, 9, 11, 12, 16, 23, 24, 31])
+def test_one_wave_keeps_the_stock_split_of_a_global_layer_above_batch_1(
     rig, batch, q_len, sinks
 ):
-    """A global layer at these batches launches the shadow's grid: bitwise equal."""
+    """A global layer above a batch of 1 launches the shadow's grid: bitwise equal."""
     assert _expected_grid(batch, q_len, True) == _expected_grid(batch, q_len, False)
     rnd = random.Random(batch * 1000 + q_len)
     for _ in range(6):
@@ -1227,6 +1312,54 @@ def test_one_wave_ragged_draft_batches(rig, batch, window, pdl, sinks):
         what = f"ragged {window} {q_lens} {ctxs}"
         _assert_close(outs["shadow"], outs["wave"], q_lens, what)
         rig.assert_semaphores_idle(what)
+
+
+def _ghost_contexts(
+    rnd: random.Random, batch: int, live: int, q_len: int, mix: bool
+) -> list[int]:
+    """``live`` requests of random length and ``batch - live`` empty lanes: at the end,
+    where the model runner pads, or (``mix``) anywhere."""
+    ctxs = _random_contexts(rnd, live, q_len) + [0] * (batch - live)
+    ctxs[0] = max(ctxs[0], 100000) if rnd.random() < 0.5 else ctxs[0]
+    if mix:
+        rnd.shuffle(ctxs)
+    return ctxs
+
+
+@pytest.mark.parametrize("sinks", [False, True])
+@pytest.mark.parametrize("q_len", [5, 8])
+@pytest.mark.parametrize("window", ["swa", "full"])
+@pytest.mark.parametrize("batch", [1, 2, 4, 8, 16, 24])
+def test_one_wave_padded_ghost_lanes(rig, batch, window, q_len, sinks):
+    """Full-graph decode pads the batch to the capture size: the lanes past the live
+    requests carry length 0. The live ones are close to the shadow's, the empty ones are
+    the shadow's bit for bit, and the semaphores are idle (a live batch of 3 runs the
+    grid of 4, of 5 to 7 the grid of 8)."""
+    rnd = random.Random(batch * 100 + q_len)
+    for live in sorted({1, max(1, batch // 2), max(1, batch - 1), batch}):
+        for mix in (False, True):
+            for _ in range(2):
+                ctxs = _ghost_contexts(rnd, batch, live, q_len, mix)
+                _run_wave_pair(rig, ctxs, window=window, q_len=q_len, sinks=sinks)
+    # Nothing live at all (a warmup or a profiling step of the padded size).
+    _run_wave_pair(rig, [0] * batch, window=window, q_len=q_len, sinks=sinks)
+
+
+@pytest.mark.parametrize("q_len", [5, 8])
+@pytest.mark.parametrize("window", ["swa", "full"])
+@pytest.mark.parametrize("batch", [2, 4])
+def test_a_ghost_lane_leaves_the_long_request_the_shadows_ctas(
+    rig, batch, window, q_len
+):
+    """The case that the global layer's gate leaves to the stock split: one long
+    request with the rest of the padded batch empty runs the shadow's grid (global
+    layer), so that it keeps its CTAs. Bitwise the shadow's."""
+    ctxs = [118000] + [0] * (batch - 1)
+    if window == "full":
+        assert _expected_grid(batch, q_len, True) == _expected_grid(batch, q_len, False)
+        _run_wave_pair(rig, ctxs, window=window, q_len=q_len, bitwise=True)
+    else:
+        _run_wave_pair(rig, ctxs, window=window, q_len=q_len)
 
 
 @pytest.mark.parametrize("pdl", [False, True])
@@ -1437,6 +1570,12 @@ def test_one_wave_graph_replay_with_changing_contexts(rig, batch, q_len, sinks):
     steps = [[MAX_LEN] * batch, [max(q_len, 1)] * batch, [300] * batch]
     steps += [_random_contexts(rnd, batch, q_len) for _ in range(10)]
     steps += [[MAX_LEN] * batch, [256 + rnd.randint(0, 2)] * batch]
+    # The graph of the padded size replays with ghost lanes (length 0) past the live
+    # requests, and with nothing live at all.
+    for live in sorted({1, max(1, batch // 2), max(1, batch - 1)}):
+        if live < batch:
+            steps.append(_ghost_contexts(rnd, batch, live, q_len, mix=False))
+    steps.append([0] * batch)
     for step, ctxs in enumerate(steps):
         inputs.seq_lens.copy_(torch.tensor(ctxs, device=DEVICE, dtype=torch.int32))
         inputs.tables.copy_(rig.block_tables(batch))
@@ -1448,8 +1587,13 @@ def test_one_wave_graph_replay_with_changing_contexts(rig, batch, q_len, sinks):
             for layer in range(layers):
                 what = f"q{q_len} step {step} rep {rep} layer {layer} ctx={ctxs}"
                 _assert_same(eager[layer], wave.outs[layer], what)
-                _assert_close(
-                    shadow.outs[layer], wave.outs[layer], [q_len] * batch, what
+                _assert_wave_close(
+                    shadow.outs[layer],
+                    wave.outs[layer],
+                    q_len,
+                    ctxs,
+                    what,
+                    "swa" if inputs.windows[layer] == SWA else "full",
                 )
             _assert_idle(shadow.workspace, f"shadow q{q_len} step {step} rep {rep}")
             _assert_idle(wave.workspace, f"wave q{q_len} step {step} rep {rep}")

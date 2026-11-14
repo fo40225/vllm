@@ -13,15 +13,18 @@ shadow kernel on the same inputs:
           the grid 2 waves of CTAs
   wave    the same module built with ``one_wave``
           (VLLM_MUSE_SPARK_SM120_XQA_SPEC_ONE_WAVE): SMs / (batch x KV heads x token
-          blocks), one wave, where that grid fills 90% of the SMs (always for the
-          sliding window layers); the shadow's split count elsewhere
+          blocks), one wave, for a global layer at a batch of 1 and for the sliding
+          window layers at every batch; the shadow's split count elsewhere
 
 The stock FlashInfer module is only run for the output check (``shadow`` is bitwise the
 stock output, ``wave`` differs at rounding level where the split counts give another
 merge order).
 
 Metrics, in us per call, the CUPTI duration of ``kernel_mha`` inside a CUDA graph,
-``enable_pdl=False``:
+``enable_pdl=False`` (``--pdl`` launches with programmatic dependent launch like the
+model does: the next kernel's start-up then overlaps the tail of the previous one, so
+that the saving of the second wave's start-up may be smaller than the duration says; the
+decode step time is the measure):
   cold  a 256 MB read-only L2 flush (a reduction over a 256 MB buffer, which leaves
         clean lines) before every call: the production-like one;
   fill  the same with a 256 MB fill (leaves dirty lines that compete with the KV reads);
@@ -31,7 +34,16 @@ The rounds of the two variants are interleaved (shadow, wave, wave, shadow) and
 averaged.
 ``grid`` is read from the profiler trace; ``tb_s`` = batch x ctx x 256 B / cold us.
 
+Uniform contexts by default (``--ctxs`` x ``--batches``). ``--lanes`` gives batches of
+other contexts per request, ``;`` between batches and ``,`` between requests, 0 for an
+empty lane: the padded batch of a CUDA graph (``118000,0,0,0`` is one live request on
+the grid of 4) and ragged batches (``118000,3000``). The launch grid is sized for the
+batch of the launch, so these are the rows that tell whether a policy that is sized for
+a uniform batch of long sequences holds for the batches the model runner launches.
+
     python benchmarks/kernels/benchmark_muse_spark_xqa_wave_fit.py --out rows.jsonl
+    python benchmarks/kernels/benchmark_muse_spark_xqa_wave_fit.py --out lanes.jsonl \
+        --lanes "118000,3000;118000,0;118000,3000,3000,3000;118000,0,0,0"
 """
 
 import argparse
@@ -64,6 +76,7 @@ POOL_PAGES = 1 << 21  # 8 GiB of KV pool (4096 B per page)
 ROT_TARGET_BYTES = 640 * 1024 * 1024  # 5x L2
 ROT_MAX_CALLS = 160
 
+ENABLE_PDL = False
 CTXS = [16384, 32768, 65536, 118000]
 BATCHES = [1, 2, 3, 4]
 QLENS = [8]
@@ -79,24 +92,28 @@ def cdiv(a, b):
 class Case:
     """The tensors of one (batch, ctx, q_len, window) configuration."""
 
-    def __init__(self, pool, workspace, batch, ctx, q_len, window_left):
+    def __init__(self, pool, workspace, ctxs, q_len, window_left):
         dev = pool.device
-        self.batch, self.ctx, self.q_len = batch, ctx, q_len
+        batch = len(ctxs)
+        self.batch, self.ctxs, self.q_len = batch, list(ctxs), q_len
         self.window_left = window_left
-        self.pages = cdiv(ctx, PAGE)
-        self.bytes = batch * ctx * BYTES_PER_TOKEN
-        per_call_pages = batch * self.pages
+        pages = [cdiv(c, PAGE) for c in ctxs]  # 0 for an empty lane
+        self.bytes = sum(ctxs) * BYTES_PER_TOKEN
+        per_call_pages = sum(pages)
         want = cdiv(ROT_TARGET_BYTES, self.bytes)
         self.k_rot = max(1, min(ROT_MAX_CALLS, want, pool.shape[0] // per_call_pages))
         perm = torch.randperm(pool.shape[0], device=dev)
         perm = perm[: self.k_rot * per_call_pages].to(torch.int32)
-        perm = perm.view(self.k_rot, batch, self.pages)
+        perm = perm.view(self.k_rot, per_call_pages)
         self.tables = []
         for k in range(self.k_rot):
             table = torch.zeros(batch, PROD_PAGES, dtype=torch.int32, device=dev)
-            table[:, : self.pages] = perm[k]
+            start = 0
+            for i, n in enumerate(pages):
+                table[i, :n] = perm[k, start : start + n]
+                start += n
             self.tables.append(table)
-        self.seq_lens = torch.full((batch,), ctx, dtype=torch.int32, device=dev)
+        self.seq_lens = torch.tensor(ctxs, dtype=torch.int32, device=dev)
         self.kv = pool.split(HEAD_DIM, dim=-1)  # K and V are strided halves
         self.query = torch.randn(
             batch * q_len, NUM_Q_HEADS, HEAD_DIM, device=dev, dtype=torch.bfloat16
@@ -107,7 +124,7 @@ class Case:
         self.mask = self.mask.contiguous()
         self.workspace = workspace
 
-    def call(self, variant, table_idx=0, enable_pdl=False):
+    def call(self, variant, table_idx=0):
         if variant == "stock":
             module = contextlib.nullcontext()
         else:
@@ -126,7 +143,7 @@ class Case:
                 out=self.out[variant],
                 sinks=None,
                 kv_layout="NHD",
-                enable_pdl=enable_pdl,
+                enable_pdl=ENABLE_PDL,
                 q_len_per_req=self.q_len,
                 mask=self.mask,
                 q_cu_seq_lens=None,
@@ -206,7 +223,12 @@ def run_case(case, flush_read, flush_fill, names_seen, row):
     row["shadow_bitwise_stock"] = bool(torch.equal(stock, shadow))
     wave = case.out["wave"].view(torch.int16)
     row["wave_bitwise_shadow"] = bool(torch.equal(shadow, wave))
-    diff = (case.out["wave"].float() - case.out["shadow"].float()).abs()
+    # An empty lane (length 0) outputs NaN in every module: compare the live lanes.
+    live = [i for i, c in enumerate(case.ctxs) if c > 0]
+    rows = torch.cat(
+        [torch.arange(i * case.q_len, (i + 1) * case.q_len) for i in live]
+    ).to(case.out["wave"].device)
+    diff = (case.out["wave"].float() - case.out["shadow"].float()).abs()[rows]
     row["wave_max_abs_diff"] = diff.max().item()
     cold = {v: [] for v in VARIANTS}
     fill = {v: [] for v in VARIANTS}
@@ -235,7 +257,16 @@ def main():
     ap.add_argument("--batches", default="")
     ap.add_argument("--qlens", default="")
     ap.add_argument("--windows", default="full", help="comma list of: full, swa")
+    ap.add_argument(
+        "--lanes",
+        default="",
+        help="batches of per-request contexts: ';' between batches, ',' between "
+        "requests, 0 for an empty lane (replaces --ctxs x --batches)",
+    )
+    ap.add_argument("--pdl", action="store_true", help="launch with enable_pdl=True")
     args = ap.parse_args()
+    global ENABLE_PDL
+    ENABLE_PDL = args.pdl
     dev = torch.device("cuda:0")
     torch.manual_seed(0)
     reason = am.unavailable_reason()
@@ -267,12 +298,22 @@ def main():
     windows = args.windows.split(",")
     if args.quick:
         ctxs, batches, qlens = [16384, 118000], [1, 4], [8]
+    if args.lanes:
+        batch_ctxs = [[int(c) for c in b.split(",")] for b in args.lanes.split(";")]
+    else:
+        batch_ctxs = [[ctx] * batch for batch in batches for ctx in ctxs]
     t0 = time.time()
     with open(args.out, "w") as f:
-        grid = itertools.product(qlens, windows, batches, ctxs)
-        for q_len, window, batch, ctx in grid:
+        grid = itertools.product(qlens, windows, batch_ctxs)
+        for q_len, window, lane_ctxs in grid:
+            batch = len(lane_ctxs)
+            ctx = lane_ctxs[0] if len(set(lane_ctxs)) == 1 else "+".join(
+                str(c) for c in lane_ctxs
+            )
             row = {"q_len": q_len, "window": window, "batch": batch, "ctx": ctx}
-            case = Case(pool, workspace, batch, ctx, q_len, WINDOWS[window])
+            row["ctxs"] = lane_ctxs
+            row["pdl"] = ENABLE_PDL
+            case = Case(pool, workspace, lane_ctxs, q_len, WINDOWS[window])
             row["bytes"] = case.bytes
             row["k_rot"] = case.k_rot
             run_case(case, flush_read, flush_fill, names_seen, row)
@@ -280,7 +321,7 @@ def main():
             f.flush()
             print(
                 f"[{time.time() - t0:6.0f}s] q{q_len} {window:4s} b{batch:2d} "
-                f"ctx{ctx:7d} "
+                f"ctx {str(ctx):>14s} "
                 f"grid {row['grid_shadow']}->{row['grid_wave']} "
                 f"cold {row['cold_us_shadow']:7.2f}->{row['cold_us_wave']:7.2f} "
                 f"fill {row['fill_us_shadow']:7.2f}->{row['fill_us_wave']:7.2f} "

@@ -27,11 +27,14 @@
 // SMs / (batch x KV heads) and leaves the blocks out, so that the grid has twice as many CTAs as
 // SMs (1 CTA per SM: two waves, each paying the CTA start-up and the merge of twice as many
 // partial results as a one-wave grid). When MUSE_XQA_SPEC_ONE_WAVE is 1 the launcher sizes it by
-// SMs / (batch x KV heads x blocks) instead, one wave, where that grid fills at least
-// kOneWaveMinFillPercent of the SMs (the rounding down of the division leaves SMs idle at larger
-// batches, and a layer that streams many tiles per CTA then loses more than the wave saves), and
-// always for a layer that reads few tiles per sequence (a sliding window). The kernel is not
-// changed; the number of splits changes the order in which the partial results are merged.
+// SMs / (batch x KV heads x blocks) instead, one wave, for a layer that streams many tiles per
+// sequence (a global layer) only at a batch of 1, and always for a layer that reads few tiles per
+// sequence (a sliding window). The batch is the one of the launch, which under CUDA graphs is the
+// padded capture size, so that a launch at a batch of 1 has no lane that is idle. At a larger
+// batch the grid is sized for sequences that are all long: a ragged batch, or a live batch below
+// the padded one (lanes of sequence length 0), leaves the long sequence with the CTAs of the one
+// wave, half of the stock split count, and the layer loses more than the wave saves. The kernel is
+// not changed; the number of splits changes the order in which the partial results are merged.
 #ifndef MUSE_XQA_SPEC_ONE_WAVE
 #define MUSE_XQA_SPEC_ONE_WAVE 0
 #endif
@@ -3143,11 +3146,11 @@ static uint32_t const hostSmemSize = configureKernel();
 
 #if SPEC_DEC && MUSE_XQA_SPEC_ONE_WAVE
 // The one-wave split count of launchMHAFlashInfer is used for a layer that streams many tiles
-// per sequence only where the grid fills at least this share of the SMs (batch 1 to 5 of q_len
-// 5..8 on 188 SMs; the rounding down of SMs / CTAs leaves 11% idle at batch 6 and 15% at batch 8,
-// where the stock two waves are faster at 118k tokens), and for a layer that reads at most this
-// many tiles per sequence (a sliding window of 2048 tokens reads 9 to 10).
-constexpr uint32_t kOneWaveMinFillPercent = 90;
+// per sequence only up to this batch (the batch of the launch, the padded capture size under CUDA
+// graphs: nothing is idle there, and the grid fills all the SMs: 47 splits x 4 CTAs on 188 SMs),
+// and for a layer that reads at most this many tiles per sequence (a sliding window of 2048 tokens
+// reads 9 to 10, whatever the other lanes of the batch hold).
+constexpr uint32_t kOneWaveGlobalMaxBatch = 1;
 constexpr uint32_t kOneWaveFewTiles = 16;
 #endif
 
@@ -3196,9 +3199,8 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
 #else
       constexpr bool fewTilesPerSeq = false;
 #endif
-      bool const fillsSms = uint64_t(oneWave) * nbCtasPerSubSeq * 100 >=
-                            uint64_t(multiProcessorCount) * kOneWaveMinFillPercent;
-      if (fewTilesPerSeq || fillsSms) {
+      bool const allLanesLong = batchSize <= kOneWaveGlobalMaxBatch;
+      if (fewTilesPerSeq || allLanesLong) {
         nbSubSeq = oneWave;
       }
     }
