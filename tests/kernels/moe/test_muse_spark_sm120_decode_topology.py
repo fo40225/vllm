@@ -298,3 +298,119 @@ def test_aux_plan_and_norm_quant_graph_replays_like_the_plain_aux_graph(
                 assert bool((reference != 0).any())
                 for key, (_, out, _) in graphs.items():
                     assert torch.equal(out, reference), (num_tokens, replay, key)
+
+
+@pytest.mark.parametrize("pdl", ["1", "0"])
+@torch.inference_mode()
+def test_chained_layers_share_the_plan_and_the_quantization_scratch_in_a_graph(
+    dist_init, workspace_init, layer, pdl, monkeypatch
+) -> None:
+    """Several layers back to back in one graph, as the model's decode graph runs them:
+    the plan, the route -> row map and the quantized input are static scratch shared by
+    every layer, so the aux-stream plan of layer L + 1 must wait for the experts of
+    layer L, and its quantization for the finalize of layer L. The chain with the plan
+    on the aux stream and the quantizing norm is bit for bit the chain without them,
+    over many replays on fresh inputs (a layer's plan overwriting the map the previous
+    layer still reads would show here)."""
+    monkeypatch.setenv(PDL_ENV, pdl)
+    router, runner, vllm_config = _build_layer(layer)
+    generator = torch.Generator(device="cuda").manual_seed(3)
+    layers = []
+    for _ in range(3):
+        layers.append(
+            (
+                (torch.randn(H, D_MODEL, device="cuda", generator=generator) * 0.02).to(
+                    torch.bfloat16
+                ),
+                (
+                    torch.randn(E_LOCAL, D_MODEL, device="cuda", generator=generator)
+                    * 0.05
+                ).float(),
+                (torch.randn(H, device="cuda", generator=generator) * 0.3).to(
+                    torch.bfloat16
+                ),
+            )
+        )
+    aux = torch.cuda.Stream()
+    events = (torch.cuda.Event(), torch.cuda.Event())
+    flags_seen: list[int] = []
+    original = torch.ops._muse_C.nvfp4_decode_moe_large
+    depth = [0]
+
+    def spy(*args):
+        if depth[0] == 0:
+            flags_seen.append(args[-1])
+        depth[0] += 1
+        try:
+            return original(*args)
+        finally:
+            depth[0] -= 1
+
+    monkeypatch.setattr(torch.ops._muse_C, "nvfp4_decode_moe_large", spy)
+
+    def make(prepared: bool):
+        def one_layer(x, pooler_weight, router_weight, norm_weight):
+            def pool_and_norm() -> torch.Tensor:
+                pooled = F.linear(x, pooler_weight)
+                if prepared:
+                    fused = runner.norm_quant_decode_input(
+                        pooled, norm_weight, NORM_EPS, 1.0
+                    )
+                    if fused is not None:
+                        return fused
+                return fused_rmsnorm_fwd(pooled, norm_weight, NORM_EPS, gain_center=1.0)
+
+            def route():
+                weights, ids = runner.select_experts(
+                    x, F.linear(x.float(), router_weight)
+                )
+                if prepared:
+                    runner.build_decode_plan(ids)
+                return weights, ids
+
+            pooled, (weights, ids) = maybe_execute_in_parallel(
+                pool_and_norm, route, *events, aux
+            )
+            return runner.forward_routed(pooled, weights, ids)
+
+        def forward(x: torch.Tensor) -> torch.Tensor:
+            for weights in layers:
+                out = one_layer(x, *weights)
+                # The next layer's input depends on this layer's output.
+                x = (0.5 * x.float() + 0.5 * torch.cat([out, out], dim=1).float()).to(
+                    torch.bfloat16
+                )
+            return x
+
+        return forward
+
+    def capture(forward, x_static: torch.Tensor):
+        for _ in range(3):
+            forward(x_static)
+        torch.accelerator.synchronize()
+        flags_seen.clear()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out = forward(x_static)
+        return graph, out
+
+    with set_current_vllm_config(vllm_config), set_forward_context(None, vllm_config):
+        for num_tokens in (MUSE_SMALL_MAX_TOKENS + 1, 24, 64, MUSE_MAX_TOKENS):
+            graphs = {}
+            for prepared in (False, True):
+                x = _random_input(num_tokens, generator)
+                graph, out = capture(make(prepared), x)
+                assert len(flags_seen) == len(layers), (num_tokens, prepared)
+                assert all(bool(f & 32) == prepared for f in flags_seen)
+                assert all(bool(f & 64) == prepared for f in flags_seen)
+                graphs[prepared] = (graph, out, x)
+            for replay in range(REPLAYS):
+                new_x = _random_input(num_tokens, generator)
+                for _, _, x in graphs.values():
+                    x.copy_(new_x)
+                for graph, _, _ in graphs.values():
+                    graph.replay()
+                torch.accelerator.synchronize()
+                reference = graphs[False][1]
+                assert bool(torch.isfinite(reference).all())
+                assert torch.equal(graphs[True][1], reference), (num_tokens, replay)
