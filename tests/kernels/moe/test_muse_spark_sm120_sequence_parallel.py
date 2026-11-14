@@ -518,9 +518,9 @@ def _sharded_branch_worker(rank: int, world: int, port: int, out_path: str) -> N
             experts=runner,
         )
 
-        def sharded(local, num_tokens, layer=layer):
+        def sharded(local, num_tokens, layer=layer, router_input=None):
             return muse_model.MuseSpark1xMoE.forward_sequence_parallel(
-                layer, local, num_tokens
+                layer, local, num_tokens, router_input=router_input
             )
 
         for num_tokens in BRANCH_TOKENS:
@@ -544,6 +544,9 @@ def _sharded_branch_worker(rank: int, world: int, port: int, out_path: str) -> N
                 local = padded[rank * rows : (rank + 1) * rows].contiguous()
                 first = sharded(local, num_tokens)
                 second = sharded(local, num_tokens)
+                # The boundary kernel's fp32 copy of the rows is what the router
+                # would cast itself.
+                widened = sharded(local, num_tokens, router_input=local.float())
                 output = tensor_model_parallel_all_gather(first, 0)[:num_tokens]
                 # The same branch captured in a CUDA graph, as a decode-sized batch
                 # of a launch with large capture sizes would run it.
@@ -564,6 +567,7 @@ def _sharded_branch_worker(rank: int, world: int, port: int, out_path: str) -> N
                 nonzero=float((reference != 0).float().mean()),
                 finite=bool(torch.isfinite(output).all()),
                 deterministic=bool(torch.equal(first, second)),
+                router_input_equal=bool(torch.equal(first, widened)),
                 graph_equal=bool(torch.equal(captured, first)),
                 graph_rel_l2=float(
                     (captured.float() - first.float()).norm()
@@ -600,6 +604,7 @@ def test_sharded_branch_matches_the_replicated_one(tmp_path, world: int) -> None
         # The Marlin experts are not run-to-run reproducible on their own (the
         # replicated stream included), so only the other two have to repeat bitwise.
         if not key.startswith("nvfp4_marlin"):
+            assert result["router_input_equal"], (key, result)
             assert result["deterministic"], (key, result)
             assert result["graph_equal"], (key, result)
         else:

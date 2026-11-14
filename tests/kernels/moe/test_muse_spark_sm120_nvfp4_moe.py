@@ -1325,16 +1325,18 @@ def prefill_ops(monkeypatch) -> list[str]:
     return seen
 
 
+@pytest.mark.parametrize("exact", [False, True], ids=["folded", "exact"])
 @pytest.mark.parametrize("up_gate", [True, False])
 @pytest.mark.parametrize("num_tokens", [16, 700])
 @torch.inference_mode()
 def test_sm120_local_rows_leave_the_layer_output_bitwise_unchanged(
-    dist_init, workspace_init, prefill_ops, num_tokens, up_gate
+    dist_init, workspace_init, prefill_ops, num_tokens, up_gate, exact
 ) -> None:
     """The routing and the quantization of GEMM1's activations run on the local
     routes where the extension is loaded, and the finalized output is that of the
     stock sort, shuffle and quantization, bit for bit, with routes that are local,
-    remote and absent."""
+    remote and absent. The exact GEMM1 (gate and up alphas apart) takes the same
+    quantized activations, so it composes with the local rows."""
     muse_c.load()
     problem = _Problem()
     norm = _make_norm()
@@ -1346,8 +1348,9 @@ def test_sm120_local_rows_leave_the_layer_output_bitwise_unchanged(
     )
     topk_ids, topk_weights = _routes(num_tokens, 8, remote_experts, remote_tokens=3)
     x = torch.randn(num_tokens, K, device="cuda").to(torch.bfloat16)
-    experts = _Experts(problem, norm, local_experts, 8, up_gate=up_gate)
+    experts = _Experts(problem, norm, local_experts, 8, up_gate=up_gate, exact=exact)
     assert experts.experts.local_rows
+    assert (experts.experts.exact_scales is not None) == exact
 
     local_out = experts.apply(x, topk_ids, topk_weights)
     experts.experts.local_rows = False
