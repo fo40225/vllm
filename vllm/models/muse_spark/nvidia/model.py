@@ -2717,6 +2717,17 @@ class MuseSpark1xForCausalLM(LlamaForCausalLM, SupportsLoRA, MixtureOfExperts):
             vllm_config=vllm_config, prefix=prefix, layer_type=layer_type
         )
 
+    @property
+    def min_tokens_per_ubatch(self) -> int:
+        """Smallest microbatch (in tokens) that takes the path of a large batch.
+
+        Below ``sp_min_tokens`` the model keeps the residual stream replicated; a
+        split batch is only worth running as microbatches when every microbatch
+        shards the stream like the whole batch would (see
+        ``vllm.v1.worker.gpu.ubatch_utils.fit_prefill_threshold_to_model``).
+        """
+        return self.model.sp_min_tokens or 0
+
     def set_moe_parameters(self):
         self.moe_layers: list[nn.Module] = []
         example_moe = None

@@ -11,7 +11,7 @@ from typing import Any, NamedTuple
 import numpy as np
 import torch
 
-from vllm.config import CUDAGraphMode, VllmConfig
+from vllm.config import CUDAGraphMode, ParallelConfig, VllmConfig
 from vllm.distributed import get_dcp_group
 from vllm.forward_context import (
     DPMetadata,
@@ -31,6 +31,7 @@ from vllm.v1.worker.ubatch_utils import (
     UBatchSlice,
     UBatchSlices,
     create_sm_control_context,
+    get_num_ubatches,
     maybe_create_ubatch_slices,
 )
 from vllm.v1.worker.ubatching import (
@@ -566,6 +567,34 @@ class UBatchRunner:
             logger.exception("Failed to join microbatch threads after an abort")
         finally:
             self._pending_finish = None
+
+
+def fit_prefill_threshold_to_model(
+    parallel_config: ParallelConfig, model: Any
+) -> None:
+    """Split a batch only where every microbatch takes the model path of the batch.
+
+    A model may declare ``min_tokens_per_ubatch``: the smallest microbatch that
+    takes the same path as a large batch (Muse Spark: the sequence-parallel
+    minimum, which depends on the CUDA graph sizes and so is only known once the
+    configuration is final). The prefill threshold is raised to that many tokens
+    per microbatch. Microbatches that take different paths still run (the
+    hand-off tolerates unequal collective counts) but overlap less.
+    """
+    min_tokens = getattr(model, "min_tokens_per_ubatch", 0)
+    if not isinstance(min_tokens, int) or min_tokens <= 0:
+        return
+    floor = get_num_ubatches(parallel_config) * min_tokens
+    if parallel_config.dbo_prefill_token_threshold < floor:
+        logger.info(
+            "Microbatching of prefill batches starts at %d tokens (was %d): every "
+            "microbatch must hold at least %d tokens to take the model's "
+            "large-batch path.",
+            floor,
+            parallel_config.dbo_prefill_token_threshold,
+            min_tokens,
+        )
+        parallel_config.dbo_prefill_token_threshold = floor
 
 
 def maybe_build_ubatch_runner(

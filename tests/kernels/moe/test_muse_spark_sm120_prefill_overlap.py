@@ -314,6 +314,61 @@ def _parallel(**fields):
     return SimpleNamespace(**base)
 
 
+def test_threshold_follows_the_sequence_parallel_minimum_of_the_model() -> None:
+    """With a larger CUDA graph range the sequence-parallel minimum rises, and a
+    batch is split only where both halves still shard the stream."""
+    from vllm.models.muse_spark.nvidia.model import (
+        MuseSpark1xForCausalLM,
+        sm120_sequence_parallel_min_tokens,
+    )
+    from vllm.v1.worker.gpu.ubatch_utils import fit_prefill_threshold_to_model
+
+    def model_for(max_graph_tokens):
+        compilation_config = SimpleNamespace(
+            max_cudagraph_capture_size=max_graph_tokens
+        )
+        config = SimpleNamespace(compilation_config=compilation_config)
+        sp_min = sm120_sequence_parallel_min_tokens(config)
+        stub = SimpleNamespace(model=SimpleNamespace(sp_min_tokens=sp_min))
+        return sp_min, MuseSpark1xForCausalLM.min_tokens_per_ubatch.fget(stub)
+
+    sp_min, per_ubatch = model_for(2048)
+    assert sp_min == per_ubatch == 2049
+    parallel = _parallel()
+    fit_prefill_threshold_to_model(
+        parallel, SimpleNamespace(min_tokens_per_ubatch=per_ubatch)
+    )
+    # (2048, 2049) tokens would have put one half on each side of the minimum.
+    assert parallel.dbo_prefill_token_threshold == 2 * 2049
+
+    # A small graph range leaves the launch floor alone.
+    _, per_ubatch = model_for(256)
+    parallel = _parallel()
+    fit_prefill_threshold_to_model(
+        parallel, SimpleNamespace(min_tokens_per_ubatch=per_ubatch)
+    )
+    assert parallel.dbo_prefill_token_threshold == 2050
+
+
+def test_threshold_is_left_alone_for_a_model_without_a_minimum() -> None:
+    from vllm.models.muse_spark.nvidia.model import MuseSpark1xForCausalLM
+    from vllm.v1.worker.gpu.ubatch_utils import fit_prefill_threshold_to_model
+
+    for model in (
+        object(),
+        SimpleNamespace(min_tokens_per_ubatch=0),
+        SimpleNamespace(min_tokens_per_ubatch="x"),
+        SimpleNamespace(
+            min_tokens_per_ubatch=MuseSpark1xForCausalLM.min_tokens_per_ubatch.fget(
+                SimpleNamespace(model=SimpleNamespace(sp_min_tokens=None))
+            )
+        ),
+    ):
+        parallel = _parallel()
+        fit_prefill_threshold_to_model(parallel, model)
+        assert parallel.dbo_prefill_token_threshold == 2050
+
+
 def test_data_parallel_free_microbatching_needs_the_model_switch() -> None:
     """--enable-dbo at DP=1 stays what it was (no runner) for every other model."""
     from vllm.v1.worker.gpu import ubatch_utils

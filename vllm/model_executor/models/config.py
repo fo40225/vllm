@@ -140,10 +140,12 @@ class MuseSparkConfig(VerifyAndUpdateConfig):
             )
             return
         pc = vllm_config.parallel_config
-        # The microbatches hand off at every collective, so both halves must take
-        # the same model path: keep them above the token thresholds of the model
-        # (the sequence-parallel minimum, the CUDA-graph range, the decode-sized
-        # fused kernels).
+        # A floor for the speed, not for correctness (the microbatches hand off
+        # at every collective and cope with unequal collective counts): keep both
+        # halves above the sequence-parallel minimum of the launch (the model
+        # raises the threshold to its exact minimum once the CUDA graph sizes are
+        # known, see fit_prefill_threshold_to_model) and out of the range of the
+        # decode-sized kernels.
         num_ubatches = max(envs.VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_UBATCHES, 2)
         floor = num_ubatches * (
             max(envs.VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_MIN_TOKENS, 1024) + 1

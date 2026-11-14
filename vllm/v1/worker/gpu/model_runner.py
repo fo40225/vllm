@@ -182,6 +182,7 @@ from vllm.v1.worker.gpu.structured_outputs import (
 from vllm.v1.worker.gpu.ubatch_utils import (
     UBatchRunner,
     UBatchState,
+    fit_prefill_threshold_to_model,
     maybe_build_ubatch_runner,
 )
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
@@ -738,6 +739,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.kv_cache_config,
             self.max_num_reqs,
         )
+        if self.ubatch_runner is not None:
+            fit_prefill_threshold_to_model(self.parallel_config, self.model)
         if self.speculator is not None:
             self.speculator.pcp_manager = self.pcp_manager
         initialize_mamba_ssu_backend(
