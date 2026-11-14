@@ -15,6 +15,7 @@ every token count of the large-batch kernel, and to wait for what they read.
 """
 
 import contextlib
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -796,6 +797,48 @@ def _norm_inputs(kind: str, t: int, seed: int) -> torch.Tensor:
 NORM_KINDS = ("normal", "heavy", "tiny", "zero", "big", "ties")
 NORM_CONFIGS = ((1e-6, 1.0), (1e-8, 0.0), (1e-5, 0.5), (1e-6, -0.25))
 
+# The CUDA norm (``_muse_C.rmsnorm_nvfp4_quant``) and the Triton reference
+# (``fused_rmsnorm_fwd``) were bit-identical up to Triton 3.7. Triton 3.8 (torch 2.14)
+# changed the bits of the Triton kernel's output: a rounding tie of the final bf16 cast
+# now resolves the other way in a few elements (152 of ~203M, 7.5e-7, over the 768
+# configs of the first test below), every one by exactly 1 bf16 ulp; both kernels are
+# equally accurate against a float64 reference. The comparisons of the CUDA norm with the
+# Triton reference therefore check the bf16 bit patterns exactly: every difference is at
+# most 1 ulp, and the number of differing elements stays under 1e-5 of the elements
+# (13x the measured rate; a wrong rounding mode or a changed summation order differs in
+# orders of magnitude more elements, and the max-1-ulp check catches any error beyond
+# the last bit). Everything downstream of the norm stays bitwise.
+NORM_MAX_ULP = 1
+NORM_MAX_DIFF_FRACTION = 1e-5
+
+
+def _bf16_ordinal(x: torch.Tensor) -> torch.Tensor:
+    """Monotonic integer image of the bf16 bit patterns: adjacent bf16 values (also
+    across zero, where -0.0 and +0.0 coincide) are 1 apart."""
+    bits = x.view(torch.int16).to(torch.int32)
+    return torch.where(bits < 0, -32768 - bits, bits)
+
+
+def _norm_ulp_mismatches(
+    out: torch.Tensor,
+    ref: torch.Tensor,
+    what,
+    keep: torch.Tensor | None = None,
+) -> int:
+    """Number of elements of ``out`` (restricted to ``keep``) whose bf16 bits differ from
+    ``ref``; asserts that none is more than ``NORM_MAX_ULP`` ulps away."""
+    dist = (_bf16_ordinal(out) - _bf16_ordinal(ref)).abs()
+    if keep is not None:
+        dist = dist[keep]
+    worst = int(dist.max()) if dist.numel() else 0
+    assert worst <= NORM_MAX_ULP, (what, "ulp distance", worst)
+    return int((dist != 0).sum())
+
+
+def _norm_diff_budget(numel: int) -> int:
+    """Differing elements allowed among ``numel`` (at least one for a small call)."""
+    return max(1, math.ceil(NORM_MAX_DIFF_FRACTION * numel))
+
 
 @torch.inference_mode()
 def test_rmsnorm_quant_is_the_triton_norm_and_the_quantization_of_its_output(
@@ -804,6 +847,7 @@ def test_rmsnorm_quant_is_the_triton_norm_and_the_quantization_of_its_output(
     g = torch.Generator(device="cuda").manual_seed(77)
     w = (torch.randn(H, device="cuda", generator=g) * 0.3).to(torch.bfloat16)
     gscale = float(layer.gs[0])
+    differing = total = 0
     for t in range(1, MAX_LARGE_T + 1):
         for kind in NORM_KINDS:
             x = _norm_inputs(kind, t, t)
@@ -818,12 +862,13 @@ def test_rmsnorm_quant_is_the_triton_norm_and_the_quantization_of_its_output(
                 torch.ops._muse_C.rmsnorm_nvfp4_quant(
                     x, w, eps, gain, layer.gs, out, data, sf, pdl
                 )
-                assert torch.equal(out.view(torch.int16), ref.view(torch.int16)), (
-                    t, kind, pdl,
-                )  # fmt: skip
-                q_ref, sf_ref = _stock_quant(ref, gscale)
+                differing += _norm_ulp_mismatches(out, ref, (t, kind, pdl))
+                total += out.numel()
+                # The quantization is that of the CUDA norm's own output, bit for bit.
+                q_ref, sf_ref = _stock_quant(out, gscale)
                 assert torch.equal(data, q_ref), (t, kind, pdl)
                 assert torch.equal(sf, sf_ref), (t, kind, pdl)
+    assert differing <= _norm_diff_budget(total), (differing, total)
 
 
 @pytest.mark.parametrize("t", [9, 33, MAX_LARGE_T])
@@ -832,8 +877,9 @@ def test_rmsnorm_quant_on_non_finite_rows_is_the_triton_norm_and_act_quant(
     layer: _Layer, t: int
 ) -> None:
     """Rows with an Inf or a NaN (a broken step, never a served one) take the same
-    arithmetic as in the Triton norm (same NaN positions, same bits elsewhere) and the
-    same quantization as the stock activation quantization of the output."""
+    arithmetic as in the Triton norm (same NaN positions, the same bits elsewhere up to
+    the 1-ulp rounding of ``NORM_MAX_ULP``) and the same quantization as the stock
+    activation quantization of the output."""
     g = torch.Generator(device="cuda").manual_seed(31)
     w = (torch.randn(H, device="cuda", generator=g) * 0.3).to(torch.bfloat16)
     for kind in ("inf", "nan", "mixed"):
@@ -855,9 +901,8 @@ def test_rmsnorm_quant_on_non_finite_rows_is_the_triton_norm_and_act_quant(
         )
         nan_ref, nan_out = torch.isnan(ref), torch.isnan(out)
         assert torch.equal(nan_ref, nan_out), kind
-        assert torch.equal(
-            out.view(torch.int16)[~nan_ref], ref.view(torch.int16)[~nan_ref]
-        ), kind
+        differing = _norm_ulp_mismatches(out, ref, kind, keep=~nan_ref)
+        assert differing <= _norm_diff_budget(int((~nan_ref).sum())), (kind, differing)
         q_data = torch.empty_like(data)
         q_sf = torch.empty_like(sf)
         torch.ops._muse_C.nvfp4_decode_act_quant(out, layer.gs, q_data, q_sf)
@@ -903,9 +948,15 @@ def test_engine_runs_on_the_output_of_the_norm_and_quantization_launch(
     x = _norm_inputs("normal", t, 5)
     ids = _all_ids(t, 460 + t, layer.e_local)["three_local"]
     normed = fused_rmsnorm_fwd(x, w, 1e-6, gain_center=1.0, use_kahan_summation=True)
-    ref = _valid(*engine.run(normed, ids, layer.expert_map))
+    first = engine.rmsnorm_quantize(x, w, 1e-6, 1.0)
+    differing = _norm_ulp_mismatches(first, normed, t)
+    assert differing <= _norm_diff_budget(normed.numel()), (t, differing)
+    # The reference run takes the rows of the CUDA norm through a copy (another data
+    # pointer: the engine quantizes them itself instead of taking the scratch); the norm
+    # launch is then repeated, so the scratch the engine reads below was written by it.
+    ref = _valid(*engine.run(first.clone(), ids, layer.expert_map))
     got_normed = engine.rmsnorm_quantize(x, w, 1e-6, 1.0)
-    assert torch.equal(got_normed.view(torch.int16), normed.view(torch.int16))
+    assert torch.equal(got_normed.view(torch.int16), first.view(torch.int16))
     engine.build_plan(ids, layer.expert_map)
     got = _valid(*engine.run(got_normed, ids, layer.expert_map))
     assert spy.flags[-1] & FLAG_EXTERNAL_XQ and spy.flags[-1] & FLAG_EXTERNAL_PLAN
@@ -931,7 +982,10 @@ def test_norm_quant_launch_waits_for_the_producer_of_its_input(
     x = _norm_inputs("heavy", t, 6)
     stale = _norm_inputs("normal", t, 7)
     ids = _all_ids(t, 470 + t, layer.e_local)["random"]
-    normed = fused_rmsnorm_fwd(x, w, 1e-6, gain_center=1.0, use_kahan_summation=True)
+    # The reference input is the CUDA norm's own output (through a copy, so the engine
+    # quantizes it itself): the launches below are compared with it bit for bit, which
+    # the Triton norm's 1-ulp rounding differences (NORM_MAX_ULP) would not allow.
+    normed = engine.rmsnorm_quantize(x, w, 1e-6, 1.0).clone()
     ref = _valid(*engine.run(normed, ids, layer.expert_map))
     x_in = stale.clone()
 
