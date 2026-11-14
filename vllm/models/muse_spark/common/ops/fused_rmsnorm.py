@@ -518,6 +518,10 @@ def fused_norm_residual_norm_fwd(
     bT = max(1, _BOUNDARY_TILE_ELEMS // bD)
 
     num_warps = 32 if bD >= 8192 else (16 if bD >= 4096 else 8)
+    # The retune is SM100 only. On SM120 (RTX PRO 6000 Blackwell, 2026-10-23)
+    # it is not worth enabling: a different bT or num_warps regroups the fp32
+    # row sums, so 6% of the new stream differs bitwise from this config, and
+    # the kernel is HBM bound at T=8192 (554 vs 551 us, 1.45 TB/s).
     if D == 8192 and T >= 256 and current_platform.is_device_capability(100):
         bT = 2
         num_warps = 8
