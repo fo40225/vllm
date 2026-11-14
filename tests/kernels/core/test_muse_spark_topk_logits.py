@@ -254,7 +254,7 @@ def _hook_worker(rank: int, world: int, port: int, out_path: str) -> None:
     from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
     from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
     from vllm.v1.worker.gpu.sample.gumbel import apply_temperature, gumbel_sample
-    from vllm.v1.worker.gpu.sample.topk_logits import topk_merge_sample
+    from vllm.v1.worker.gpu.sample.topk_logits import TieDraw, topk_merge_sample
 
     torch.cuda.set_device(rank)
     config = VllmConfig(parallel_config=ParallelConfig(tensor_parallel_size=world))
@@ -336,6 +336,53 @@ def _hook_worker(rank: int, world: int, port: int, out_path: str) -> None:
             in_vocab=bool(((first >= 0) & (first < VOCAB)).all()),
         )
         torch.distributed.barrier()
+
+        # The same on FlashInfer's rule at the top_k boundary (a step of unseeded rows
+        # keeps every token tied with the top_k-th logit): the draw of the Gumbel-max
+        # over that set of the full logits.
+        if rows < 8:
+            continue
+        t_temperature = torch.full((rows,), 0.8, device="cuda")
+        t_top_k = torch.full((rows,), 64, dtype=torch.int32, device="cuda")
+
+        def threshold_hook():
+            ties = TieDraw(idx, seeds, pos)
+            topk = MuseSpark1xForCausalLM.compute_topk_logits(model, hidden, ties)
+            return topk_merge_sample(topk, idx, t_temperature, t_top_k, seeds, pos)
+
+        with torch.inference_mode():
+            kth = torch.topk(full, 64, dim=1).values[:, -1:]
+            masked = torch.where(
+                full >= kth, full, torch.full_like(full, -float("inf"))
+            )
+            apply_temperature(masked, idx, t_temperature)
+            expected = gumbel_sample(
+                masked,
+                idx,
+                t_temperature,
+                seeds,
+                pos,
+                apply_temperature=False,
+                is_drafting=False,
+            )
+            first = threshold_hook()
+            second = threshold_hook()
+            everyone = tensor_model_parallel_all_gather(first, 0).view(world, rows)
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with graph_capture(device=torch.device("cuda", rank)) as capture:
+                with torch.cuda.graph(graph, stream=capture.stream):
+                    captured = threshold_hook()
+            graph.replay()
+            torch.cuda.synchronize()
+        results[f"threshold_{rows}"] = dict(
+            equal_reference=bool(torch.equal(first, expected)),
+            deterministic=bool(torch.equal(first, second)),
+            same_on_all_ranks=bool((everyone == everyone[0]).all()),
+            graph_equal=bool(torch.equal(captured, first)),
+            in_the_set=bool((torch.gather(full, 1, first.view(-1, 1)) >= kth).all()),
+        )
+        torch.distributed.barrier()
     if rank == 0:
         with open(out_path, "w") as f:
             json.dump(results, f)
@@ -347,12 +394,15 @@ def test_the_model_hook_matches_compute_logits_on_8_ranks(tmp_path):
     """The real lm_head shards and collectives: the token drawn from the gathered
     candidates is the token of ``compute_logits`` + the full sampler route, bit for bit
     (greedy rows and t1k64 rows), identical on all ranks, run-to-run, and from a CUDA
-    graph."""
+    graph; and on FlashInfer's rule at the top_k boundary (ties of the top_k-th logit
+    all kept) the Gumbel-max draw over that set."""
     out_path = str(tmp_path / "results.json")
     port = 29700 + os.getpid() % 1000
     mp.spawn(_hook_worker, args=(8, port, out_path), nprocs=8)
     with open(out_path) as f:
         results = json.load(f)
-    assert set(results) == {str(rows) for rows in ROWS}
+    assert set(results) == {str(rows) for rows in ROWS} | {
+        f"threshold_{rows}" for rows in ROWS if rows >= 8
+    }
     for rows, result in results.items():
         assert all(result.values()), (rows, result)

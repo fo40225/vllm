@@ -161,7 +161,10 @@ from vllm.utils.torch_utils import aux_stream
 from vllm.v1.worker.gpu.sample.topk_logits import (
     MAX_CANDIDATES,
     MAX_GATHER_SHARD_COLS,
+    TIE_EXTRA_WORDS,
+    TieDraw,
     TopKLogits,
+    fill_tie_closure,
     local_topk_candidates,
 )
 
@@ -3331,7 +3334,9 @@ class MuseSpark1xForCausalLM(LlamaForCausalLM, SupportsLoRA, MixtureOfExperts):
         )
         return k
 
-    def compute_topk_logits(self, hidden_states: torch.Tensor) -> TopKLogits:
+    def compute_topk_logits(
+        self, hidden_states: torch.Tensor, ties: TieDraw | None = None
+    ) -> TopKLogits:
         """The top-``topk_logits_k`` logits of every TP rank, gathered, for sampling.
 
         What ``compute_logits`` does up to the gather, with the gather and everything
@@ -3340,6 +3345,10 @@ class MuseSpark1xForCausalLM(LlamaForCausalLM, SupportsLoRA, MixtureOfExperts):
         all-gather, rank-major), and the soft cap is applied to the gathered words
         by the very op of ``compute_logits``. The sampler turns the candidates into
         tokens (``Sampler.sample_topk_logits``).
+
+        ``ties`` (``Sampler.topk_logits_tie_draw``) asks for a step that keeps every
+        token tied with the top_k-th logit: each rank then adds the words that close the
+        ties it could not list (``fill_tie_closure``) to the same gather.
         """
         k = self.topk_logits_k
         assert k > 0
@@ -3347,9 +3356,22 @@ class MuseSpark1xForCausalLM(LlamaForCausalLM, SupportsLoRA, MixtureOfExperts):
         hidden_states = hidden_states.to(head.weight.dtype)
         # Plain shard logits: the head takes no scale or soft cap of its own here.
         local = self.logits_processor(head, hidden_states, skip_gather=True)
+        num_valid = head.shard_indices.num_org_elements
         words = local_topk_candidates(
-            local, k, num_valid=head.shard_indices.num_org_elements
+            local,
+            k,
+            num_valid=num_valid,
+            extra_words=TIE_EXTRA_WORDS if ties is not None else 0,
         )
+        if ties is not None:
+            fill_tie_closure(
+                local,
+                words,
+                k,
+                ties,
+                token_base=head.tp_rank * head.num_embeddings_per_partition,
+                num_valid=num_valid,
+            )
         # int16 words travel as bf16 bits: every communicator moves that dtype and
         # an all-gather only copies (the gate keeps the index words finite bf16, which
         # no conversion or NaN quieting can change).
@@ -3364,6 +3386,7 @@ class MuseSpark1xForCausalLM(LlamaForCausalLM, SupportsLoRA, MixtureOfExperts):
             k=k,
             tp_size=head.tp_size,
             shard_size=head.num_embeddings_per_partition,
+            threshold=ties is not None,
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

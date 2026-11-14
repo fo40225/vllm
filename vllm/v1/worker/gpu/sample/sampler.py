@@ -35,7 +35,11 @@ from vllm.v1.worker.gpu.sample.output import SamplerOutput, SamplingMaskTensors
 from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
 from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS, SamplingStates
 from vllm.v1.worker.gpu.sample.thinking_budget import ThinkingBudgetState
-from vllm.v1.worker.gpu.sample.topk_logits import TopKLogits, topk_merge_sample
+from vllm.v1.worker.gpu.sample.topk_logits import (
+    TieDraw,
+    TopKLogits,
+    topk_merge_sample,
+)
 from vllm.v1.worker.gpu.sample.trace_replay import TraceReplayState
 from vllm.v1.worker.gpu.states import RequestState
 
@@ -172,6 +176,37 @@ class Sampler:
             return "top-k-unset-or-above-k"
         return None
 
+    def topk_logits_threshold_route(self, idx_mapping_np: np.ndarray) -> bool:
+        """Whether the full path draws this step with FlashInfer's top-k sampler.
+
+        It does for a step with random rows and top_k set, with neither a greedy row
+        nor an explicit seed (the condition of `sample`, for a step that is on the
+        path: no logprobs). Its top-k keeps *every* token tied with the top_k-th logit,
+        where the Gumbel-max route keeps exactly top_k of them (the lowest ids). Host
+        state only: every TP rank decides alike.
+        """
+        return (
+            self.use_flashinfer
+            and not self.sampling_states.any_greedy(idx_mapping_np)
+            and not self.sampling_states.any_explicit_seed(idx_mapping_np)
+        )
+
+    def topk_logits_tie_draw(
+        self, input_batch: InputBatch, force: bool = False
+    ) -> TieDraw | None:
+        """What the candidates of this step need to close the ties of a threshold step
+        (None for a step that keeps exactly top_k tokens). Call it where the ranks
+        compute their candidates. ``force`` builds it whatever the route (warm-up)."""
+        route = self.topk_logits_threshold_route(input_batch.idx_mapping_np)
+        if not (force or route):
+            return None
+        return TieDraw(
+            expanded_idx_mapping=input_batch.expanded_idx_mapping,
+            seeds=self.sampling_states.seeds.gpu,
+            pos=input_batch.positions[input_batch.logits_indices],
+            use_fp64=self.use_fp64_gumbel,
+        )
+
     def topk_logits_supported(self, idx_mapping_np: np.ndarray, k: int) -> bool:
         """Whether `sample_topk_logits` can sample these requests."""
         return self.topk_logits_fallback_reason(idx_mapping_np, k) is None
@@ -182,9 +217,13 @@ class Sampler:
         """`__call__` on the candidates of `topk` instead of the full logits.
 
         The caller has checked `topk_logits_supported`. Draws the token of the full
-        path: the argmax of the logits, or the Gumbel-max draw over their top_k (exactly
-        top_k tokens, the lowest ids among ties at the boundary: the tokens and noise
-        of the Gumbel-max route; FlashInfer's route keeps every tie of the k-th logit).
+        path, the route it would take for this step: the argmax of the logits for a
+        greedy row; for the others the Gumbel-max draw over their top_k, exactly top_k
+        tokens (the lowest ids among ties at the boundary) with the tokens and noise of
+        the Gumbel-max route, or, for a step on FlashInfer's route
+        (`topk_logits_threshold_route`, candidates made with `topk_logits_tie_draw`),
+        over every token tied with or above the top_k-th logit: the distribution of
+        FlashInfer's sampler.
         """
         states = self.sampling_states
         pos = input_batch.positions[input_batch.logits_indices]

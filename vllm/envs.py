@@ -1658,23 +1658,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the full path (the lowest index among equal logits), unless more than K tokens of
     # one vocabulary shard have |logit| >= 816, where the soft cap of Muse Spark stops
     # being strictly increasing on bf16 values. A request with temperature > 0 needs
-    # top_k <= K, and keeps exactly top_k tokens, the lowest ids among the ones tied at
-    # the k-th logit; its draw is the Gumbel-max draw of the full path (same noise per
-    # seed, position and token id): bitwise the token of the full path wherever that
-    # path draws by Gumbel-max (a step with a greedy request or an explicit seed). A
-    # step without both takes FlashInfer's top-k sampler on the full path, which keeps
-    # every token tied with the k-th logit: the two distributions differ on a row whose
-    # k-th and (k+1)-th logits are equal, by the weight of the tokens tied beyond the
-    # k-th (they get 0 here). A step takes the full path (all ranks decide alike,
-    # from the request state) when any request of it asks for logprobs, penalties,
-    # logit bias / allowed token ids / bad words, a thinking budget, a grammar bitmask,
-    # or, at temperature > 0, min_p, top_p, or a top_k above K (no top_k included): one
-    # such request sends the whole step down the full path. Speculative decoding,
-    # LoRA, batch-sharded sampling, a watermark, trace replay, a sampling mask or the
-    # NaN counter switch the path off for the launch, and a step with fewer rows than
-    # VLLM_MUSE_SPARK_SM120_TOPK_LOGITS_MIN_TOKENS takes the full path. The share of
-    # steps on the path and the reasons of the others are logged every 30 s. Read
-    # once, when the model is constructed. Off by default until measured.
+    # top_k <= K, and is drawn with the rule of the sampler the full path takes for the
+    # step: with a greedy request or an explicit seed in it, the Gumbel-max draw over
+    # exactly top_k tokens (the lowest ids among the ones tied at the k-th logit),
+    # bitwise the token of the full path; otherwise (FlashInfer's top-k sampler there)
+    # the draw over every token tied with or above the k-th logit, which the ranks make
+    # exact for any size of the tie group by sending the best unlisted tie of their
+    # shard in the same gather: FlashInfer's distribution (not its random numbers). A
+    # step takes the full path (all ranks decide alike, from the request state) when
+    # any request of it asks for logprobs, penalties, logit bias / allowed token ids /
+    # bad words, a thinking budget, a grammar bitmask, or, at temperature > 0, min_p,
+    # top_p, or a top_k above K (no top_k included): one such request sends the whole
+    # step down the full path.
+    # Speculative decoding, LoRA, batch-sharded sampling, a watermark, trace replay, a
+    # sampling mask or the NaN counter switch the path off for the launch, and a step
+    # with fewer rows than VLLM_MUSE_SPARK_SM120_TOPK_LOGITS_MIN_TOKENS takes the full
+    # path. The share of steps on the path and the reasons of the others are logged
+    # every 30 s. Read once, when the model is constructed. Off by default until
+    # measured.
     "VLLM_MUSE_SPARK_SM120_TOPK_LOGITS": lambda: bool(
         int(os.getenv("VLLM_MUSE_SPARK_SM120_TOPK_LOGITS", "0"))
     ),

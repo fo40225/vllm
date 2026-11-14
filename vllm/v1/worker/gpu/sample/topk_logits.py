@@ -16,7 +16,8 @@ instead:
 3. ``topk_merge_sample`` draws the token of each row from its ``TP * K`` candidates:
    argmax with the lowest token id among equal logits for a greedy row, and for a
    row with temperature > 0 the top-k mask followed by the Gumbel-max draw of
-   ``gumbel_sample``, with the noise keyed by the token id exactly as there.
+   ``gumbel_sample``, with the noise keyed by the token id exactly as there. The mask
+   keeps exactly top_k tokens, or every token tied with the top_k-th (see below).
 
 Candidates are ordered by their bf16 logit, then by their token id, which is the order
 of the soft-capped fp32 values with the lowest id first among equal ones, as in the full
@@ -27,18 +28,39 @@ and 820 are the first bf16 values that share a capped value; the cap reaches exa
 full logits, unless more than K tokens of one shard have |logit| >= 816 (their capped
 values can tie where their bf16 values do not): Muse logits are tens, not hundreds.
 
-Ties at the top_k boundary. A row with top_k <= K keeps exactly ``top_k`` tokens: the
-lowest token ids among the ones tied at the boundary. These are the tokens
-``apply_top_k_top_p`` (Qrita) keeps, with the same noise per (seed, position, token id),
-so the row returns the token of the full path whenever that path draws by Gumbel-max (a
-greedy row, a seeded row, or any step with one). The other route of the full path for
-top_k-only sampling, FlashInfer's sampler (a step with neither greedy rows nor explicit
-seeds), keeps every token tied with the k-th value. The two differ only on a row with a
-tie across the k-th place: the tokens tied beyond the k-th get weight 0 here and their
-share of the renormalised mass there, so the draw here favours the lower token ids by at
-most that mass in total variation. top_k does not define a tie rule; both are top-k
-samplers. Expect the difference on bf16 logits only where the k-th and (k+1)-th logit
-are equal.
+Ties at the top_k boundary. bf16 logits tie constantly (about 44 % of the real decode
+rows of Muse Spark have an equal 64th and 65th logit), and the two samplers of the full
+path treat a tie across the top_k-th place differently:
+
+* the Gumbel-max route (a step with a greedy row or an explicit seed) keeps exactly
+  ``top_k`` tokens, the lowest ids among the ones tied at the boundary
+  (``apply_top_k_top_p``, Qrita). The candidate path does the same, with the same noise
+  per (seed, position, token id): it returns the very token of the full path;
+* FlashInfer's top-k sampler (any other step of top_k-only sampling) keeps *every*
+  token tied with the top_k-th logit: a token is accepted when fewer than top_k tokens
+  are strictly larger. The candidate path of such a step (``TopKLogits.threshold``)
+  draws over the same set, with weights exp(logit / T), so its distribution is
+  FlashInfer's (the random streams differ: unseeded draws of one distribution).
+
+The second rule needs the whole tie group, which a rank's K candidates may not hold: a
+rank lists the lowest indices among the tokens tied with its K-th logit, and a group
+can have any size (all of the vocabulary, for equal logits). So the candidates close the
+ties: a token tied with the K-th logit of a rank but not listed is *unlisted*; it is
+in the kept set only if that K-th logit is the global top_k-th one (the candidates of
+every rank have at most top_k - 1 tokens above it); all tokens tied with one logit have
+one weight; and Gumbel-max over a group is the Gumbel-max over its token of the largest
+noise, which only the owning rank can find (the noise is a function of seed, position
+and token id, all known to it). So every rank sends, in the same gather, its best
+unlisted tie (``fill_tie_closure``, 8 more words per row), and the merge counts it as
+one more candidate of the weight of the group exactly when its rank's K-th logit equals
+the top_k-th one. The kept set, the weights and so the distribution are those of the
+full path for any tie group, without a second collective or a host sync, and
+``tests/v1/worker/test_gpu_topk_logits_ties.py`` checks it on constructed ties (in
+one shard, in every shard, beyond the lists, signed zeros, all logits equal) against the
+real FlashInfer kernel, draw by draw against the Gumbel-max over the threshold set of
+the full logits, and by chi-square. (FlashInfer's probabilities tie exactly where the
+logits do while their gaps, at least 0.011 in the capped logit, stay above fp32
+rounding after the division by the temperature, which is at most 2.)
 """
 
 import time
@@ -48,7 +70,7 @@ from dataclasses import dataclass
 import torch
 
 from vllm.triton_utils import tl, triton
-from vllm.v1.worker.gpu.sample.gumbel import gumbel_noised_argmax
+from vllm.v1.worker.gpu.sample.gumbel import gumbel_noise, gumbel_noised_argmax
 
 # The widest shard row of the local kernel (a column is a 16-bit index of the candidate
 # word).
@@ -59,6 +81,10 @@ MAX_SHARD_COLS = 65535
 MAX_GATHER_SHARD_COLS = 0x7F80
 # The widest candidate list of a row (TP * K) the merge kernel holds in registers.
 MAX_CANDIDATES = 2048
+# Words after the 2 * K candidate words of a row in the "threshold" payload: the best
+# unlisted tie of the rank (shard-local index, presence flag) and padding, so that the
+# row stays a multiple of 16 bytes. See ``fill_tie_closure``.
+TIE_EXTRA_WORDS = 8
 _INT32_MAX = tl.constexpr(0x7FFFFFFF)
 
 
@@ -66,18 +92,45 @@ _INT32_MAX = tl.constexpr(0x7FFFFFFF)
 class TopKLogits:
     """The gathered candidates of a batch, rank-major.
 
-    ``words`` is the all-gather (dim 0) of the per-rank ``[rows, 2 * k]`` words of
-    ``local_topk_candidates``: row ``r * rows + t`` holds the k logits (bf16) of rank
-    ``r`` for row ``t``, then the k shard-local indices (int16 bits). ``capped`` is the
-    soft cap of ``words`` as fp32 (only its first k columns of a row are logits).
+    ``words`` is the all-gather (dim 0) of the per-rank ``[rows, 2 * k (+ extra)]``
+    words of ``local_topk_candidates``: row ``r * rows + t`` holds the k logits (bf16)
+    of rank ``r`` for row ``t``, then the k shard-local indices (int16 bits), then, in a
+    ``threshold`` batch, ``TIE_EXTRA_WORDS`` words of ``fill_tie_closure``. ``capped``
+    is the soft cap of ``words`` as fp32 (only the first k columns of a row are
+    logits).
     """
 
-    words: torch.Tensor  # [tp * rows, 2 * k], bf16 carrier of int16 / bf16 bits
-    capped: torch.Tensor  # [tp * rows, 2 * k], fp32
+    # [tp * rows, 2 * k (+ extra)], bf16 carrier of int16 / bf16 bits
+    words: torch.Tensor
+    capped: torch.Tensor  # same shape, fp32
     num_rows: int
     k: int
     tp_size: int
     shard_size: int  # token ids per rank: id = rank * shard_size + local index
+    # Sampling rule at the top_k boundary: False keeps exactly top_k tokens (the lowest
+    # ids among the ones tied at the boundary), True keeps every token tied with the
+    # top_k-th logit. The payload of the second carries the closure of the ties.
+    threshold: bool = False
+
+    @property
+    def extra_words(self) -> int:
+        return TIE_EXTRA_WORDS if self.threshold else 0
+
+
+@dataclass(slots=True)
+class TieDraw:
+    """What the ranks need to draw among the ties they could not list: the Gumbel noise
+    of a token is a function of the request's seed, the position and the token id.
+
+    The seed of a request without one is a host numpy draw: identical on every TP rank
+    because every worker seeds numpy alike (``set_random_seed``) and admits the
+    requests in the same order, which the Gumbel-max route of the full path relies on
+    as well."""
+
+    expanded_idx_mapping: torch.Tensor  # [rows] request state index of every row
+    seeds: torch.Tensor  # [max_num_reqs]
+    pos: torch.Tensor  # [rows]
+    use_fp64: bool = False
 
 
 @triton.jit
@@ -186,6 +239,9 @@ def _merge_chunks_kernel(
 # Warps of the program that draws the token of a row from its candidates.
 MERGE_NUM_WARPS = 4
 
+# Columns of one program of the tie closure.
+TIE_BLOCK_COLS = 2048
+
 # Columns of one program of the first pass: a row is cut into chunks, each reduced to
 # its K largest, and the K * chunks candidates of a row to K by a second pass.
 CHUNK_COLS = 2048
@@ -195,6 +251,7 @@ def local_topk_candidates(
     logits: torch.Tensor,
     k: int,
     num_valid: int | None = None,
+    extra_words: int = 0,
 ) -> torch.Tensor:
     """The K largest logits of every row, with their column indices.
 
@@ -202,12 +259,13 @@ def local_topk_candidates(
         logits: ``[rows, cols]`` bf16, contiguous rows.
         k: candidates per row, at most ``num_valid``.
         num_valid: columns that are vocabulary (the rest is shard padding).
+        extra_words: columns appended to every row for the caller (uninitialised).
 
     Returns:
-        ``[rows, 2 * k]`` int16: the k logits as bf16 bits, then their column indices.
-        The k are the largest of the row, ties broken towards the lowest column; their
-        order within the row is fixed but unspecified. No host sync, no data-dependent
-        shape: safe to capture in a CUDA graph.
+        ``[rows, 2 * k + extra_words]`` int16: the k logits as bf16 bits, then their
+        column indices. The k are the largest of the row, ties broken towards the lowest
+        column; their order within the row is fixed but unspecified. No host sync, no
+        data-dependent shape: safe to capture in a CUDA graph.
     """
     assert logits.dtype == torch.bfloat16 and logits.dim() == 2
     assert logits.stride(1) == 1
@@ -215,7 +273,9 @@ def local_topk_candidates(
     if num_valid is None:
         num_valid = cols
     assert 1 <= k <= num_valid <= cols <= MAX_SHARD_COLS
-    out = torch.empty((rows, 2 * k), dtype=torch.int16, device=logits.device)
+    out = torch.empty(
+        (rows, 2 * k + extra_words), dtype=torch.int16, device=logits.device
+    )
     if rows == 0:
         return out
     num_chunks = triton.cdiv(num_valid, CHUNK_COLS)
@@ -246,6 +306,164 @@ def local_topk_candidates(
     return out
 
 
+@triton.jit(do_not_specialize=["num_valid", "token_base"])
+def _tie_partial_kernel(
+    logits_ptr,
+    logits_stride,
+    words_ptr,
+    words_stride,
+    expanded_idx_mapping_ptr,
+    seeds_ptr,
+    pos_ptr,
+    noise_ptr,
+    arg_ptr,
+    num_valid,
+    token_base,
+    K: tl.constexpr,
+    K_POW2: tl.constexpr,
+    BLOCK: tl.constexpr,
+    NUM_BLOCKS: tl.constexpr,
+    USE_FP64: tl.constexpr,
+):
+    """The unlisted tie of the largest noise in one block of columns of one row."""
+    row = tl.program_id(0).to(tl.int64)
+    block = tl.program_id(1)
+    j = tl.arange(0, K_POW2)
+    in_list = j < K
+    base = words_ptr + row * words_stride
+    # The K-th key of the rank (the lowest of the list) and the highest index among the
+    # listed tokens that have it: the listed ties are the lowest indices of the ties.
+    list_key = _bf16_key(tl.load(base + j, mask=in_list, other=0), in_list)
+    kappa = tl.min(tl.where(in_list, list_key, 65536), axis=0)
+    list_idx = tl.load(base + K + j, mask=in_list, other=0).to(tl.int32) & 0xFFFF
+    last_listed = tl.max(tl.where(in_list & (list_key == kappa), list_idx, -1), axis=0)
+
+    offs = block * BLOCK + tl.arange(0, BLOCK)
+    in_cols = offs < num_valid
+    bits = tl.load(logits_ptr + row * logits_stride + offs, mask=in_cols, other=0.0).to(
+        tl.int16, bitcast=True
+    )
+    unlisted = (_bf16_key(bits, in_cols) == kappa) & (offs > last_listed)
+    if USE_FP64:
+        best_noise = tl.full((), float("-inf"), tl.float64)
+    else:
+        best_noise = tl.full((), float("-inf"), tl.float32)
+    best_idx = tl.full((), -1, tl.int32)
+    if tl.max(unlisted.to(tl.int32), axis=0) > 0:
+        req_state_idx = tl.load(expanded_idx_mapping_ptr + row).to(tl.int64)
+        is_valid_req = req_state_idx >= 0
+        seed = tl.load(seeds_ptr + req_state_idx, mask=is_valid_req, other=0)
+        pos = tl.load(pos_ptr + row)
+        noise = gumbel_noise(seed, pos, token_base + offs, USE_FP64)
+        noise = tl.where(unlisted, noise, float("-inf"))
+        best_noise, arg = tl.max(noise, axis=0, return_indices=True)
+        best_idx = block * BLOCK + arg
+    tl.store(noise_ptr + row * NUM_BLOCKS + block, best_noise)
+    tl.store(arg_ptr + row * NUM_BLOCKS + block, best_idx)
+
+
+@triton.jit
+def _tie_reduce_kernel(
+    noise_ptr,
+    arg_ptr,
+    words_ptr,
+    words_stride,
+    K: tl.constexpr,
+    EXTRA: tl.constexpr,
+    NUM_BLOCKS: tl.constexpr,
+    BLOCKS_POW2: tl.constexpr,
+):
+    """Word 0 and 1 of the extra words: the best of the per-block unlisted ties."""
+    row = tl.program_id(0).to(tl.int64)
+    b = tl.arange(0, BLOCKS_POW2)
+    in_blocks = b < NUM_BLOCKS
+    noise = tl.load(
+        noise_ptr + row * NUM_BLOCKS + b, mask=in_blocks, other=float("-inf")
+    )
+    args = tl.load(arg_ptr + row * NUM_BLOCKS + b, mask=in_blocks, other=-1)
+    # The first block of the largest noise holds the lowest index among equal noise.
+    _, best = tl.max(noise, axis=0, return_indices=True)
+    idx = tl.sum(tl.where(b == best, args, 0), axis=0)
+    present = tl.max(args, axis=0) >= 0
+    e = tl.arange(0, EXTRA)
+    extra = tl.where(
+        e == 0, tl.where(present, idx, 0), tl.where(e == 1, present.to(tl.int32), 0)
+    )
+    tl.store(words_ptr + row * words_stride + 2 * K + e, extra.to(tl.int16))
+
+
+def fill_tie_closure(
+    logits: torch.Tensor,
+    words: torch.Tensor,
+    k: int,
+    ties: TieDraw,
+    token_base: int,
+    num_valid: int | None = None,
+) -> None:
+    """Writes the ``TIE_EXTRA_WORDS`` words that close the ties of a rank's candidates.
+
+    The rank lists the k largest of its shard, the lowest indices among equal values. A
+    token tied with the rank's k-th logit that did not make the list is *unlisted*: a
+    sampler that keeps every token tied with the top_k-th logit (FlashInfer's rule)
+    must still be able to draw it, however many there are. Its Gumbel noise is known to
+    this rank alone (a function of seed, position and token id), and the tokens tied
+    with one logit have one weight, so the whole group is represented, exactly, by the
+    unlisted token with the largest noise: its index (word 0) and whether there is one
+    (word 1). ``topk_merge_sample`` counts it as a candidate whenever the rank's k-th
+    logit is the global top_k-th one (the only case in which the unlisted ties are in
+    the kept set).
+
+    Args:
+        logits: the ``[rows, cols]`` shard the candidates were taken from.
+        words: ``[rows, 2 * k + TIE_EXTRA_WORDS]`` int16 from ``local_topk_candidates``.
+        token_base: token id of column 0 of the shard (rank * shard size).
+    """
+    rows, cols = logits.shape
+    if num_valid is None:
+        num_valid = cols
+    assert words.shape == (rows, 2 * k + TIE_EXTRA_WORDS) and words.dtype == torch.int16
+    assert logits.dtype == torch.bfloat16 and logits.stride(1) == 1
+    if rows == 0:
+        return
+    block = TIE_BLOCK_COLS
+    num_blocks = triton.cdiv(num_valid, block)
+    scratch_dtype = torch.float64 if ties.use_fp64 else torch.float32
+    best_noise = torch.empty(
+        (rows, num_blocks), dtype=scratch_dtype, device=logits.device
+    )
+    best_idx = torch.empty((rows, num_blocks), dtype=torch.int32, device=logits.device)
+    _tie_partial_kernel[(rows, num_blocks)](
+        logits,
+        logits.stride(0),
+        words,
+        words.stride(0),
+        ties.expanded_idx_mapping.contiguous(),
+        ties.seeds,
+        ties.pos.contiguous(),
+        best_noise,
+        best_idx,
+        num_valid,
+        token_base,
+        K=k,
+        K_POW2=triton.next_power_of_2(k),
+        BLOCK=block,
+        NUM_BLOCKS=num_blocks,
+        USE_FP64=ties.use_fp64,
+        num_warps=4,
+    )
+    _tie_reduce_kernel[(rows,)](
+        best_noise,
+        best_idx,
+        words,
+        words.stride(0),
+        K=k,
+        EXTRA=TIE_EXTRA_WORDS,
+        NUM_BLOCKS=num_blocks,
+        BLOCKS_POW2=triton.next_power_of_2(num_blocks),
+        num_warps=1,
+    )
+
+
 @triton.jit
 def _load_candidates(
     words_ptr,
@@ -256,12 +474,13 @@ def _load_candidates(
     shard_size,
     TP: tl.constexpr,
     K: tl.constexpr,
+    ROW_WORDS: tl.constexpr,
 ):
     """Candidates ``j`` of ``row``: soft-capped value, token id, bf16 order key."""
     rank = j // K
     col = j - rank * K
     in_range = j < TP * K
-    base = (rank * num_rows + row).to(tl.int64) * (2 * K)
+    base = (rank * num_rows + row).to(tl.int64) * ROW_WORDS
     value = tl.load(capped_ptr + base + col, mask=in_range, other=float("-inf"))
     raw_bits = tl.load(words_ptr + base + col, mask=in_range, other=0)
     local = tl.load(words_ptr + base + K + col, mask=in_range, other=0)
@@ -285,9 +504,12 @@ def _topk_merge_sample_kernel(
     num_rows,
     shard_size,
     TP: tl.constexpr,
+    TP_POW2: tl.constexpr,
     K: tl.constexpr,
+    ROW_WORDS: tl.constexpr,
     NUM_CANDIDATES: tl.constexpr,
     USE_FP64: tl.constexpr,
+    THRESHOLD: tl.constexpr,
 ):
     row = tl.program_id(0)
     req_state_idx = tl.load(expanded_idx_mapping_ptr + row).to(tl.int64)
@@ -298,7 +520,7 @@ def _topk_merge_sample_kernel(
 
     j = tl.arange(0, NUM_CANDIDATES)
     value, token_id, in_range, key = _load_candidates(
-        words_ptr, capped_ptr, j, row, num_rows, shard_size, TP, K
+        words_ptr, capped_ptr, j, row, num_rows, shard_size, TP, K, ROW_WORDS
     )
     if temp == 0.0:
         # The lowest token id among the largest values, as the argmax of the full path.
@@ -308,15 +530,21 @@ def _topk_merge_sample_kernel(
     else:
         # The temperature as the full path divides by it: not at all for 1.0.
         value = tl.where(temp != 1.0, value / temp, value)
-        # The top_k largest by the bf16 order of the logits, which is that of the
-        # capped, scaled values. Each rank lists equal logits by ascending token id,
-        # and the ranks by ascending id: the first of equal candidates has the lowest
-        # id.
         top_k = tl.minimum(tl.load(top_k_ptr + req_state_idx), TP * K)
-        keep, _ = _select_top(key, top_k)
+        if THRESHOLD:
+            # Every token with at least the top_k-th largest logit (bf16 order, which
+            # is that of the capped, scaled values).
+            threshold = _kth_largest_key(key, top_k)
+            keep = in_range & (key >= threshold)
+        else:
+            # The top_k largest by the bf16 order of the logits, which is that of the
+            # capped, scaled values. Each rank lists equal logits by ascending token
+            # id, and the ranks by ascending id: the first of equal candidates has the
+            # lowest id.
+            keep, _ = _select_top(key, top_k)
         seed = tl.load(seeds_ptr + req_state_idx, mask=is_valid_req, other=0)
         pos = tl.load(pos_ptr + row)
-        _, winner = gumbel_noised_argmax(
+        score, winner = gumbel_noised_argmax(
             value,
             token_id,
             keep,
@@ -328,6 +556,39 @@ def _topk_merge_sample_kernel(
             APPLY_TEMPERATURE=False,
         )
         token = tl.sum(tl.where(j == winner, token_id, 0), axis=0)
+        if THRESHOLD:
+            # The ties a rank could not list: its k-th logit is the global top_k-th one
+            # only if they are in the kept set, and then the unlisted token of the
+            # largest noise (word 0 of the extra words, if word 1) stands for them all.
+            r = tl.arange(0, TP_POW2)
+            in_tp = r < TP
+            base = (r * num_rows + row).to(tl.int64) * ROW_WORDS
+            kth_bits = tl.load(words_ptr + base + (K - 1), mask=in_tp, other=0)
+            relevant = (
+                in_tp
+                & (tl.load(words_ptr + base + 2 * K + 1, mask=in_tp, other=0) != 0)
+                & (_bf16_key(kth_bits, in_tp) == threshold)
+            )
+            tie_value = tl.load(
+                capped_ptr + base + (K - 1), mask=in_tp, other=float("-inf")
+            )
+            tie_value = tl.where(temp != 1.0, tie_value / temp, tie_value)
+            tie_local = tl.load(words_ptr + base + 2 * K, mask=in_tp, other=0)
+            tie_id = r * shard_size + (tie_local.to(tl.int32) & 0xFFFF)
+            tie_score, tie_winner = gumbel_noised_argmax(
+                tie_value,
+                tie_id,
+                relevant,
+                seed,
+                pos,
+                temp,
+                IS_DRAFTING=False,
+                USE_FP64=USE_FP64,
+                APPLY_TEMPERATURE=False,
+            )
+            tie_token = tl.sum(tl.where(r == tie_winner, tie_id, 0), axis=0)
+            wins = (tie_score > score) | ((tie_score == score) & (tie_token < token))
+            token = tl.where(wins, tie_token, token)
     tl.store(sampled_ptr + row, token.to(tl.int64))
 
 
@@ -343,14 +604,16 @@ def topk_merge_sample(
     """Sample one token per row from the gathered candidates.
 
     Every row of temperature 0 is greedy; the others must have ``top_k <= topk.k``
-    (the caller checks: a larger top_k would be silently cut to the candidates).
-    Returns ``[rows]`` int64 token ids. No host sync: safe to capture in a CUDA graph.
+    (the caller checks: a larger top_k would be silently cut to the candidates). A
+    ``topk.threshold`` batch has no greedy row. Returns ``[rows]`` int64 token ids. No
+    host sync: safe to capture in a CUDA graph.
     """
     rows, k, tp = topk.num_rows, topk.k, topk.tp_size
     num_candidates = triton.next_power_of_2(tp * k)
     assert tp * k <= MAX_CANDIDATES
+    row_words = 2 * k + topk.extra_words
     assert topk.words.is_contiguous() and topk.capped.is_contiguous()
-    assert topk.words.shape == (tp * rows, 2 * k) == tuple(topk.capped.shape)
+    assert topk.words.shape == (tp * rows, row_words) == tuple(topk.capped.shape)
     sampled = torch.empty(rows, dtype=torch.int64, device=topk.words.device)
     if rows == 0:
         return sampled
@@ -366,9 +629,12 @@ def topk_merge_sample(
         rows,
         topk.shard_size,
         TP=tp,
+        TP_POW2=triton.next_power_of_2(tp),
         K=k,
+        ROW_WORDS=row_words,
         NUM_CANDIDATES=num_candidates,
         USE_FP64=use_fp64,
+        THRESHOLD=topk.threshold,
         num_warps=MERGE_NUM_WARPS,
     )
     return sampled
@@ -392,6 +658,7 @@ class RouteStats:
     ) -> None:
         self.k = k
         self.taken = 0
+        self.taken_threshold = 0  # of the taken steps, those that keep every tie
         self.fallbacks: dict[str, int] = {}
         self._interval_s = interval_s
         self._clock = clock
@@ -406,18 +673,21 @@ class RouteStats:
         share = 100.0 * self.taken / steps
         line = (
             f"{self.taken} of {steps} sampled steps ({share:.1f}%) drew from the "
-            f"top-{self.k} logits of every TP rank"
+            f"top-{self.k} logits of every TP rank ({self.taken_threshold} of them on "
+            "FlashInfer's rule at the top_k boundary, the others on exactly top_k "
+            "tokens)"
         )
         if self.fallbacks:
             reasons = ", ".join(f"{r}: {n}" for r, n in sorted(self.fallbacks.items()))
             line += f"; the others gathered the logits ({reasons})"
         return line
 
-    def record(self, reason: str | None) -> str | None:
+    def record(self, reason: str | None, threshold: bool = False) -> str | None:
         """Count a step that gathered the logits for ``reason``, or (None) did not."""
         new_reason = False
         if reason is None:
             self.taken += 1
+            self.taken_threshold += threshold
         else:
             new_reason = reason not in self.fallbacks
             self.fallbacks[reason] = self.fallbacks.get(reason, 0) + 1

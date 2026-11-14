@@ -187,6 +187,52 @@ def test_the_fallback_reason_of_a_sampler_feature():
     )
 
 
+@pytest.mark.parametrize("use_flashinfer", [True, False])
+@pytest.mark.parametrize(
+    "params",
+    [
+        [T1K64] * 4,
+        [T1K64, SamplingParams(temperature=0.7, top_k=20), T1K64],
+        [GREEDY, T1K64, T1K64],
+        [T1K64, SamplingParams(temperature=1.0, top_k=64, seed=5), T1K64],
+        [SamplingParams(temperature=1.0, top_k=64, seed=5)] * 3,
+        [GREEDY] * 3,
+        [SamplingParams(temperature=1.0, top_k=1)] * 2,
+    ],
+    ids=["unseeded", "unseeded-mixed", "greedy-row", "seeded-row", "all-seeded",
+         "all-greedy", "k1"],
+)
+def test_the_threshold_route_is_the_choice_of_the_full_sampler(
+    monkeypatch, params, use_flashinfer
+):
+    """The full sampler draws a step with FlashInfer's top-k sampler (every token tied
+    with the top_k-th logit stays) or by Gumbel-max (exactly top_k tokens). The
+    candidates take the matching rule: the same decision, from the same state."""
+    from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+
+    seen = []
+
+    def spy(self, processed_logits, expanded_idx_mapping, idx_mapping_np, pos, top_k,
+            top_p, use_fused_sampler):
+        seen.append(use_fused_sampler)
+        return processed_logits.argmax(-1), processed_logits
+
+    monkeypatch.setattr(Sampler, "_sample_random", spy)
+    sampler = sampler_with(*params)
+    sampler.apply_staged_writes()
+    sampler.use_flashinfer = use_flashinfer
+    n = len(params)
+    assert supported(sampler, list(range(n)))
+    buffers = InputBuffers(n, n, DEVICE)
+    batch = InputBatch.make_dummy(n, n, buffers)
+    sampler(torch.randn(n, VOCAB_SIZE, device=DEVICE), batch)
+    assert len(seen) == 1
+    assert sampler.topk_logits_threshold_route(batch.idx_mapping_np) == seen[0]
+    # ... and the candidates of the step carry the closure of the ties exactly then.
+    tie_draw = sampler.topk_logits_tie_draw(batch)
+    assert (tie_draw is not None) == seen[0]
+
+
 def test_a_batch_takes_the_path_only_if_every_request_can():
     sampler = sampler_with(
         GREEDY,
@@ -358,12 +404,19 @@ def fake_batch(rows: int, draft_tokens: int = 0, reqs: int | None = None):
     )
 
 
-def fake_runner(k: int = K, min_tokens: int = 1, reason: str | None = None, **kwargs):
+def fake_runner(
+    k: int = K,
+    min_tokens: int = 1,
+    reason: str | None = None,
+    threshold: bool = False,
+    **kwargs,
+):
     sampler = SimpleNamespace(
         calls=[],
         topk_logits_fallback_reason=lambda idx, kk: (
             sampler.calls.append((idx.tolist(), kk)) or reason
         ),
+        topk_logits_threshold_route=lambda idx: threshold,
     )
     runner = SimpleNamespace(
         topk_logits_k=k,
@@ -448,6 +501,16 @@ def test_a_launch_without_the_path_counts_nothing():
     runner = fake_runner(k=0)
     assert not step_uses_topk(runner, fake_batch(8))
     assert runner.topk_logits_stats.steps == 0 and runner.sampler.calls == []
+
+
+def test_route_stats_count_the_threshold_steps():
+    stats = RouteStats(64, clock=lambda: 0.0)
+    stats.record(None, threshold=True)
+    stats.record(None)
+    stats.record(None, threshold=True)
+    line = stats.record("logprobs")
+    assert stats.taken == 3 and stats.taken_threshold == 2
+    assert "3 of 4 sampled steps" in line and "2 of them on FlashInfer's rule" in line
 
 
 def test_route_stats_log_the_first_step_new_reasons_and_then_every_interval():

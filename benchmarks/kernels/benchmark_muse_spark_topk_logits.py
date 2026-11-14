@@ -12,7 +12,9 @@ the gathers, not the gathers. Per decode batch size T it times, in us per step:
            sampler, the route of a batch without greedy rows and explicit seeds
            where it is supported), as the V2 sampler runs them
   new_*    the local top-K of the [T, 25256] shard, the soft cap of the gathered
-           candidates and ``topk_merge_sample``, greedy or t1k64
+           candidates and ``topk_merge_sample``, greedy or t1k64 (``*_threshold``: the
+           t1k64 step that keeps every tie of the top_k-th logit, as FlashInfer's
+           sampler does: 8 more words per row from ``fill_tie_closure``)
   and each stage alone. The bytes a rank sends per step are printed with them: the
   all-gather of the full path moves T * 25256 * 2 B per rank, the candidate path
   T * 2 * K * 2 B.
@@ -39,7 +41,10 @@ from vllm.v1.sample.ops.topk_topp_sampler import (
 )
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.sample.topk_logits import (
+    TIE_EXTRA_WORDS,
+    TieDraw,
     TopKLogits,
+    fill_tie_closure,
     local_topk_candidates,
     topk_merge_sample,
 )
@@ -116,6 +121,11 @@ def main() -> None:
         words = torch.cat([words_one] * TP).view(torch.bfloat16)
         capped = cap(words)
         topk = TopKLogits(words, capped, t, k, TP, shard)
+        ties = TieDraw(idx, seeds, pos)
+        words_t_one = local_topk_candidates(local, k, extra_words=TIE_EXTRA_WORDS)
+        fill_tie_closure(local, words_t_one, k, ties, token_base=0)
+        words_t = torch.cat([words_t_one] * TP).view(torch.bfloat16)
+        topk_t = TopKLogits(words_t, cap(words_t), t, k, TP, shard, threshold=True)
         sink = {}
 
         def old_cap():
@@ -158,11 +168,25 @@ def main() -> None:
             tk = TopKLogits(wg, cap(wg), t, k, TP, shard)
             sink["tok"] = topk_merge_sample(tk, idx, ones, top_k_all, seeds, pos)
 
+        def new_closure():
+            fill_tie_closure(local, words_t_one, k, ties, token_base=0)
+
+        def new_merge_threshold():
+            sink["tok"] = topk_merge_sample(topk_t, idx, ones, top_k_all, seeds, pos)
+
+        def new_t1k64_threshold():
+            w = local_topk_candidates(local, k, extra_words=TIE_EXTRA_WORDS)
+            fill_tie_closure(local, w, k, ties, token_base=0)
+            wg = torch.cat([w] * TP).view(torch.bfloat16)
+            tk = TopKLogits(wg, cap(wg), t, k, TP, shard, threshold=True)
+            sink["tok"] = topk_merge_sample(tk, idx, ones, top_k_all, seeds, pos)
+
         row = {
             "tokens": t,
             "k": k,
             "bytes_per_rank_full": t * shard * 2,
             "bytes_per_rank_topk": t * 2 * k * 2,
+            "bytes_per_rank_topk_threshold": t * (2 * k + TIE_EXTRA_WORDS) * 2,
         }
         for name, fn in [
             ("old_cap", old_cap),
@@ -175,6 +199,9 @@ def main() -> None:
             ("new_merge_t1k64", new_merge_t1k64),
             ("new_greedy", new_greedy),
             ("new_t1k64", new_t1k64),
+            ("new_closure", new_closure),
+            ("new_merge_threshold", new_merge_threshold),
+            ("new_t1k64_threshold", new_t1k64_threshold),
         ]:
             row[f"{name}_graph_us"] = round(time_graph(fn), 2)
             row[f"{name}_eager_us"] = round(time_eager(fn, flush), 2)

@@ -1057,9 +1057,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.sampler.apply_staged_writes()
         self.sampler(logits, dummy_input_batch)
         if self.topk_logits_k:
-            # Compile the kernels of the top-k logits path before the first request.
-            topk = self.model.compute_topk_logits(hidden_states)
-            self.sampler.sample_topk_logits(topk, dummy_input_batch)
+            # Compile the kernels of the top-k logits path before the first request,
+            # for both rules at the top_k boundary.
+            for force_ties in (False, True):
+                ties = self.sampler.topk_logits_tie_draw(
+                    dummy_input_batch, force=force_ties
+                )
+                topk = self.model.compute_topk_logits(hidden_states, ties)
+                self.sampler.sample_topk_logits(topk, dummy_input_batch)
 
     def _resolve_topk_logits_k(self) -> int:
         """Candidates per TP rank of the top-k logits sampling, 0 when it is off.
@@ -1129,8 +1134,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.topk_logits_k == 0:
             return False
         reason = self._topk_logits_fallback_reason(input_batch, grammar_output)
-        assert self.topk_logits_stats is not None
-        line = self.topk_logits_stats.record(reason)
+        assert self.topk_logits_stats is not None and self.sampler is not None
+        line = self.topk_logits_stats.record(
+            reason,
+            threshold=reason is None
+            and self.sampler.topk_logits_threshold_route(input_batch.idx_mapping_np),
+        )
         if line is not None:
             logger.info("Sampling from the top-k logits: %s.", line)
         return reason is None
@@ -1830,8 +1839,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         self.topk_logits_k,
                         input_batch.logits_indices.shape[0],
                     )
-                topk = self.model.compute_topk_logits(sample_hidden_states)
                 assert self.sampler is not None
+                topk = self.model.compute_topk_logits(
+                    sample_hidden_states, self.sampler.topk_logits_tie_draw(input_batch)
+                )
                 sampler_output = self.sampler.sample_topk_logits(topk, input_batch)
                 return (
                     sampler_output,
