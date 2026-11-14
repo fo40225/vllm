@@ -68,6 +68,10 @@ def supports_dense_q(attn_layer: torch.nn.Module) -> bool:
             "in use has no dense Q output."
         )
         return False
+    logger.info_once(
+        "MuseSpark SM120: the fused QK-norm/RoPE kernel writes Q into a dense buffer "
+        "(VLLM_MUSE_SPARK_SM120_DENSE_Q=1); FlashInfer does not copy it any more."
+    )
     return True
 
 
