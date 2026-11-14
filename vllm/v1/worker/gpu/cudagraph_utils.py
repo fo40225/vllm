@@ -157,6 +157,7 @@ class CudaGraphManager:
         lora_capture_cases: list[int] | None = None,
         varlen_decode: bool = False,
         ubatch_runner: "UBatchRunner | None" = None,
+        dynamic_decode_query_len: bool = True,
     ):
         self.vllm_config = vllm_config
         self.device = device
@@ -165,6 +166,11 @@ class CudaGraphManager:
         assert self.compilation_config is not None
         self.cudagraph_mode = cudagraph_mode
         self.decode_query_len = decode_query_len
+        # False: the caller always runs ``decode_query_len`` tokens per request,
+        # whatever the dynamic speculative decoding schedule asks of the target, so
+        # only that uniform decode tier is ever dispatched and the others are not
+        # captured.
+        self.dynamic_decode_query_len = dynamic_decode_query_len
         self.varlen_decode = varlen_decode
         # DBO supports FULL CUDA graphs only.
         self.ubatch_runner = ubatch_runner
@@ -275,7 +281,8 @@ class CudaGraphManager:
         # to capture graphs for all possible values during decode.
         speculative_config = self.vllm_config.speculative_config
         if (
-            speculative_config
+            self.dynamic_decode_query_len
+            and speculative_config
             and speculative_config.uses_dynamic_speculative_decoding()
             and self.decode_query_len > self.vllm_config.num_speculative_tokens
         ):

@@ -426,3 +426,94 @@ def test_dynamic_sd_only_captures_scheduled_query_lengths(monkeypatch):
                 assert desc.num_tokens == num_tokens
                 assert desc.num_reqs is None
             assert desc.num_active_loras == 0
+
+
+@pytest.mark.parametrize("max_spec_tokens", [3, 7])
+def test_fixed_decode_query_len_captures_only_its_own_tier(
+    monkeypatch, max_spec_tokens
+):
+    """A draft manager that always runs 1 + K tokens per request has one tier.
+
+    The DFlash draft block is ``1 + K`` tokens per request whatever the schedule asks
+    of the target, so decode_query_len (K + 1) exceeds num_speculative_tokens (K) and
+    the dynamic branch used to expand it into the tiers 1..K + 1, of which only
+    K + 1 is ever dispatched.
+    """
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    monkeypatch.setattr(
+        gpu_cudagraph_utils.current_platform,
+        "get_global_graph_pool",
+        lambda: None,
+    )
+    query_len = max_spec_tokens + 1
+
+    def tiers(**kwargs) -> set[int | None]:
+        vllm_config = _create_vllm_config_for_dsd(
+            max_num_seqs=16,
+            max_spec_tokens=max_spec_tokens,
+            cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
+        )
+        manager = gpu_cudagraph_utils.CudaGraphManager(
+            vllm_config=vllm_config,
+            device=torch.device("cpu"),
+            cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
+            decode_query_len=query_len,
+            **kwargs,
+        )
+        return {
+            desc.uniform_token_count
+            for desc in manager._capture_descs[CUDAGraphMode.FULL]
+        }
+
+    assert tiers() == set(range(1, query_len + 1))
+    assert tiers(dynamic_decode_query_len=False) == {query_len}
+
+
+@pytest.mark.parametrize(
+    "speculator_path",
+    [
+        "vllm.v1.worker.gpu.spec_decode.dflash.speculator.DFlashSpeculator",
+        "vllm.v1.worker.gpu.spec_decode.dflash2.speculator.DFlash2Speculator",
+        "vllm.v1.worker.gpu.spec_decode.dspark.speculator.DSparkSpeculator",
+    ],
+)
+def test_dflash_family_draft_manager_has_a_single_tier(monkeypatch, speculator_path):
+    """The speculators of the DFlash family capture only the full draft block."""
+    from vllm.utils.import_utils import resolve_obj_by_qualname
+    from vllm.v1.attention.backend import AttentionCGSupport
+
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    monkeypatch.setattr(
+        gpu_cudagraph_utils.current_platform,
+        "get_global_graph_pool",
+        lambda: None,
+    )
+    speculator_cls = resolve_obj_by_qualname(speculator_path)
+    speculator = speculator_cls.__new__(speculator_cls)
+    speculator.vllm_config = _create_vllm_config_for_dsd(
+        max_num_seqs=16,
+        max_spec_tokens=7,
+        cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+    )
+    speculator.device = torch.device("cpu")
+    speculator.num_query_per_req = 8
+    speculator.attn_cg_support = SimpleNamespace(
+        min_cg_support=AttentionCGSupport.UNIFORM_BATCH,
+        min_cg_attn_backend="test",
+    )
+
+    speculator.init_cudagraph_manager(CUDAGraphMode.FULL_AND_PIECEWISE)
+
+    manager = speculator.query_cudagraph_manager
+    assert manager is not None
+    descs = manager._capture_descs[CUDAGraphMode.FULL]
+    assert descs
+    assert {desc.uniform_token_count for desc in descs} == {8}

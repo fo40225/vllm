@@ -164,6 +164,9 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.device,
             cudagraph_mode,
             decode_query_len=self.num_query_per_req,
+            # propose() ignores the K of the step and always drafts a full block of
+            # num_query_per_req tokens per request: one uniform decode tier.
+            dynamic_decode_query_len=False,
         )
 
     def capture(self) -> None:
