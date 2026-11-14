@@ -974,3 +974,67 @@ def test_init_attn_backend_splits_same_spec_layers_by_scale(
         assert split == [["t0", "d0", "t1", "d1"]]
     else:
         assert split == [["t0", "t1"], ["d0", "d1"]]
+
+
+@pytest.mark.parametrize(
+    ("override", "expected"), [(None, 2), (1, 1), (3, 3)]
+)
+def test_init_attn_backend_builds_one_builder_set_per_microbatch_unless_told(
+    monkeypatch: pytest.MonkeyPatch, override: int | None, expected: int
+):
+    """A target microbatched in two builds two sets of metadata builders; a drafter
+    (which runs on the merged batch) asks for one."""
+    spec = FullAttentionSpec(
+        block_size=16, num_kv_heads=2, head_size=64, dtype=torch.bfloat16
+    )
+    layers = {"t0": _fake_attn_layer(0.68), "t1": _fake_attn_layer(0.68)}
+    kv_cache_config = SimpleNamespace(
+        kv_cache_groups=[KVCacheGroupSpec(list(layers), spec)]
+    )
+    monkeypatch.setattr(
+        attn_utils,
+        "get_layers_from_vllm_config",
+        lambda cfg, cls, names=None: {n: layers[n] for n in (names or layers)},
+    )
+    monkeypatch.setattr(attn_utils, "add_kv_sharing_layers_to_kv_cache_groups", Mock())
+    monkeypatch.setattr(attn_utils, "get_shared_kv_cache_layers", lambda *a: {})
+    monkeypatch.setattr(
+        attn_utils, "get_kv_sharing_fast_prefill_eligible_layers", lambda *a: set()
+    )
+    monkeypatch.setattr(attn_utils, "prepare_kernel_block_sizes", lambda *a: [16])
+    monkeypatch.setattr(attn_utils, "get_num_ubatches", lambda *a: 2)
+    monkeypatch.setattr(
+        attn_utils, "get_attn_cg_support", lambda *a, **k: "cg_support_info"
+    )
+    create = Mock()
+    monkeypatch.setattr(AttentionGroup, "create_metadata_builders", create)
+    kwargs = {} if override is None else {"num_metadata_builders": override}
+
+    attn_utils.init_attn_backend(
+        kv_cache_config,
+        SimpleNamespace(parallel_config=None),
+        torch.device("cpu"),
+        **kwargs,
+    )
+
+    assert create.call_args.kwargs["num_metadata_builders"] == expected
+
+
+def test_drafter_attention_groups_get_one_metadata_builder(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm.v1.worker.gpu.spec_decode import speculator as speculator_module
+
+    init = Mock(return_value=("groups", "cg_support", [16]))
+    monkeypatch.setattr(speculator_module, "init_attn_backend", init)
+    stub = SimpleNamespace(
+        attn_vllm_config="config",
+        device=torch.device("cpu"),
+        draft_attn_layer_names={"d0"},
+        _configure_decode_metadata_update=Mock(),
+    )
+    speculator_module.DraftModelSpeculator.set_attn(
+        stub, "model_state", "kv_cache_config", "block_tables", "buffers", []
+    )
+    assert init.call_args.kwargs["num_metadata_builders"] == 1
+    assert stub.attn_groups == "groups"

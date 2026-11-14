@@ -240,7 +240,13 @@ def init_attn_backend(
     active_layer_names: set[str] | None = None,
     draft_layer_names: set[str] | None = None,
     unbuilt_layer_names: set[str] | None = None,
+    num_metadata_builders: int | None = None,
 ) -> tuple[list[list[AttentionGroup]], AttentionCGSupportInfo, list[int]]:
+    """Discover the attention groups and build their metadata builders.
+
+    ``num_metadata_builders`` is the number of builders per group (default: one per
+    microbatch of the target model; a drafter that never runs microbatched needs one).
+    """
     # Phase 1: discover attention groups for each kv cache group.
     attn_groups: list[list[AttentionGroup]] = []
 
@@ -341,7 +347,11 @@ def init_attn_backend(
                 # Microbatches build attention metadata concurrently, and some
                 # builders keep the prepared metadata on themselves (MLA stores
                 # it on the prefill backend), so each ubatch needs its own.
-                num_metadata_builders=get_num_ubatches(vllm_config.parallel_config),
+                num_metadata_builders=(
+                    get_num_ubatches(vllm_config.parallel_config)
+                    if num_metadata_builders is None
+                    else num_metadata_builders
+                ),
             )
             # The microbatches' builders share the workspace: they all issue
             # attention on the one compute stream the threads hand off, so the
