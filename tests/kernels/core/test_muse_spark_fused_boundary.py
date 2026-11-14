@@ -657,3 +657,87 @@ def test_pooler_gemv_gather_and_norm_decline(monkeypatch, case):
     assert moe._fused_gemv_all_gather_rmsnorm(x) is None
     expected_calls = ["gemv_all_gather_rmsnorm"] if case == "returns None" else []
     assert communicator.calls == expected_calls
+
+
+class GemvLimitedCommunicator(FakeCommunicator):
+    """Fuses the GEMV kinds for fewer rows than the plain gathers (the host plugin's
+    MUSE_TOPO_GEMV_MAX_ROWS is 4 where its gather kernels take 8)."""
+
+    def __init__(self, *, gemv_max_tokens=4, **kwargs):
+        super().__init__(**kwargs)
+        self.gemv_max_tokens = gemv_max_tokens
+
+    def supports_fused_residual_boundary(self, kind, num_tokens):
+        if kind.startswith("gemv_"):
+            return num_tokens <= self.gemv_max_tokens
+        return super().supports_fused_residual_boundary(kind, num_tokens)
+
+
+def make_unpooler_gemv_layer(*, fuses=True, column_gather=True):
+    """A layer whose MoE block has a sharded unpooler (``make_unpooler_moe_stub``)."""
+    layer = make_layer_stub(column_gather=column_gather)
+    layer.feed_forward, _ = make_unpooler_moe_stub(1, fuses=fuses)
+    layer.feed_forward.shards_unpooler = lambda num_tokens: True
+    return layer
+
+
+def run_deferred_unpooler(layer, rows):
+    """Whether the layer hands the unpooler GEMV to the boundary for ``rows`` rows,
+    the way ``MuseSpark1xDecoderLayer`` decides it."""
+    if not layer._defers_column_gather(rows):
+        return False
+    x = torch.randn(rows, 64, device="cuda", dtype=torch.bfloat16)
+    columns = layer.feed_forward._deferred_unpooler_columns(x)
+    return isinstance(columns, model_ops.MuseSpark1xUnpoolerInput)
+
+
+@requires_cuda
+def test_the_l2_prefetch_predicts_the_fused_unpooler_gemv(monkeypatch):
+    """``fuses_unpooler_gemv`` (what the L2 prefetch asks) agrees with the layer's own
+    decision for every batch size, also where the GEMV limit is below the gather's."""
+    use_communicator(monkeypatch, GemvLimitedCommunicator(gemv_max_tokens=4))
+    layer = make_unpooler_gemv_layer()
+    rows = [1, 2, 4, 5, 8, 9]
+    assert [layer.fuses_unpooler_gemv(n) for n in rows] == [True] * 3 + [False] * 3
+    assert [run_deferred_unpooler(layer, n) for n in rows] == [
+        layer.fuses_unpooler_gemv(n) for n in rows
+    ]
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "case",
+    [
+        "gemv flag off",
+        "no communicator",
+        "gemv declined",
+        "no column gather",
+        "unsharded unpooler",
+        "fp32 weight",
+        "no unpooler",
+        "dense layer",
+    ],
+)
+def test_the_l2_prefetch_keeps_the_unpooler_where_the_gemv_is_not_fused(
+    monkeypatch, case
+):
+    gemv_max_tokens = 0 if case == "gemv declined" else 4
+    use_communicator(
+        monkeypatch,
+        None
+        if case == "no communicator"
+        else GemvLimitedCommunicator(gemv_max_tokens=gemv_max_tokens),
+    )
+    layer = make_unpooler_gemv_layer(
+        fuses=case != "gemv flag off", column_gather=case != "no column gather"
+    )
+    moe = layer.feed_forward
+    if case == "unsharded unpooler":
+        moe.shards_unpooler = lambda num_tokens: False
+    if case == "fp32 weight":
+        moe.unpooler.weight.data = moe.unpooler.weight.data.float()
+    if case == "no unpooler":
+        moe.unpooler = None
+    if case == "dense layer":
+        layer.feed_forward = torch.nn.Identity()
+    assert not layer.fuses_unpooler_gemv(1)

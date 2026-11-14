@@ -152,6 +152,7 @@ if TYPE_CHECKING:
     VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_MIN_TOKENS: int = 512
     VLLM_MUSE_SPARK_SM120_L2_PREFETCH: bool = True
     VLLM_MUSE_SPARK_SM120_L2_PREFETCH_AFTER_EXPERTS_CTAS: int = 4
+    VLLM_MUSE_SPARK_SM120_L2_PREFETCH_ORDER: int = 0
     VLLM_MUSE_SPARK_SM120_EXPERT_PREFETCH: bool = True
     VLLM_MUSE_SPARK_SM120_EXPERT_PREFETCH_BYTES: int = 12582912
     VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY: bool = True
@@ -1462,6 +1463,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # host launch environment sets it. Read once, when the model is constructed.
     "VLLM_MUSE_SPARK_SM120_L2_PREFETCH_AFTER_EXPERTS_CTAS": lambda: int(
         os.getenv("VLLM_MUSE_SPARK_SM120_L2_PREFETCH_AFTER_EXPERTS_CTAS", "4")
+    ),
+    # Muse Spark on SM120: which weights the L2 prefetch of a decode layer pulls, and
+    # in what order (the kernel walks the tensors of a launch in list order). 0 = the
+    # shipped lists: behind the experts the unpooler shards, then the QKV and O weights
+    # of the next layer; behind the QKV projection the pooler shards and the router.
+    # 1 = QKV first (QKV, unpooler, O), so that the weights the next op reads are the
+    # first to arrive. 2 = leave the unpooler shards out where the TP communicator runs
+    # the unpooler GEMV itself (the fused GEMV + gather kernel loads its weights before
+    # the all-reduce in front of it has finished; padded batches up to the
+    # communicator's MAX_ROWS), which shortens the burst by 8.4 MB. 3 = pull the O
+    # weight of a layer behind that layer's own QKV projection (first in the launch,
+    # with the CTA count of the launch behind the experts) instead of behind the
+    # experts of the layer before; a layer without a hook, or behind one, is left as
+    # it is, so the weights pulled per layer do not change. 4 = 2 and 3. A cache-hint
+    # tuning, no output changes. Must be 0 to 4. Read once, when the model is
+    # constructed.
+    "VLLM_MUSE_SPARK_SM120_L2_PREFETCH_ORDER": lambda: int(
+        os.getenv("VLLM_MUSE_SPARK_SM120_L2_PREFETCH_ORDER", "0")
     ),
     # Muse Spark on SM120: in the decode CUDA graphs of up to 8 tokens, prefetch the
     # head of the experts that the routing picked for this rank into L2 on the aux

@@ -310,3 +310,181 @@ def test_a_cta_count_the_launch_cannot_take_is_refused_at_construction(
     model = _model_with_launchable_hooks()
     with pytest.raises(ValueError, match=CTAS_KNOB):
         model._configure_l2_prefetch()
+
+
+ORDER_KNOB = "VLLM_MUSE_SPARK_SM120_L2_PREFETCH_ORDER"
+# The CTA count behind the experts in the order tests; a launch with the prefetcher's
+# own count shows as None.
+C = 8
+# Layer 0 (BF16 experts) has no hook site and the last layer has no next layer to
+# prefetch for, so of five layers 1 to 3 are hooked.
+HOOKABLE = [False, True, True, True, False]
+
+
+def _named_model(hookable=HOOKABLE) -> model_ops.MuseSpark1xModel:
+    """Layers whose weights are told apart by name: ``qkv2`` is the QKV weight of layer
+    2, ``u2`` / ``p2`` its unpooler / pooler shards, ``r2`` its router, ``o2`` its O
+    weight. A layer's unpooler GEMV is fused for batches of up to 4 rows."""
+    model = object.__new__(model_ops.MuseSpark1xModel)
+    model.layers, model.names = [], {}
+    model.start_layer, model.end_layer = 0, len(hookable)
+    model._l2_prefetcher = None
+
+    def weight(name):
+        tensor = torch.empty(1)
+        model.names[id(tensor)] = name
+        return tensor
+
+    for idx, hook_site in enumerate(hookable):
+        moe = object.__new__(model_ops.MuseSpark1xMoE)
+        torch.nn.Module.__init__(moe)
+        moe.experts = object.__new__(_Experts)
+        torch.nn.Module.__init__(moe.experts)
+        moe.experts.hooks = []
+        moe.experts.supports_after_gemm2_hook = hook_site
+        moe.pooler = SimpleNamespace(shard=weight(f"p{idx}"))
+        moe.unpooler = SimpleNamespace(shard=weight(f"u{idx}"))
+        moe.sharded_weights = lambda num_tokens, op: [op.shard]
+        moe.router = SimpleNamespace(weight=SimpleNamespace(data=weight(f"r{idx}")))
+        model.layers.append(
+            SimpleNamespace(
+                feed_forward=moe,
+                fuses_unpooler_gemv=lambda num_tokens: num_tokens <= 4,
+                self_attn=SimpleNamespace(
+                    qkv_proj=SimpleNamespace(
+                        weight=SimpleNamespace(data=weight(f"qkv{idx}"))
+                    ),
+                    o_proj=SimpleNamespace(
+                        weight=SimpleNamespace(data=weight(f"o{idx}"))
+                    ),
+                ),
+            )
+        )
+    return model
+
+
+def _hook_lists(monkeypatch, layer, num_tokens, order=None, ctas=C):
+    """What the two hooks of ``layer`` launch for a decode batch of ``num_tokens``: the
+    weights by name in launch order and the CTA count (None: the prefetcher's own),
+    behind the experts and then behind the QKV projection. ``order`` and ``ctas``
+    set their knobs (None: unset)."""
+    for knob, value in ((ORDER_KNOB, order), (CTAS_KNOB, ctas)):
+        if value is None:
+            monkeypatch.delenv(knob, raising=False)
+        else:
+            monkeypatch.setenv(knob, str(value))
+    monkeypatch.setattr(muse_c, "preflight", lambda: None)
+    model = _named_model()
+    launches = []
+
+    def launch(self, tensors, num_ctas=None):
+        launches.append(([model.names[id(t)] for t in tensors], num_ctas))
+
+    monkeypatch.setattr(L2Prefetcher, "launch", launch)
+    model._configure_l2_prefetch()
+    hooked = model.layers[layer]
+    for hook in [*hooked.feed_forward.experts.hooks, hooked.self_attn.after_qkv_hook]:
+        hook(num_tokens)
+    return launches
+
+
+def test_the_default_order_is_the_shipped_one(monkeypatch):
+    """No knob: behind the experts of a layer the unpooler, QKV and O weights of the
+    next one (the default CTA count of the experts knob), behind the QKV projection the
+    pooler and router of the layer itself."""
+    assert _hook_lists(monkeypatch, 2, 2, order=None, ctas=None) == [
+        (["u2", "qkv3", "o3"], 4),
+        (["p2", "r2"], None),
+    ]
+    assert envs.VLLM_MUSE_SPARK_SM120_L2_PREFETCH_ORDER == 0
+
+
+# (order, rows) -> the launches of layer 2, which is hooked, follows a hooked layer
+# and precedes a hooked one: behind its experts, then behind its QKV projection. The
+# unpooler GEMV is fused for 1 to 4 rows, which only the orders 2 and 4 look at.
+SHIPPED = [(["u2", "qkv3", "o3"], C), (["p2", "r2"], None)]
+NO_UNPOOLER = [(["qkv3", "o3"], C), (["p2", "r2"], None)]
+O_LATER = [(["u2", "qkv3"], C), (["o2", "p2", "r2"], C)]
+O_LATER_NO_UNPOOLER = [(["qkv3"], C), (["o2", "p2", "r2"], C)]
+MIDDLE_LAYER = [
+    (0, 1, SHIPPED),
+    (0, 8, SHIPPED),
+    (1, 1, [(["qkv3", "u2", "o3"], C), (["p2", "r2"], None)]),
+    (1, 8, [(["qkv3", "u2", "o3"], C), (["p2", "r2"], None)]),
+    (2, 1, NO_UNPOOLER),
+    (2, 4, NO_UNPOOLER),
+    (2, 5, SHIPPED),
+    (2, 8, SHIPPED),
+    (3, 1, O_LATER),
+    (3, 8, O_LATER),
+    (4, 1, O_LATER_NO_UNPOOLER),
+    (4, 4, O_LATER_NO_UNPOOLER),
+    (4, 5, O_LATER),
+    (4, 8, O_LATER),
+]
+
+
+@pytest.mark.parametrize("order,rows,expected", MIDDLE_LAYER)
+def test_the_hook_lists_of_a_middle_layer(monkeypatch, order, rows, expected):
+    assert _hook_lists(monkeypatch, 2, rows, order=order) == expected
+
+
+# The ends of the chain, where the orders that re-time the O weight must not add or
+# drop one: layer 1 follows an unhooked layer, so its O weight was never prefetched
+# and still is not; layer 3 precedes layer 4, which has no QKV hook of its own, so the
+# O weight of layer 4 stays behind the experts of layer 3.
+CHAIN_ENDS = [
+    (3, 8, 1, [(["u1", "qkv2"], C), (["p1", "r1"], None)]),
+    (3, 8, 3, [(["u3", "qkv4", "o4"], C), (["o3", "p3", "r3"], C)]),
+    (4, 2, 1, [(["qkv2"], C), (["p1", "r1"], None)]),
+    (4, 2, 3, [(["qkv4", "o4"], C), (["o3", "p3", "r3"], C)]),
+    (2, 2, 3, [(["qkv4", "o4"], C), (["p3", "r3"], None)]),
+]
+
+
+@pytest.mark.parametrize("order,rows,layer,expected", CHAIN_ENDS)
+def test_the_hook_lists_at_the_ends_of_the_chain(
+    monkeypatch, order, rows, layer, expected
+):
+    assert _hook_lists(monkeypatch, layer, rows, order=order) == expected
+
+
+@pytest.mark.parametrize("order", [0, 1, 2, 3, 4])
+@pytest.mark.parametrize("rows", [1, 8])
+def test_every_order_pulls_each_weight_the_shipped_order_pulls(
+    monkeypatch, order, rows
+):
+    """The orders move weights between the hooks (or leave the fused unpooler out), they
+    never add or lose an attention weight: QKV and O of layers 2 to 4 are in one launch
+    each, in front of the layers that the shipped order covers."""
+
+    def pulled(order):
+        names = []
+        for layer in (1, 2, 3):
+            for launch, _ in _hook_lists(monkeypatch, layer, rows, order=order):
+                names += launch
+        return names
+
+    attention = [
+        name for name in pulled(order) if name.startswith(("qkv", "o"))
+    ]
+    assert sorted(attention) == sorted(
+        name for name in pulled(0) if name.startswith(("qkv", "o"))
+    )
+    assert sorted(attention) == ["o2", "o3", "o4", "qkv2", "qkv3", "qkv4"]
+
+
+@pytest.mark.parametrize("order", [0, 3])
+def test_no_hook_launches_above_the_batch_limit(monkeypatch, order):
+    assert _hook_lists(monkeypatch, 2, 257, order=order) == []
+    assert _hook_lists(monkeypatch, 2, 256, order=order) != []
+
+
+@pytest.mark.parametrize("value", ["-1", "5", "9"])
+def test_an_order_the_prefetch_does_not_have_is_refused_at_construction(
+    monkeypatch, value
+):
+    monkeypatch.setenv(ORDER_KNOB, value)
+    monkeypatch.setattr(muse_c, "preflight", lambda: None)
+    with pytest.raises(ValueError, match=ORDER_KNOB):
+        _named_model()._configure_l2_prefetch()

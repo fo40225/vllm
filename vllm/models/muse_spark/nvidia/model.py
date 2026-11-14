@@ -129,6 +129,7 @@ from vllm.models.muse_spark.nvidia.ops.l2_prefetch import (
     L2_PREFETCH_MAX_CTAS,
     L2_PREFETCH_MAX_TOKENS,
     L2Prefetcher,
+    l2_prefetch_order,
 )
 from vllm.models.muse_spark.nvidia.ops.mnnvl_fusions import (
     maybe_create_all_gather_dual_norm,
@@ -1262,6 +1263,20 @@ class MuseSpark1xMoE(nn.Module):
             norm.fused_gain_center,
         )
 
+    def communicator_runs_unpooler_gemv(self, num_tokens: int) -> bool:
+        """Whether the TP communicator takes the unpooler GEMV of a batch of this size
+        (the weight and communicator side of the fusion; the activations of the
+        batch must also be contiguous bf16)."""
+        unpooler = self.unpooler
+        return (
+            self.fuses_gemv_gather
+            and unpooler is not None
+            and unpooler.weight.dtype == torch.bfloat16
+            and fused_boundary.supports_fused_boundary(
+                fused_boundary.KIND_GEMV_ALL_GATHER_BOUNDARY, num_tokens
+            )
+        )
+
     def _deferred_unpooler_columns(
         self, experts_out: torch.Tensor
     ) -> torch.Tensor | MuseSpark1xUnpoolerInput:
@@ -1270,13 +1285,9 @@ class MuseSpark1xMoE(nn.Module):
         unpooler = self.unpooler
         assert unpooler is not None
         if (
-            self.fuses_gemv_gather
+            self.communicator_runs_unpooler_gemv(experts_out.shape[0])
             and experts_out.dtype == torch.bfloat16
             and experts_out.is_contiguous()
-            and unpooler.weight.dtype == torch.bfloat16
-            and fused_boundary.supports_fused_boundary(
-                fused_boundary.KIND_GEMV_ALL_GATHER_BOUNDARY, experts_out.shape[0]
-            )
         ):
             return MuseSpark1xUnpoolerInput(
                 x=experts_out,
@@ -2522,6 +2533,35 @@ class MuseSpark1xDecoderLayer(nn.Module):
             )
         )
 
+    def fuses_unpooler_gemv(self, num_tokens: int) -> bool:
+        """Whether the unpooler GEMV of a decode batch of this size runs in the TP
+        communicator's GEMV + gather kernel.
+
+        That kernel loads the weights by itself, ahead of the all-reduce that precedes
+        it (the L2 prefetch of the shards is then at best a head start for it). The
+        answer follows the chain of ``_defers_column_gather``, the MoE layer's
+        ``_deferred_unpooler_columns`` and the next boundary; it does not see the
+        norm parameters that the boundary checks (a hint-level approximation).
+        """
+        moe = self.feed_forward
+        return (
+            isinstance(moe, MuseSpark1xMoE)
+            and self._defers_column_gather(num_tokens)
+            and moe.communicator_runs_unpooler_gemv(num_tokens)
+        )
+
+
+def _after_gemm2_hook_site(layer: MuseSpark1xDecoderLayer) -> MuseMoERunner | None:
+    """The experts of ``layer`` where they call the hook that follows their GEMMs."""
+    moe = layer.feed_forward
+    if (
+        isinstance(moe, MuseSpark1xMoE)
+        and isinstance(moe.experts, MuseMoERunner)
+        and moe.experts.supports_after_gemm2_hook
+    ):
+        return moe.experts
+    return None
+
 
 # Runs uncompiled under breakable cudagraphs; drop LlamaModel's torch.compile.
 @ignore_torch_compile
@@ -2827,17 +2867,17 @@ class MuseSpark1xModel(LlamaModel):
         router weights of layer ``i``. The weights are looked up when the graph
         is captured, after they are final.
 
+        ``VLLM_MUSE_SPARK_SM120_L2_PREFETCH_ORDER`` selects other lists (QKV first,
+        no unpooler shards where the communicator's GEMV + gather kernel loads them
+        itself, the O weight behind the QKV projection of its own layer; see
+        ``L2PrefetchOrder``); the default is the lists above.
+
         A hint that changes no output, so a host that cannot build the ``_muse_C``
         extension, and a model without the SM120 native NVFP4 experts, run without it.
         """
         layers = list(islice(self.layers, self.start_layer, self.end_layer))
         # No extension (and no stream) for a model whose experts have no call site.
-        if not any(
-            isinstance(layer.feed_forward, MuseSpark1xMoE)
-            and isinstance(layer.feed_forward.experts, MuseMoERunner)
-            and layer.feed_forward.experts.supports_after_gemm2_hook
-            for layer in layers[:-1]
-        ):
+        if all(_after_gemm2_hook_site(layer) is None for layer in layers[:-1]):
             return
         if (reason := muse_c.preflight()) is not None:
             logger.info_once("The L2 weight prefetch is off: %s", reason)
@@ -2848,6 +2888,8 @@ class MuseSpark1xModel(LlamaModel):
                 "VLLM_MUSE_SPARK_SM120_L2_PREFETCH_AFTER_EXPERTS_CTAS must be in "
                 f"[1, {L2_PREFETCH_MAX_CTAS}], got {after_experts_ctas}."
             )
+        order_id = envs.VLLM_MUSE_SPARK_SM120_L2_PREFETCH_ORDER
+        order = l2_prefetch_order(order_id)
         try:
             prefetcher = L2Prefetcher()
         except Exception as e:
@@ -2860,52 +2902,80 @@ class MuseSpark1xModel(LlamaModel):
             )
             return
 
+        # A layer is hooked when it has a call site and a next layer to prefetch for.
+        hooked = [_after_gemm2_hook_site(layer) is not None for layer in layers[:-1]]
+        hooked.append(False)
+        # The O weight of layer j moves to the hook behind its own QKV projection when
+        # layer j - 1 (which carries it in the shipped order) and layer j are both
+        # hooked; otherwise it stays where the shipped order has it, so the order only
+        # re-times the prefetch and never adds or drops an O weight.
+        o_after_qkv = [
+            order.o_after_qkv and 0 < i and hooked[i - 1] and hooked[i]
+            for i in range(len(layers))
+        ]
+
         def after_experts(
-            moe: MuseSpark1xMoE, next_attn: MuseSpark1xAttention
+            layer: MuseSpark1xDecoderLayer,
+            next_layer: MuseSpark1xDecoderLayer,
+            next_o_after_qkv: bool,
         ) -> Callable[[int], None]:
+            moe = cast(MuseSpark1xMoE, layer.feed_forward)
+            next_attn = next_layer.self_attn
+
             def hook(num_tokens: int) -> None:
-                if num_tokens <= L2_PREFETCH_MAX_TOKENS:
-                    prefetcher.launch(
-                        [
-                            *moe.sharded_weights(num_tokens, moe.unpooler),
-                            next_attn.qkv_proj.weight.data,
-                            next_attn.o_proj.weight.data,
-                        ],
-                        num_ctas=after_experts_ctas,
-                    )
+                if num_tokens > L2_PREFETCH_MAX_TOKENS:
+                    return
+                unpooler = moe.sharded_weights(num_tokens, moe.unpooler)
+                if order.skip_fused_unpooler and layer.fuses_unpooler_gemv(num_tokens):
+                    unpooler = []
+                qkv = [next_attn.qkv_proj.weight.data]
+                o = [] if next_o_after_qkv else [next_attn.o_proj.weight.data]
+                tensors = [*unpooler, *qkv, *o]
+                if order.qkv_first:
+                    tensors = [*qkv, *unpooler, *o]
+                prefetcher.launch(tensors, num_ctas=after_experts_ctas)
 
             return hook
 
-        def after_qkv(moe: MuseSpark1xMoE) -> Callable[[int], None]:
+        def after_qkv(
+            layer: MuseSpark1xDecoderLayer, o_here: bool
+        ) -> Callable[[int], None]:
+            moe = cast(MuseSpark1xMoE, layer.feed_forward)
+            attn = layer.self_attn
+
             def hook(num_tokens: int) -> None:
-                if num_tokens <= L2_PREFETCH_MAX_TOKENS:
-                    prefetcher.launch(
-                        [
-                            *moe.sharded_weights(num_tokens, moe.pooler),
-                            moe.router.weight.data,
-                        ],
-                    )
+                if num_tokens > L2_PREFETCH_MAX_TOKENS:
+                    return
+                # The O GEMM follows the attention: its weight leads the launch, and
+                # the launch is as fast as the one behind the experts.
+                o = [attn.o_proj.weight.data] if o_here else []
+                prefetcher.launch(
+                    [
+                        *o,
+                        *moe.sharded_weights(num_tokens, moe.pooler),
+                        moe.router.weight.data,
+                    ],
+                    num_ctas=after_experts_ctas if o_here else None,
+                )
 
             return hook
 
-        hooked = 0
-        for layer, next_layer in zip(layers, layers[1:]):
-            moe = layer.feed_forward
-            if isinstance(moe, MuseSpark1xMoE) and isinstance(
-                moe.experts, MuseMoERunner
+        hook_count = 0
+        for i, (layer, next_layer) in enumerate(zip(layers, layers[1:])):
+            experts = _after_gemm2_hook_site(layer)
+            if experts is not None and experts.set_after_gemm2_hook(
+                after_experts(layer, next_layer, o_after_qkv[i + 1])
             ):
-                if moe.experts.set_after_gemm2_hook(
-                    after_experts(moe, next_layer.self_attn)
-                ):
-                    layer.self_attn.after_qkv_hook = after_qkv(moe)
-                    hooked += 1
-        if hooked:
+                layer.self_attn.after_qkv_hook = after_qkv(layer, o_after_qkv[i])
+                hook_count += 1
+        if hook_count:
             self._l2_prefetcher = prefetcher
             logger.info_once(
                 "MuseSpark: L2 prefetch of the weights of the next decode ops in %d "
-                "layers (%d CTAs behind the experts).",
-                hooked,
+                "layers (%d CTAs behind the experts%s).",
+                hook_count,
                 after_experts_ctas,
+                f", prefetch order {order_id}" if order_id else "",
             )
 
     def _make_empty_intermediate_tensors(

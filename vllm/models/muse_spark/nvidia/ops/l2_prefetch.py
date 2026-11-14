@@ -26,6 +26,7 @@ when the launch took 113 us (4 CTAs).
 """
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 import torch
 
@@ -49,6 +50,49 @@ L2_PREFETCH_MAX_CTAS = 1024
 L2_BUDGET_FRACTION = 0.75
 # The L2 size to assume when the driver does not report one.
 _FALLBACK_L2_BYTES = 64 << 20
+
+# The values of ``VLLM_MUSE_SPARK_SM120_L2_PREFETCH_ORDER`` (see ``L2PrefetchOrder``).
+L2_PREFETCH_ORDERS = (0, 1, 2, 3, 4)
+
+
+@dataclass(frozen=True, slots=True)
+class L2PrefetchOrder:
+    """What one value of ``VLLM_MUSE_SPARK_SM120_L2_PREFETCH_ORDER`` changes.
+
+    Order 0 is the shipped one: behind the experts of a layer the unpooler shards,
+    then the QKV and O weights of the next layer; behind the QKV projection the
+    pooler shards and the router.
+    """
+
+    # The QKV weight leads the launch behind the experts (the launch pulls the tensors
+    # in list order, so the first one is the first to be warm).
+    qkv_first: bool = False
+    # No unpooler shards where the communicator runs the unpooler GEMV, which loads
+    # its weights by itself.
+    skip_fused_unpooler: bool = False
+    # The O weight of a layer goes with the launch behind that layer's own QKV
+    # projection (in front of the pooler and router) instead of the launch behind
+    # the experts of the layer before.
+    o_after_qkv: bool = False
+
+
+_ORDERS = {
+    0: L2PrefetchOrder(),
+    1: L2PrefetchOrder(qkv_first=True),
+    2: L2PrefetchOrder(skip_fused_unpooler=True),
+    3: L2PrefetchOrder(o_after_qkv=True),
+    4: L2PrefetchOrder(skip_fused_unpooler=True, o_after_qkv=True),
+}
+
+
+def l2_prefetch_order(order: int) -> L2PrefetchOrder:
+    """The lists of ``VLLM_MUSE_SPARK_SM120_L2_PREFETCH_ORDER=order``."""
+    if order not in _ORDERS:
+        raise ValueError(
+            "VLLM_MUSE_SPARK_SM120_L2_PREFETCH_ORDER must be one of "
+            f"{L2_PREFETCH_ORDERS}, got {order}."
+        )
+    return _ORDERS[order]
 
 
 def l2_budget_bytes(device: torch.device | int | None = None) -> int:
