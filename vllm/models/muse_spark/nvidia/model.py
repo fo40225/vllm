@@ -4,7 +4,7 @@
 
 import inspect
 import math
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from itertools import islice
@@ -116,9 +116,14 @@ from vllm.models.muse_spark.nvidia.muse_moe_runner import (
     MuseSparkMoEConfig,
     MuseSparkRoutedExperts,
 )
+from vllm.models.muse_spark.nvidia.ops import muse_c
 from vllm.models.muse_spark.nvidia.ops.cute_dsl.qk_norm import (
     qk_norm,
     supports_qk_norm,
+)
+from vllm.models.muse_spark.nvidia.ops.l2_prefetch import (
+    L2_PREFETCH_MAX_TOKENS,
+    L2Prefetcher,
 )
 from vllm.models.muse_spark.nvidia.ops.mnnvl_fusions import (
     maybe_create_all_gather_dual_norm,
@@ -749,6 +754,26 @@ class MuseSpark1xMoE(nn.Module):
         weight = layer.weight.narrow(0, self.tp_rank * shard_size, shard_size)
         return self._projection_gemm(layer, x, weight, None)
 
+    def sharded_weights(
+        self, num_tokens: int, layer: ReplicatedLinear | None
+    ) -> list[torch.Tensor]:
+        """The rows of a pooler or unpooler weight this rank reads at this size.
+
+        Empty where the projection runs whole: that is a read of tens of MB,
+        too much to keep in L2.
+        """
+        if layer is None:
+            return []
+        shard = (
+            self.shards_pooler(num_tokens)
+            if layer is self.pooler
+            else self.shards_unpooler(num_tokens)
+        )
+        if not shard:
+            return []
+        size = layer.output_size // self.tp_size
+        return [layer.weight.data.narrow(0, self.tp_rank * size, size)]
+
     def _project(
         self, layer: ReplicatedLinear, x: torch.Tensor, shard: bool
     ) -> torch.Tensor:
@@ -1362,6 +1387,8 @@ class MuseSpark1xAttention(nn.Module):
             prefix=f"{prefix}.attn",
         )
 
+        # Set by the model for the decode L2 prefetch; called with the token count.
+        self.after_qkv_hook: Callable[[int], None] | None = None
         self.fused_qk_norm_rope_kv_insert = (
             self.use_qk_norm
             and self.qk_norm is not None
@@ -1455,6 +1482,8 @@ class MuseSpark1xAttention(nn.Module):
     ) -> torch.Tensor:
         """Attention over an input the caller has already normalized."""
         qkv, _ = self.qkv_proj(hidden_states)
+        if self.after_qkv_hook is not None:
+            self.after_qkv_hook(qkv.shape[0])
 
         q, k, v, og = self._qk_norm_rope_kv_insert(qkv, positions)
 
@@ -1805,6 +1834,9 @@ class MuseSpark1xModel(LlamaModel):
         self._configure_replicated_prefix()
         self._configure_column_gather()
         self._configure_pooler_gather()
+        self._l2_prefetcher: L2Prefetcher | None = None
+        if envs.VLLM_MUSE_SPARK_SM120_L2_PREFETCH:
+            self._configure_l2_prefetch()
         if self.is_sequence_parallel:
             from vllm.models.muse_spark.nvidia.ops.gemm_rs import (
                 maybe_create_gemm_rs,
@@ -1904,6 +1936,75 @@ class MuseSpark1xModel(LlamaModel):
                 eps=norm.variance_epsilon, gain_center=norm.fused_gain_center
             )
 
+    def _configure_l2_prefetch(self) -> None:
+        """Prefetch weights into L2 behind the collectives of the layer before.
+
+        Decode only, inside the CUDA graph, on a side stream (see
+        ``ops/l2_prefetch.py``). Behind the experts of layer ``i``, which are
+        followed by the MoE all-reduce, it pulls the unpooler of layer ``i`` and
+        the QKV and O weights of layer ``i + 1``; behind the QKV projection of
+        layer ``i`` (the attention reads little from HBM there), the pooler and
+        router weights of layer ``i``. The weights are looked up when the graph
+        is captured, after they are final.
+        """
+        if not (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability_family(120)
+        ):
+            logger.warning_once("VLLM_MUSE_SPARK_SM120_L2_PREFETCH needs an SM120 GPU.")
+            return
+        if (reason := muse_c.preflight()) is not None:
+            logger.warning_once("The L2 weight prefetch is off: %s", reason)
+            return
+        layers = list(islice(self.layers, self.start_layer, self.end_layer))
+        prefetcher = L2Prefetcher()
+
+        def after_experts(
+            moe: MuseSpark1xMoE, next_attn: MuseSpark1xAttention
+        ) -> Callable[[int], None]:
+            def hook(num_tokens: int) -> None:
+                if num_tokens <= L2_PREFETCH_MAX_TOKENS:
+                    prefetcher.launch(
+                        [
+                            *moe.sharded_weights(num_tokens, moe.unpooler),
+                            next_attn.qkv_proj.weight.data,
+                            next_attn.o_proj.weight.data,
+                        ]
+                    )
+
+            return hook
+
+        def after_qkv(moe: MuseSpark1xMoE) -> Callable[[int], None]:
+            def hook(num_tokens: int) -> None:
+                if num_tokens <= L2_PREFETCH_MAX_TOKENS:
+                    prefetcher.launch(
+                        [
+                            *moe.sharded_weights(num_tokens, moe.pooler),
+                            moe.router.weight.data,
+                        ]
+                    )
+
+            return hook
+
+        hooked = 0
+        for layer, next_layer in zip(layers, layers[1:]):
+            moe = layer.feed_forward
+            if isinstance(moe, MuseSpark1xMoE) and isinstance(
+                moe.experts, MuseMoERunner
+            ):
+                if moe.experts.set_after_gemm2_hook(
+                    after_experts(moe, next_layer.self_attn)
+                ):
+                    layer.self_attn.after_qkv_hook = after_qkv(moe)
+                    hooked += 1
+        if hooked:
+            self._l2_prefetcher = prefetcher
+            logger.info_once(
+                "MuseSpark: L2 prefetch of the weights of the next decode ops in %d "
+                "layers.",
+                hooked,
+            )
+
     def _make_empty_intermediate_tensors(
         self, batch_size: int, dtype: torch.dtype, device: torch.device
     ) -> IntermediateTensors:
@@ -1988,6 +2089,9 @@ class MuseSpark1xModel(LlamaModel):
                 if sp_active and not layer.is_sequence_parallel:
                     state = sp_shard(state)
                 aux_hidden_states.append(state)
+
+        if self._l2_prefetcher is not None:
+            self._l2_prefetcher.join()
 
         if not get_pp_group().is_last_rank:
             assert isinstance(x, torch.Tensor)  # fuse_across_layers is off here

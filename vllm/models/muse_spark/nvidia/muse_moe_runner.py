@@ -5,6 +5,7 @@
 Every expert backend stops after GEMM2 and hands its rows to the finalizer.
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -488,9 +489,12 @@ def _attach_post_expert_finalize(
 ) -> None:
     """Hand the layer's finalizer to its experts, which exist only now."""
     assert quant_method.moe_kernel is not None
-    quant_method.moe_kernel.fused_experts.post_gemm2_hook = (
-        quant_method.muse_post_expert_finalize
-    )
+    experts = quant_method.moe_kernel.fused_experts
+    experts.post_gemm2_hook = quant_method.muse_post_expert_finalize
+    if isinstance(experts, MuseSparkSm120NvFp4Experts):
+        experts.after_gemm2_hook = getattr(
+            quant_method, "muse_after_gemm2_hook", None
+        )
 
 
 @dataclass
@@ -607,6 +611,9 @@ class MuseSparkModelOptNvFp4FusedMoE(ModelOptNvFp4FusedMoE):
     """
 
     muse_post_expert_finalize: MusePostExpertFinalize
+    # Handed to the SM120 native experts when they are built; see
+    # ``MuseSparkSm120NvFp4Experts.after_gemm2_hook``.
+    muse_after_gemm2_hook: Callable[[int], None] | None = None
 
     def __init__(
         self,
@@ -999,6 +1006,22 @@ class MuseMoERunner(MoERunner):
             routed_experts.quant_method,
         )
         quant_method.muse_post_expert_finalize = self.post_expert_finalize
+
+    def set_after_gemm2_hook(self, hook: Callable[[int], None]) -> bool:
+        """Call ``hook(num_tokens)`` once the experts' GEMMs are queued.
+
+        Only the SM120 native NVFP4 experts have the call site, in front of the
+        post-GEMM2 finalize with its all-reduce. Returns whether this layer does.
+        The hook reaches the experts when they are built after the weights load.
+        """
+        quant_method = self.routed_experts.quant_method
+        if not (
+            isinstance(quant_method, MuseSparkModelOptNvFp4FusedMoE)
+            and quant_method.use_sm120_native
+        ):
+            return False
+        quant_method.muse_after_gemm2_hook = hook
+        return True
 
     @property
     def _prepared_nvfp4_experts(self) -> MuseSparkTrtLlmNvFp4Experts | None:

@@ -44,6 +44,7 @@ _SOURCES = (
     "muse_nvfp4_split_gemm1.cu",
     "muse_moe_route.cu",
     "muse_nvfp4_decode_moe.cu",
+    "muse_spark_l2_prefetch.cu",
     "muse_spark_mul_tanh_soft_cap.cu",
     "muse_spark_qknorm_rope_kv_insert.cu",
 )
@@ -397,6 +398,23 @@ def _register_decode_fakes() -> None:
     _fakes_registered.add("nvfp4_decode_moe")
 
 
+def _register_l2_prefetch_fake() -> None:
+    """Fake of the L2 prefetch op (it only hints the cache)."""
+    if "l2_prefetch" in _fakes_registered or not _op_defined("l2_prefetch"):
+        return
+
+    @torch.library.register_fake("_muse_C::l2_prefetch")
+    def _l2_prefetch_fake(
+        tensors: list[torch.Tensor],
+        num_ctas: int,
+        chunk_kib: int,
+        evict_last: bool,
+    ) -> None:
+        return None
+
+    _fakes_registered.add("l2_prefetch")
+
+
 def load() -> None:
     """Load the `_muse_C` library, building it on the first use of a cache dir.
 
@@ -425,6 +443,7 @@ def load() -> None:
         _register_fakes()
         _register_decode_fakes()
         _register_prefill_moe_fakes()
+        _register_l2_prefetch_fake()
     except Exception:
         logger.warning("Could not register _muse_C fake ops", exc_info=True)
 

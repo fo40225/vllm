@@ -34,6 +34,7 @@ local routes only (``_local_rows_usable``): an EP rank owns about one route in
 eight, and the stock sort and shuffle spend their time on the rest.
 """
 
+from collections.abc import Callable
 from typing import NamedTuple
 
 import torch
@@ -472,6 +473,10 @@ class MuseSparkSm120NvFp4Experts(mk.FusedMoEExpertsModular):
         self.up_gate_layout = False
         self.use_b12x_decode = False
         self.use_muse_decode = False
+        # Called with the token count right after the experts' GEMMs have been
+        # queued in a CUDA graph capture, in front of the post-GEMM2 hook with
+        # its all-reduce. The model uses it to start a side-stream prefetch.
+        self.after_gemm2_hook: Callable[[int], None] | None = None
         self.b12x: B12xDecodeMoE | None = None
         self.muse: MuseDecodeMoE | None = None
         # The exact (unfolded) scales of the muse kernel, captured from the raw
@@ -778,6 +783,8 @@ class MuseSparkSm120NvFp4Experts(mk.FusedMoEExpertsModular):
             unfinalized = self._apply_cutlass(
                 hidden_states, w1, w2, topk_weights, topk_ids, expert_map, workspace2
             )
+        if self.after_gemm2_hook is not None:
+            self.after_gemm2_hook(hidden_states.shape[0])
         self._run_post_gemm2_hook(unfinalized, output)
 
     def _apply_muse(

@@ -10,6 +10,7 @@
 
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace muse_spark {
 
@@ -143,5 +144,12 @@ void fused_muse_spark_qknorm_rope_kv_insert(
     std::optional<at::Tensor> const& v_scale,
     std::optional<at::Tensor> const& q_fp8_out,
     std::optional<at::Tensor> const& q_scale);
+
+// Asynchronous L2 prefetch of up to 4 contiguous 16 B aligned tensors
+// (muse_spark_l2_prefetch.cu): each CTA issues cp.async.bulk.prefetch.L2 for its
+// share of `chunk_kib` KiB chunks and exits. With evict_last the lines get the
+// L2 evict-last priority. Reads and writes no tensor data.
+void l2_prefetch(std::vector<at::Tensor> const& tensors, int64_t num_ctas,
+                 int64_t chunk_kib, bool evict_last);
 
 }  // namespace muse_spark
