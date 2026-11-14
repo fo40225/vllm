@@ -295,6 +295,173 @@ def test_sequence_parallel_row_gate_ranks_agree(monkeypatch) -> None:
     assert gate(1024) and len(reduced) == 1
 
 
+class _OProj:
+    """Stands in for the row-parallel o_proj: records the ``reduce_results`` it ran
+    with, returns the input plus one so that its output can be told from the input,
+    and fails on request."""
+
+    def __init__(self, reduce_results: bool, fail: bool = False) -> None:
+        self.reduce_results = reduce_results
+        self.fail = fail
+        self.seen: list[bool] = []
+        self.weight = object()
+
+    def __call__(self, x: torch.Tensor):
+        self.seen.append(self.reduce_results)
+        if self.fail:
+            raise RuntimeError("o_proj failed")
+        return x + 1, None
+
+
+def _attention(
+    monkeypatch,
+    *,
+    sp_launch: bool,
+    reduce_results: bool,
+    min_tokens: int = 512,
+    row_gate=None,
+    gemm_rs=None,
+    fail: bool = False,
+):
+    """The state ``_project_output`` reads, and the collectives it may call."""
+    calls: list[tuple[str, torch.Tensor]] = []
+    monkeypatch.setattr(
+        muse_model,
+        "tensor_model_parallel_all_reduce",
+        lambda x: calls.append(("all_reduce", x)) or x + 100,
+    )
+    monkeypatch.setattr(
+        muse_model,
+        "sp_reduce_scatter",
+        lambda x: calls.append(("reduce_scatter", x)) or x + 200,
+    )
+    attention = SimpleNamespace(
+        is_sequence_parallel_output=sp_launch,
+        sp_min_tokens=min_tokens,
+        sp_row_gate=row_gate,
+        gemm_rs=gemm_rs,
+        o_proj=_OProj(reduce_results, fail),
+    )
+    return attention, calls
+
+
+def _project_output(attention, num_tokens: int, defer_all_reduce: bool):
+    x = torch.zeros(num_tokens, 4)
+    out = muse_model.MuseSpark1xAttention._project_output(
+        attention, x, defer_all_reduce
+    )
+    return x, out
+
+
+@pytest.mark.parametrize("sp_launch", [False, True])
+def test_project_output_defers_the_all_reduce_to_the_boundary(
+    monkeypatch, sp_launch: bool
+) -> None:
+    # The decode path of the fused boundary: the output is this rank's partial sum.
+    # A launch with the sharded stream has already turned o_proj's reduction off,
+    # one without it has not; both get their setting back.
+    reduce_results = not sp_launch
+    attention, calls = _attention(
+        monkeypatch, sp_launch=sp_launch, reduce_results=reduce_results
+    )
+    x, out = _project_output(attention, 8, defer_all_reduce=True)
+    assert torch.equal(out, x + 1)
+    assert attention.o_proj.seen == [False]
+    assert attention.o_proj.reduce_results is reduce_results
+    assert calls == []
+    # The setting is restored when o_proj raises.
+    attention, _ = _attention(
+        monkeypatch, sp_launch=sp_launch, reduce_results=reduce_results, fail=True
+    )
+    with pytest.raises(RuntimeError, match="o_proj failed"):
+        _project_output(attention, 8, defer_all_reduce=True)
+    assert attention.o_proj.reduce_results is reduce_results
+
+
+def test_project_output_reduces_a_replicated_batch_of_the_sharded_launch(
+    monkeypatch,
+) -> None:
+    # Forced sequence parallelism turns o_proj's reduction off for every batch, so
+    # a batch below the minimum (decode, a short prefill) is all-reduced here.
+    attention, calls = _attention(monkeypatch, sp_launch=True, reduce_results=False)
+    x, out = _project_output(attention, 8, defer_all_reduce=False)
+    assert [name for name, _ in calls] == ["all_reduce"]
+    assert torch.equal(calls[0][1], x + 1)
+    assert torch.equal(out, x + 101)
+    assert attention.o_proj.seen == [False]
+    # The last size under the minimum, and a batch the row gate of the auto mode
+    # does not admit, take the same route.
+    for num_tokens, row_gate in ((511, None), (1024, lambda num_tokens: False)):
+        attention, calls = _attention(
+            monkeypatch, sp_launch=True, reduce_results=False, row_gate=row_gate
+        )
+        _project_output(attention, num_tokens, defer_all_reduce=False)
+        assert [name for name, _ in calls] == ["all_reduce"], num_tokens
+
+
+def test_project_output_leaves_the_reduction_to_o_proj_without_the_stream(
+    monkeypatch,
+) -> None:
+    attention, calls = _attention(monkeypatch, sp_launch=False, reduce_results=True)
+    for num_tokens in (8, 1024):
+        x, out = _project_output(attention, num_tokens, defer_all_reduce=False)
+        assert torch.equal(out, x + 1)
+    assert attention.o_proj.seen == [True, True]
+    assert calls == []
+
+
+@pytest.mark.parametrize("defer_all_reduce", [False, True])
+def test_project_output_reduce_scatters_a_sharded_batch(
+    monkeypatch, defer_all_reduce: bool
+) -> None:
+    # From the minimum up the output is reduce-scattered, a deferred all-reduce is
+    # ignored (the boundary of a sharded batch works on rows) and o_proj keeps its
+    # reduction off.
+    attention, calls = _attention(monkeypatch, sp_launch=True, reduce_results=False)
+    x, out = _project_output(attention, 512, defer_all_reduce)
+    assert [name for name, _ in calls] == ["reduce_scatter"]
+    assert torch.equal(calls[0][1], x + 1)
+    assert torch.equal(out, x + 201)
+    assert attention.o_proj.seen == [False]
+    assert attention.o_proj.reduce_results is False
+
+
+def test_project_output_hands_a_sharded_batch_to_the_fused_gemm(monkeypatch) -> None:
+    class GemmRs:
+        def __init__(self, supports: bool, runs: bool) -> None:
+            self.supports, self.runs = supports, runs
+            self.called = 0
+
+        def supports_projection(self, o_proj) -> bool:
+            return self.supports
+
+        def should_run(self, x: torch.Tensor) -> bool:
+            return self.runs
+
+        def __call__(self, x: torch.Tensor, weight) -> torch.Tensor:
+            self.called += 1
+            return x + 300
+
+    gemm_rs = GemmRs(supports=True, runs=True)
+    attention, calls = _attention(
+        monkeypatch, sp_launch=True, reduce_results=False, gemm_rs=gemm_rs
+    )
+    x, out = _project_output(attention, 1024, defer_all_reduce=False)
+    assert torch.equal(out, x + 300) and gemm_rs.called == 1
+    assert attention.o_proj.seen == [] and calls == []
+    # Not for a replicated batch, and not where the fused kernel declines.
+    _project_output(attention, 8, defer_all_reduce=False)
+    assert gemm_rs.called == 1
+    for supports, runs in ((False, True), (True, False)):
+        gemm_rs = GemmRs(supports, runs)
+        attention, calls = _attention(
+            monkeypatch, sp_launch=True, reduce_results=False, gemm_rs=gemm_rs
+        )
+        _project_output(attention, 1024, defer_all_reduce=False)
+        assert gemm_rs.called == 0
+        assert [name for name, _ in calls] == ["reduce_scatter"]
+
+
 @pytest.mark.parametrize(
     "overrides",
     [
