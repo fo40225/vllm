@@ -170,8 +170,8 @@ if TYPE_CHECKING:
     VLLM_MUSE_SPARK_SM120_TOPK_LOGITS_MIN_TOKENS: int = 2
     VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT: bool = True
     VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT_TABLE: str | None = None
-    VLLM_MUSE_SPARK_SM120_DENSE_Q: bool = False
-    VLLM_MUSE_SPARK_SM120_DECODE_GEMM: bool = False
+    VLLM_MUSE_SPARK_SM120_DENSE_Q: bool = True
+    VLLM_MUSE_SPARK_SM120_DECODE_GEMM: bool = True
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
     VLLM_ROCM_USE_AITER_LINEAR_HIPBMM: bool = False
     VLLM_ROCM_USE_AITER_MOE: bool = True
@@ -1731,12 +1731,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # bf16 Q with an fp8 KV cache) and copies the view first (aten direct_copy, 3.4 us
     # per layer at 64 rows, 62 layers: 0.21 ms of a c64 decode step; a single row is
     # dense already, hence no copy at batch 1). The values are the ones of the in-place
-    # store, bit for bit, so the output does not change. Needs the _muse_C fused op
-    # (the stock torch.ops._C op has no dense Q output; the layer keeps the in-place
-    # store there) and the FlashInfer attention backend. Default off. Read once, when
-    # the model is constructed.
+    # store, bit for bit, so the output does not change (two cold processes: 553 of 553
+    # requests identical to the in-place store, and 40 of 40 rows with a draft model).
+    # Real weights, TP8 + EP8, host plugin, 3 alternating cold sessions per arm, decode
+    # TPOT against the in-place store: c1 -0.6 %, c16 -1.4 %, c64 -0.6 %, c128 -0.4 %,
+    # real-prompt c64 -0.7 %. Needs the _muse_C fused op (the stock torch.ops._C op has
+    # no dense Q output; the layer keeps the in-place store there) and the FlashInfer
+    # attention backend. Default on (0 keeps the in-place store). Read once, when the
+    # model is constructed.
     "VLLM_MUSE_SPARK_SM120_DENSE_Q": lambda: bool(
-        int(os.getenv("VLLM_MUSE_SPARK_SM120_DENSE_Q", "0"))
+        int(os.getenv("VLLM_MUSE_SPARK_SM120_DENSE_Q", "1"))
     ),
     # Muse Spark on SM120: run the QKV projection and the sharded pooler / unpooler of up
     # to 64 rows (padded decode batches) as one kernel, ``_muse_C::decode_gemm``, instead
@@ -1750,10 +1754,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # split steps from 4 to 8 at 33 rows, so its bits depend on the padded batch size, as
     # cuBLAS's do). Only the three TP8 shapes of the model are served (a draft model or
     # another TP size stays on cuBLAS); above 64 rows, with a bias, with LoRA (for the QKV
-    # projection) or off SM120 the cuBLAS path stays.
-    # Default off. Read once, when the model is constructed.
+    # projection) or off SM120 the cuBLAS path stays. Real weights, TP8 + EP8, host plugin,
+    # 3 alternating cold sessions per arm, decode TPOT against cuBLAS: c1 -2.1 %, c16
+    # -3.6 %, c64 -0.3 %, c128 +0.1 % and real-prompt c64 +0.4 % (the last three within the
+    # run-to-run spread: the gain ends where the rows pass 64). Two cold processes give the
+    # same outputs bit for bit; against cuBLAS the chosen-token |dlogprob| is 8.7e-3 on
+    # average (438 of 535 requests keep every token), the prompt logprobs are bitwise.
+    # GSM8K 200x2: 385 of 400 = 96.25 % with this flag alone, 391 of 400 = 97.75 % with
+    # DENSE_Q too (production 96.5 %, reference 95.5 to 98.0 %).
+    # Default on (0 keeps cuBLAS). Read once, when the model is constructed.
     "VLLM_MUSE_SPARK_SM120_DECODE_GEMM": lambda: bool(
-        int(os.getenv("VLLM_MUSE_SPARK_SM120_DECODE_GEMM", "0"))
+        int(os.getenv("VLLM_MUSE_SPARK_SM120_DECODE_GEMM", "1"))
     ),
     # use aiter linear op if aiter ops are enabled
     # The following list of related ops

@@ -18,6 +18,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from vllm import envs
 from vllm.models.muse_spark.nvidia.ops import decode_gemm as dg
 from vllm.models.muse_spark.nvidia.ops import muse_c
 from vllm.platforms import current_platform
@@ -362,6 +363,16 @@ def test_every_device_gets_the_dynamic_shared_memory_attribute(configs):
             torch.cuda.synchronize(device)
             ref = x.double() @ w.double().t()
             assert bool(((out.double() - ref).abs() <= 0.05 * ref.abs().max()).all())
+
+
+def test_decode_gemm_flag_is_on_by_default(monkeypatch):
+    knob = "VLLM_MUSE_SPARK_SM120_DECODE_GEMM"
+    monkeypatch.delenv(knob, raising=False)
+    assert envs.VLLM_MUSE_SPARK_SM120_DECODE_GEMM is True
+    monkeypatch.setenv(knob, "0")
+    assert envs.VLLM_MUSE_SPARK_SM120_DECODE_GEMM is False
+    monkeypatch.setenv(knob, "1")
+    assert envs.VLLM_MUSE_SPARK_SM120_DECODE_GEMM is True
 
 
 def test_decode_gemm_matches_the_op_and_wraps_the_projection():

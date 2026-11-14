@@ -13,6 +13,7 @@ import pytest
 import torch
 
 import vllm._custom_ops as ops
+from vllm import envs
 from vllm.models.muse_spark.common.ops import has_compiled_op, resolve_compiled_op
 from vllm.platforms import current_platform
 
@@ -807,6 +808,16 @@ def test_wrapper_returns_the_dense_q_of_the_in_place_run(
     assert torch.equal(x_dense[:, :qsz], qkv[:, :qsz])
     assert torch.equal(x_dense[:, qsz:], x_ref[:, qsz:])
     assert torch.equal(cache_dense, cache_ref)
+
+
+def test_dense_q_flag_is_on_by_default(monkeypatch):
+    knob = "VLLM_MUSE_SPARK_SM120_DENSE_Q"
+    monkeypatch.delenv(knob, raising=False)
+    assert envs.VLLM_MUSE_SPARK_SM120_DENSE_Q is True
+    monkeypatch.setenv(knob, "0")
+    assert envs.VLLM_MUSE_SPARK_SM120_DENSE_Q is False
+    monkeypatch.setenv(knob, "1")
+    assert envs.VLLM_MUSE_SPARK_SM120_DENSE_Q is True
 
 
 def test_supports_dense_q_needs_flashinfer_and_the_muse_op(monkeypatch, namespace):
