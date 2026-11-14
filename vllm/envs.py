@@ -153,6 +153,7 @@ if TYPE_CHECKING:
     VLLM_MUSE_SPARK_SM120_PREFILL_LATENT_FP4: bool = True
     VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL: bool | None = True
     VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_MIN_TOKENS: int = 512
+    VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_GRAPH_MIN_TOKENS: int = 0
     VLLM_MUSE_SPARK_SM120_L2_PREFETCH: bool = True
     VLLM_MUSE_SPARK_SM120_L2_PREFETCH_AFTER_EXPERTS_CTAS: int = 4
     VLLM_MUSE_SPARK_SM120_L2_PREFETCH_ORDER: int = 4
@@ -1492,6 +1493,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tokens +19%, at 512 tokens -9%).
     "VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_MIN_TOKENS": lambda: int(
         os.getenv("VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_MIN_TOKENS", "512")
+    ),
+    # Muse Spark on SM120: smallest batch (in tokens) that takes the sharded stream
+    # inside a captured FULL decode CUDA graph (uniform or varlen decode batches
+    # only), whatever the capture list and the floor above: 0 (the default) keeps
+    # every graph batch replicated. Raised to one above the largest batch of the
+    # decode MoE engines (129 with the muse engine: the engine cannot take the
+    # sharded path's packed rows). Eager batches, mixed batches and the PIECEWISE
+    # graphs keep the floor above. On the K = 7 speculative launch (8 tokens per
+    # request) 136 shards the verify batches of 17..32 requests in the graphs the
+    # launch captures anyway; a capture list that reaches 384 or more
+    # (--max-cudagraph-capture-size) adds the 33..48 requests. Rounding-level
+    # (reduce-scatter + all-gather instead of an all-reduce, row-sharded GEMMs), as
+    # the stream above 384 tokens. Read once, when the model is constructed.
+    "VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_GRAPH_MIN_TOKENS": lambda: int(
+        os.getenv("VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_GRAPH_MIN_TOKENS", "0")
     ),
     # Muse Spark on SM120: inside the decode CUDA graphs, prefetch the weights of
     # the next GEMMs (QKV and O of the next layer, the pooler, router and unpooler)

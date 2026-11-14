@@ -7,6 +7,7 @@ import math
 import os
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from itertools import islice
 from typing import Any, cast
@@ -62,6 +63,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
+from vllm.forward_context import in_full_decode_graph
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory, GateLinear
@@ -124,6 +126,7 @@ from vllm.models.muse_spark.nvidia.muse_moe_runner import (
 )
 from vllm.models.muse_spark.nvidia.ops import decode_gemm as decode_gemm_ops
 from vllm.models.muse_spark.nvidia.ops import fused_boundary, muse_c
+from vllm.models.muse_spark.nvidia.ops.b12x_decode_moe import B12X_MAX_TOKENS
 from vllm.models.muse_spark.nvidia.ops.cute_dsl.qk_norm import (
     qk_norm,
     supports_qk_norm,
@@ -149,6 +152,7 @@ from vllm.models.muse_spark.nvidia.ops.muse_decode_moe import (
     EXPERT_PREFETCH_MAX_TOKENS,
     MUSE_MAX_TOKENS,
     MUSE_SMALL_MAX_TOKENS,
+    muse_max_tokens,
 )
 from vllm.models.muse_spark.nvidia.ops.prepare_megamoe_nvfp4 import (
     prepare_megamoe_nvfp4_with_norm,
@@ -725,16 +729,47 @@ def sm120_sequence_parallel_is_gated() -> bool:
     return envs.VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL is None
 
 
+# The floor that replaces every module's own one (the eager floor) for the forward that
+# is running, set by MuseSpark1xModel.forward for the warm-up and the capture pass of a
+# FULL decode CUDA graph when the graph floor is on (see
+# sm120_sequence_parallel_graph_min_tokens); None: each module's own floor applies.
+_SP_FLOOR_OVERRIDE: ContextVar[int | None] = ContextVar(
+    "muse_spark_sp_floor_override", default=None
+)
+
+
 def _sequence_parallel_active(
     enabled: bool,
     num_tokens: int,
     min_tokens: int | None,
     row_gate: Callable[[int], bool] | None,
 ) -> bool:
-    """``is_sequence_parallel_active`` plus the SM120 batch-size gate, if any."""
+    """``is_sequence_parallel_active`` plus the SM120 batch-size gate, if any.
+
+    The one place that decides, for the model, every layer and every attention, so
+    that they cannot disagree on a batch: ``_SP_FLOOR_OVERRIDE`` is read here and
+    nowhere else.
+    """
+    if min_tokens is not None:
+        override = _SP_FLOOR_OVERRIDE.get()
+        if override is not None:
+            min_tokens = override
     return is_sequence_parallel_active(enabled, num_tokens, min_tokens) and (
         row_gate is None or row_gate(num_tokens)
     )
+
+
+@contextmanager
+def _sequence_parallel_graph_floor(graph_min_tokens: int | None) -> Iterator[None]:
+    """Run a forward with the graph floor where it is a FULL decode graph's pass."""
+    if graph_min_tokens is None or not in_full_decode_graph():
+        yield
+        return
+    token = _SP_FLOOR_OVERRIDE.set(graph_min_tokens)
+    try:
+        yield
+    finally:
+        _SP_FLOOR_OVERRIDE.reset(token)
 
 
 def sm120_sequence_parallel_min_tokens(vllm_config: VllmConfig) -> int:
@@ -752,6 +787,41 @@ def sm120_sequence_parallel_min_tokens(vllm_config: VllmConfig) -> int:
         _SHARDED_PROJECTION_MAX_TOKENS + 1,
         max_graph_tokens + 1,
     )
+
+
+def sm120_sequence_parallel_graph_min_tokens(vllm_config: VllmConfig) -> int | None:
+    """Smallest batch (in tokens) that shards the stream in a FULL decode CUDA graph.
+
+    ``None`` (``VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_GRAPH_MIN_TOKENS=0``, the
+    default): graph batches keep the floor of ``sm120_sequence_parallel_min_tokens``.
+    Otherwise the value, raised above the decode MoE engines' largest batch (they only
+    run in a capture and cannot take the sharded path's packed rows), whatever the
+    capture list says. Only the warm-up and the capture pass of a decode-only FULL
+    graph use it (``ForwardContext.full_decode_graph``); eager, mixed and PIECEWISE
+    batches keep the floor above, so a prefill chunk next to the decoders is never
+    captured sharded.
+    """
+    requested = envs.VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_GRAPH_MIN_TOKENS
+    if requested <= 0:
+        return None
+    if not vllm_config.compilation_config.max_cudagraph_capture_size:
+        logger.warning_once(
+            "VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_GRAPH_MIN_TOKENS=%d is set but "
+            "ignored: no CUDA graphs are captured.",
+            requested,
+        )
+        return None
+    engine_max = max(muse_max_tokens(), B12X_MAX_TOKENS)
+    if requested <= engine_max:
+        logger.warning_once(
+            "VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_GRAPH_MIN_TOKENS=%d is raised to "
+            "%d: the decode MoE engine serves up to %d tokens of a graph and does not "
+            "run on the sharded stream.",
+            requested,
+            engine_max + 1,
+            engine_max,
+        )
+    return max(requested, engine_max + 1)
 
 
 @contextmanager
@@ -2846,6 +2916,9 @@ class MuseSpark1xModel(LlamaModel):
     # The drafter's aux projection, when it runs inside the forward (see
     # ``set_aux_combiner``); None: the forward returns the taps.
     _aux_combiner: AuxCombiner | None = None
+    # Smallest batch that shards the stream inside a FULL decode CUDA graph, None:
+    # the floor of ``sp_min_tokens`` applies there too.
+    sp_graph_min_tokens: int | None = None
 
     def __init__(
         self,
@@ -2894,6 +2967,9 @@ class MuseSpark1xModel(LlamaModel):
         self.sp_min_tokens = (
             sm120_sequence_parallel_min_tokens(vllm_config) if sm120_sp else None
         )
+        self.sp_graph_min_tokens = (
+            sm120_sequence_parallel_graph_min_tokens(vllm_config) if sm120_sp else None
+        )
         self.sp_row_gate: Callable[[int], bool] | None = None
         if self.sp_min_tokens is not None:
             logger.info_once(
@@ -2909,6 +2985,16 @@ class MuseSpark1xModel(LlamaModel):
                 if sm120_sequence_parallel_is_gated()
                 else "",
             )
+            if self.sp_graph_min_tokens is not None:
+                logger.info_once(
+                    "MuseSpark SM120: sequence parallel inside FULL decode CUDA graphs "
+                    "for batches of at least %d tokens "
+                    "(VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_GRAPH_MIN_TOKENS=%d; "
+                    "eager, mixed and PIECEWISE batches keep the floor of %d tokens).",
+                    self.sp_graph_min_tokens,
+                    envs.VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_GRAPH_MIN_TOKENS,
+                    self.sp_min_tokens,
+                )
         self.make_empty_intermediate_tensors = self._make_empty_intermediate_tensors
         self.is_sequence_parallel_input = self.is_sequence_parallel
         self._configure_replicated_prefix()
@@ -3371,6 +3457,22 @@ class MuseSpark1xModel(LlamaModel):
         return state if dtype is None else state.to(dtype)
 
     def forward(  # type: ignore[override]
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+        if self.sp_graph_min_tokens is None:
+            return self._forward(
+                input_ids, positions, intermediate_tensors, inputs_embeds
+            )
+        with _sequence_parallel_graph_floor(self.sp_graph_min_tokens):
+            return self._forward(
+                input_ids, positions, intermediate_tensors, inputs_embeds
+            )
+
+    def _forward(
         self,
         input_ids: torch.Tensor | None,
         positions: torch.Tensor,

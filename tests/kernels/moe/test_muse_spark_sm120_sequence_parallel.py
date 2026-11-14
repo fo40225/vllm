@@ -22,7 +22,12 @@ from tests.kernels.moe.muse_spark_utils import (
     run_moe,
 )
 from vllm.config import set_current_vllm_config
-from vllm.forward_context import set_forward_context
+from vllm.config.compilation import CUDAGraphMode
+from vllm.forward_context import (
+    ForwardContext,
+    override_forward_context,
+    set_forward_context,
+)
 from vllm.model_executor.layers.fused_moe import GateLinear
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.models.common.ops.sequence_parallel import is_sequence_parallel_active
@@ -37,6 +42,8 @@ from vllm.platforms import current_platform
 FLAG = "VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL"
 LATENT_FP4 = "VLLM_MUSE_SPARK_SM120_PREFILL_LATENT_FP4"
 MIN_TOKENS = "VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_MIN_TOKENS"
+GRAPH_MIN_TOKENS = "VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_GRAPH_MIN_TOKENS"
+DECODE_MAX_TOKENS = "VLLM_MUSE_SPARK_SM120_DECODE_MAX_TOKENS"
 
 
 def _vllm_config(**overrides) -> SimpleNamespace:
@@ -1404,3 +1411,217 @@ def test_sm120_packed_latent_decision_is_agreed_over_the_cpu_group(world: int) -
     one rank keeps all of them on bf16."""
     port = 30700 + os.getpid() % 1000 + world
     mp.spawn(_latent_agreement_worker, args=(world, port), nprocs=world)
+
+
+# ------------------------------------------------------------------------------
+# The stream inside the FULL decode CUDA graphs (S1-9 L11)
+# ------------------------------------------------------------------------------
+def _decode_context(full_decode_graph: bool, mode=CUDAGraphMode.NONE) -> ForwardContext:
+    return ForwardContext(
+        no_compile_layers={},
+        attn_metadata={},
+        slot_mapping={},
+        cudagraph_runtime_mode=mode,
+        full_decode_graph=full_decode_graph,
+    )
+
+
+@pytest.mark.parametrize(
+    "env_value, max_graph_tokens, decode_max, expected",
+    [
+        # Off by default, and for any value that is not a floor.
+        (None, 256, None, None),
+        ("0", 256, None, None),
+        ("-1", 256, None, None),
+        # The floor ignores the capture list and the eager floor (256 -> 257 -> 384).
+        ("136", 256, None, 136),
+        ("136", 384, None, 136),
+        ("136", 512, None, 136),
+        ("264", 256, None, 264),
+        ("4096", 256, None, 4096),
+        # The muse decode engine serves 1..128 tokens of a graph and cannot take the
+        # sharded path: the floor starts above its largest batch.
+        ("1", 256, None, 129),
+        ("72", 256, None, 129),
+        ("128", 256, None, 129),
+        ("129", 256, None, 129),
+        ("1", 256, "64", 65),
+        ("1", 256, "1", 9),
+        # No graphs, no floor.
+        ("136", 0, None, None),
+        ("136", None, None, None),
+    ],
+)
+def test_sm120_sequence_parallel_graph_floor(
+    monkeypatch, env_value, max_graph_tokens, decode_max, expected
+) -> None:
+    if env_value is None:
+        monkeypatch.delenv(GRAPH_MIN_TOKENS, raising=False)
+    else:
+        monkeypatch.setenv(GRAPH_MIN_TOKENS, env_value)
+    if decode_max is None:
+        monkeypatch.delenv(DECODE_MAX_TOKENS, raising=False)
+    else:
+        monkeypatch.setenv(DECODE_MAX_TOKENS, decode_max)
+    config = _vllm_config(max_graph_tokens=max_graph_tokens)
+    assert muse_model.sm120_sequence_parallel_graph_min_tokens(config) == expected
+    # The eager floor is the one of every other batch and does not move.
+    monkeypatch.setenv(MIN_TOKENS, "384")
+    assert muse_model.sm120_sequence_parallel_min_tokens(
+        _vllm_config(max_graph_tokens=256)
+    ) == 384
+
+
+def test_sm120_sequence_parallel_graph_floor_is_off_by_default(monkeypatch) -> None:
+    monkeypatch.delenv(GRAPH_MIN_TOKENS, raising=False)
+    assert envs.VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_GRAPH_MIN_TOKENS == 0
+    assert muse_model.MuseSpark1xModel.sp_graph_min_tokens is None
+
+
+def test_graph_floor_applies_to_the_pass_of_a_full_decode_graph_only() -> None:
+    """The floor of the graph replaces every module's floor in the warm-up and the
+    capture pass of a FULL decode graph (the flag of the forward context), and
+    nowhere else: not in an eager forward, not in a PIECEWISE one, not outside any
+    forward context, and not after the pass (also when it raised)."""
+    active = muse_model._sequence_parallel_active
+    scope = muse_model._sequence_parallel_graph_floor
+    # No context at all (the unit tests of the layers, a profile run).
+    with scope(136):
+        assert not active(True, 272, 384, None)
+    assert muse_model._SP_FLOOR_OVERRIDE.get() is None
+    for context, sharded in (
+        (_decode_context(False), False),
+        (_decode_context(False, CUDAGraphMode.PIECEWISE), False),
+        (_decode_context(False, CUDAGraphMode.FULL), False),
+        (_decode_context(True), True),
+    ):
+        with override_forward_context(context):
+            assert not active(True, 272, 384, None)
+            with scope(136):
+                assert active(True, 272, 384, None) == sharded
+                assert active(True, 136, 384, None) == sharded
+                # Below the graph floor the batch stays replicated, like the muse
+                # decode kernel's 128 tokens.
+                assert not active(True, 128, 384, None)
+                assert not active(True, 8, 384, None)
+                # A stream that is off (the draft layers, no SP launch) stays off.
+                assert not active(False, 272, 384, None)
+            assert muse_model._SP_FLOOR_OVERRIDE.get() is None
+            assert not active(True, 272, 384, None)
+    # The floor is off: a flagged pass keeps every module's floor.
+    with override_forward_context(_decode_context(True)):
+        with scope(None):
+            assert not active(True, 272, 384, None)
+            assert active(True, 384, 384, None)
+    # An exception leaves the floor reset.
+    with override_forward_context(_decode_context(True)):
+        with pytest.raises(RuntimeError):
+            with scope(136):
+                assert active(True, 136, 384, None)
+                raise RuntimeError("capture failed")
+        assert not active(True, 136, 384, None)
+    assert muse_model._SP_FLOOR_OVERRIDE.get() is None
+
+
+def test_graph_floor_reaches_the_row_gate_like_the_eager_floor() -> None:
+    """The row gate of the auto mode still decides every sharded batch."""
+    seen: list[int] = []
+
+    def gate(num_tokens: int) -> bool:
+        seen.append(num_tokens)
+        return num_tokens % 16 == 0
+
+    with override_forward_context(_decode_context(True)):
+        with muse_model._sequence_parallel_graph_floor(136):
+            assert muse_model._sequence_parallel_active(True, 272, 384, gate)
+            assert not muse_model._sequence_parallel_active(True, 264, 384, gate)
+            assert not muse_model._sequence_parallel_active(True, 128, 384, gate)
+    assert seen == [272, 264]
+
+
+class _RecordingLayer:
+    """A layer of the sequence-parallel stream that records the rows it is handed."""
+
+    is_sequence_parallel = True
+
+    def __init__(self, rows: list[int]) -> None:
+        self.rows = rows
+
+    def __call__(self, positions, x):
+        self.rows.append(x.shape[0])
+        return x + 1.0 / 3.0
+
+
+def _stream_model(graph_min_tokens, rows: list[int]):
+    """The real forward of the model over layers that record their rows."""
+    model = object.__new__(muse_model.MuseSpark1xModel)
+    model.start_layer, model.end_layer = 0, 2
+    model.layers = [_RecordingLayer(rows) for _ in range(2)]
+    model.residual_dtype = torch.float32
+    model.default_dtype = torch.bfloat16
+    model.aux_hidden_state_dtype = torch.bfloat16
+    model.aux_hidden_state_layers = ()
+    model._aux_upstream_total_cached = 0
+    model.is_sequence_parallel = True
+    model.is_sequence_parallel_input = True
+    model.sp_min_tokens = 384
+    model.sp_graph_min_tokens = graph_min_tokens
+    model.sp_row_gate = None
+    model.fuse_across_layers = True
+    model._l2_prefetcher = None
+    model._expert_prefetch = None
+    model.norm = lambda x, out_dtype=None: x.to(out_dtype or x.dtype)
+    return model
+
+
+@pytest.mark.parametrize("graph_min_tokens", [None, 136])
+def test_forward_takes_the_graph_floor_in_a_full_decode_graph_only(
+    monkeypatch, graph_min_tokens
+) -> None:
+    """The real forward of the model, with CPU stand-ins for the shard and the gather
+    of a world of 8: the layers get the rows of the graph floor in a flagged pass and
+    the rows of the eager floor in every other forward, whatever the launch's floor."""
+    monkeypatch.setattr(
+        muse_model,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True, world_size=1),
+    )
+    world = 8
+    monkeypatch.setattr(muse_model, "sp_shard", lambda x: x[: -(-x.shape[0] // world)])
+    monkeypatch.setattr(
+        muse_model,
+        "sp_all_gather",
+        lambda x: x.repeat(world, *([1] * (x.dim() - 1))),
+    )
+    cases = (
+        # (context, tokens, shards without the graph floor, shards with it)
+        (_decode_context(True), 136, False, True),
+        (_decode_context(True), 264, False, True),
+        (_decode_context(True), 272, False, True),
+        (_decode_context(True), 128, False, False),
+        (_decode_context(True), 384, True, True),
+        (_decode_context(True), 512, True, True),
+        (_decode_context(False), 272, False, False),
+        (_decode_context(False), 384, True, True),
+        (_decode_context(False, CUDAGraphMode.PIECEWISE), 272, False, False),
+    )
+    for context, tokens, eager_sharded, graph_sharded in cases:
+        rows: list[int] = []
+        model = _stream_model(graph_min_tokens, rows)
+        x = torch.randn(tokens, 64).to(torch.bfloat16)
+        positions = torch.arange(tokens)
+        with override_forward_context(context), torch.inference_mode():
+            output = model.forward(None, positions, None, inputs_embeds=x)
+        sharded = (
+            graph_sharded
+            if graph_min_tokens is not None and context.full_decode_graph
+            else eager_sharded
+        )
+        want = -(-tokens // world) if sharded else tokens
+        assert rows == [want, want], (context.full_decode_graph, tokens, rows)
+        # Whatever the stream, the output has every row once (the stand-in gather only
+        # repeats this rank's rows, so the values are checked on the replicated one).
+        assert output.shape == (tokens, 64)
+        if not sharded:
+            assert torch.equal(output, (x.float() + 2.0 / 3.0).to(torch.bfloat16))
+        assert muse_model._SP_FLOOR_OVERRIDE.get() is None
