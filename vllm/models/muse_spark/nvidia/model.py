@@ -1357,6 +1357,10 @@ class MuseSpark1xMoE(nn.Module):
         )
         if out is not None:
             runner.mark_quantized_decode_input(out)
+            logger.info_once(
+                "MuseSpark MoE: the TP communicator's pooler gather + pre-expert norm "
+                "also quantizes its output for the muse large-batch kernel."
+            )
         return out
 
     def _fused_gemv_all_gather_rmsnorm(

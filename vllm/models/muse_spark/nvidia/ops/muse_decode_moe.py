@@ -489,9 +489,18 @@ class MuseDecodeMoE:
         plan_key, self._plan_key = self._plan_key, None
         xq_key, self._xq_key = self._xq_key, None
         if num_tokens > MUSE_SMALL_MAX_TOKENS:
+            capturing = torch.cuda.is_current_stream_capturing()
             if xq_key is not None:
                 if xq_key == (hidden_states.data_ptr(), tuple(hidden_states.shape)):
                     flags |= _FLAG_LARGE_EXTERNAL_XQ
+                    if capturing:
+                        logger.info_once(
+                            "MuseSpark MoE: the large-batch muse kernel takes its "
+                            "quantized input from the producer of the pre-expert norm "
+                            "output (the norm + quantization launch, or the TP "
+                            "communicator's gather + norm epilogue; "
+                            "VLLM_MUSE_SPARK_SM120_FUSED_NORM_QUANT=1)."
+                        )
                 else:
                     logger.warning_once(
                         "MuseSpark MoE: the activations quantized ahead of the "
@@ -501,11 +510,12 @@ class MuseDecodeMoE:
             if plan_key is not None:
                 if plan_key == self._plan_key_of(topk_ids, expert_map):
                     flags |= _FLAG_LARGE_EXTERNAL_PLAN
-                    logger.info_once(
-                        "MuseSpark MoE: the plan of the large-batch muse kernel is "
-                        "built on the aux stream behind the top-k "
-                        "(VLLM_MUSE_SPARK_SM120_AUX_PLAN=1)."
-                    )
+                    if capturing:
+                        logger.info_once(
+                            "MuseSpark MoE: the plan of the large-batch muse kernel "
+                            "is built on the aux stream behind the top-k "
+                            "(VLLM_MUSE_SPARK_SM120_AUX_PLAN=1)."
+                        )
                 else:
                     logger.warning_once(
                         "MuseSpark MoE: the plan built on the aux stream was for other "
