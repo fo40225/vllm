@@ -12,8 +12,10 @@ and the resampled token of the full path:
 * a batch with sampled rows (temperature > 0, top_k <= K) with the same draws (the
   uniform of the acceptance test and the Gumbel noise are keyed by seed, position and
   token id in both), up to fp32 rounding of the sums over the vocabulary, which differ
-  in order; plus a chi-square test of the first token against the analytic block
-  verification distribution.
+  in order (the pinned inputs below show no differing request at all); plus chi-square
+  tests against the analytic law of the block method: the first token of a one-step
+  verification, and the exact law of the whole outcome of a three-step verification at
+  temperature 0.7 with draft mass outside the target's top-k support.
 """
 
 import numpy as np
@@ -377,8 +379,10 @@ def test_sampled_matches_full_path(temperature: float, top_k: int, num_steps: in
         seed=top_k + num_steps,
     )
     expected, got, bad = compare(batch)
-    # The draws agree except where the fp32 sums of the two paths differ in rounding.
-    assert len(bad) <= max(1, n // 100), [(expected[r], got[r]) for r in bad]
+    # The draws are those of the full path: a request would differ only where its
+    # uniform or Gumbel scores sit within fp32 rounding of a threshold (about 1e-7 per
+    # draw; the inputs are pinned and none does).
+    assert not bad, [(expected[r], got[r]) for r in bad]
 
 
 @pytest.mark.parametrize("use_fp64", [False, True])
@@ -408,7 +412,7 @@ def test_mixed_batch_matches_full_path(use_fp64: bool):
     expected, got, bad = compare(batch, use_fp64=use_fp64)
     greedy_rows = [r for r in range(n) if temperature[r] == 0.0]
     assert not set(bad) & set(greedy_rows), "a greedy request differs"
-    assert len(bad) <= max(1, n // 100), [(expected[r], got[r]) for r in bad]
+    assert not bad, [(expected[r], got[r]) for r in bad]
 
 
 def test_sampled_ties_at_the_top_k_boundary_match_full_path():
@@ -454,7 +458,7 @@ def test_sampled_ties_at_the_top_k_boundary_match_full_path():
         outside=0.0,
     )
     expected, got, bad = compare(batch)
-    assert len(bad) <= max(1, n // 50), [(expected[r], got[r]) for r in bad]
+    assert not bad, [(expected[r], got[r]) for r in bad]
 
 
 @pytest.mark.parametrize("tp,k", [(8, 64), (4, 32), (2, 64), (8, 128)])
@@ -490,7 +494,7 @@ def test_sampled_other_shapes(tp: int, k: int):
         )
     )
     bad = [r for r in range(n) if exp[r] != got[r]]
-    assert len(bad) <= max(1, n // 50), bad
+    assert not bad, [(exp[r], got[r]) for r in bad]
 
 
 def test_is_deterministic():
@@ -636,7 +640,9 @@ def test_outputs_have_the_distribution_of_the_full_path():
     cf, cg = Counter(map(tuple, full)), Counter(map(tuple, got))
     assert len(cf) > 10, "the outcomes did not spread"
     mismatches = sum(1 for a, b in zip(full, got) if a != b)
-    assert mismatches <= 5, mismatches
+    # Same draws: the paths differ only where a threshold sits within fp32 rounding of
+    # the other path's sum (about 1e-7 per draw; 0 of 20000 on the pinned inputs).
+    assert mismatches <= 2, mismatches
     # Two-sample chi-square over the outcomes seen at least 5 times in either.
     keys = [k for k in set(cf) | set(cg) if cf[k] + cg[k] >= 10]
     chi2 = sum((cf[k] - cg[k]) ** 2 / (cf[k] + cg[k]) for k in keys)
@@ -651,3 +657,182 @@ def test_outputs_have_the_distribution_of_the_full_path():
     assert float(counts.sum()) > 0.5 * n
     chi2 = float(((counts - countsf) ** 2 / (counts + countsf).clamp(min=1)).sum())
     assert chi2 < 20.0, (chi2, counts.tolist(), countsf.tolist())
+
+
+# --------------------------------------------------------------------------------
+# The exact law of a multi-step verification (temperature 0.7, draft mass outside the
+# target's top-k support).
+# --------------------------------------------------------------------------------
+
+EXACT_VOCAB = 1024
+EXACT_K = 8
+EXACT_STEPS = 3
+EXACT_TEMPERATURE = 0.7
+EXACT_TOP_K = 3
+# Six tokens carry all the mass (in six different shards); every other logit is -20.
+EXACT_IDS = [3, 130, 301, 520, 777, 1000]
+
+
+def exact_case(seed: int = 12):
+    """Target probabilities P [steps + 1, 6] (top-3 of each row, temperature 0.7) and
+    draft probabilities Q [steps, 6] (temperature 0.7) over the six tokens, with the
+    logits that make them. Q has mass on tokens the target's top-k mask removes."""
+    r = np.random.default_rng(seed)
+    z = np.round(r.normal(0, 4.0, (EXACT_STEPS + 1, 6)) * 4) / 4  # exact in bf16
+    capped = SOFT_CAP * np.tanh(z * MULTIPLIER / SOFT_CAP) / EXACT_TEMPERATURE
+    P = np.zeros_like(capped)
+    for i in range(EXACT_STEPS + 1):
+        top = np.argsort(-capped[i], kind="stable")[:EXACT_TOP_K]
+        e = np.exp(capped[i][top] - capped[i][top].max())
+        P[i][top] = e / e.sum()
+    score = r.normal(0, 1.0, (EXACT_STEPS, 6)).astype(np.float32)
+    Q = np.exp(score.astype(np.float64) / EXACT_TEMPERATURE)
+    return z, P, score, Q / Q.sum(axis=1, keepdims=True)
+
+
+def block_verification_law(P: np.ndarray, Q: np.ndarray, mutant: str | None = None):
+    """The exact law of the output of the block method (accepted prefix, then the
+    resampled or bonus token) for drafts x_i ~ Q_i and target rows P_i, by
+    enumeration. ``mutant`` breaks one piece of it (to show the test would notice)."""
+    import itertools
+    import math
+
+    g, v = Q.shape
+    law: dict[tuple, float] = {}
+    for x in itertools.product(range(v), repeat=g):
+        w = float(np.prod([Q[i][x[i]] for i in range(g)]))
+        if w == 0.0:
+            continue
+        log_p, ps, hs = 0.0, [], []
+        for i in range(g):
+            lp = math.log(P[i][x[i]]) if P[i][x[i]] > 0 else -math.inf
+            log_p = min(log_p + lp - math.log(Q[i][x[i]]), 0.0)
+            ps.append(math.exp(log_p))
+        for i in range(g):
+            if i < g - 1:
+                residual = float(np.maximum(ps[i] * P[i + 1] - Q[i + 1], 0.0).sum())
+                denom = residual + 1.0 - ps[i]
+                h = residual / denom if denom > 0 else 1.0
+            else:
+                h = ps[i]
+            hs.append(1.0 if mutant == "h_one" else h)
+        for tau in range(g + 1):
+            if tau == 0:
+                p_tau = float(np.prod([1 - h for h in hs]))
+            else:
+                p_tau = hs[tau - 1] * float(np.prod([1 - h for h in hs[tau:]]))
+            if p_tau == 0.0:
+                continue
+            if tau == g:
+                resid = P[g].copy()
+            elif mutant == "resample_target":
+                resid = P[tau].copy()
+            else:
+                scale = 1.0 if tau == 0 or mutant == "no_p_tau" else ps[tau - 1]
+                resid = np.maximum(scale * P[tau] - Q[tau], 0.0)
+            if resid.sum() <= 0.0:
+                continue
+            resid = resid / resid.sum()
+            for y in range(v):
+                if resid[y] > 0:
+                    out = tuple(x[:tau]) + (y,)
+                    law[out] = law.get(out, 0.0) + w * p_tau * float(resid[y])
+    return law
+
+
+def chi_square(counts: dict, law: dict, n: int):
+    """Pearson statistic over the outcomes expected at least 5 times (the rest pooled
+    in one cell) and its degrees of freedom."""
+    stat, cells, rest_obs, rest_exp = 0.0, 0, 0.0, 0.0
+    for outcome in set(counts) | set(law):
+        expected = n * law.get(outcome, 0.0)
+        observed = counts.get(outcome, 0)
+        if expected >= 5.0:
+            stat += (observed - expected) ** 2 / expected
+            cells += 1
+        else:
+            rest_obs += observed
+            rest_exp += expected
+    if rest_exp > 0:
+        stat += (rest_obs - rest_exp) ** 2 / rest_exp
+        cells += 1
+    return stat, cells - 1
+
+
+def test_the_outcome_has_the_exact_law_of_the_block_method_over_three_steps():
+    """Verifications of three drafts drawn from Q (a quarter to two thirds of the mass
+    of Q sits on tokens outside the target's top-3), at temperature 0.7: the joint law
+    of (accepted prefix, resampled token) against the enumerated law of the block
+    method. It sees what the one-step test cannot: the cumulative probability ratio
+    p_tau of the residual, the residual mass of the next step in the acceptance
+    probability, the temperature on the draft side, and draft tokens outside the
+    support. The test checks its own power: the laws of three broken variants are far
+    from the correct one at this n."""
+    n = 40000
+    z, P, score, Q = exact_case()
+    law = block_verification_law(P, Q)
+    assert abs(sum(law.values()) - 1.0) < 1e-9
+    outside = [float(Q[i][P[i] == 0].sum()) for i in range(EXACT_STEPS)]
+    assert max(outside) > 0.5 and min(outside) > 0.1, outside
+
+    # Row logits: the six tokens carry z, all the others -20.
+    logits = torch.full((EXACT_STEPS + 1, EXACT_VOCAB), -20.0, device=DEVICE)
+    logits[:, EXACT_IDS] = torch.tensor(z, dtype=torch.float32, device=DEVICE)
+    logits = logits.to(torch.bfloat16)
+    base = gather_candidates(logits, tp=TP, k=EXACT_K)
+    rows_per = EXACT_STEPS + 1
+    width = base.words.shape[-1]
+    words = (
+        base.words.view(TP, rows_per, width).repeat(1, n, 1).reshape(-1, width)
+    ).contiguous()
+    topk = TopKLogits(
+        words=words,
+        capped=soft_cap(words),
+        num_rows=rows_per * n,
+        k=EXACT_K,
+        tp_size=TP,
+        shard_size=EXACT_VOCAB // TP,
+    )
+    rng = np.random.default_rng(2024)
+    ids = np.asarray(EXACT_IDS)
+    draws = np.stack(
+        [rng.choice(6, size=n, p=Q[i]) for i in range(EXACT_STEPS)], axis=1
+    )
+    draft_sampled = np.zeros((n, rows_per), dtype=np.int64)
+    draft_sampled[:, 1:] = ids[draws]  # slot 0 is the input token of the step
+    draft_logits = torch.full((EXACT_STEPS, EXACT_VOCAB), float("-inf"), device=DEVICE)
+    draft_logits[:, EXACT_IDS] = torch.from_numpy(score).to(DEVICE)
+    draft_logits = draft_logits.expand(n, EXACT_STEPS, EXACT_VOCAB)
+    state = torch.arange(n, device=DEVICE, dtype=torch.int64)
+    gen = torch.Generator(device=DEVICE).manual_seed(77)
+    sampled, num_sampled = topk_verify(
+        topk,
+        torch.from_numpy(draft_sampled.reshape(-1)).to(DEVICE),
+        torch.arange(n * rows_per, device=DEVICE, dtype=torch.int64) + 1000,
+        torch.arange(n + 1, device=DEVICE, dtype=torch.int32) * rows_per,
+        state,
+        state.repeat_interleave(rows_per),
+        torch.arange(rows_per, device=DEVICE, dtype=torch.int32).repeat(n),
+        torch.full((n,), EXACT_TEMPERATURE, device=DEVICE),
+        torch.full((n,), EXACT_TOP_K, device=DEVICE, dtype=torch.int32),
+        torch.randint(-(1 << 62), 1 << 62, (n,), generator=gen, device=DEVICE),
+        EXACT_STEPS,
+        draft_logits=draft_logits,
+        has_sampled=True,
+    )
+    local = {t: i for i, t in enumerate(EXACT_IDS)}
+    counts: dict[tuple, int] = {}
+    for tokens in as_lists(sampled, num_sampled):
+        outcome = tuple(local[t] for t in tokens)
+        counts[outcome] = counts.get(outcome, 0) + 1
+    assert set(counts) <= set(law), "an outcome the block method cannot produce"
+    stat, dof = chi_square(counts, law, n)
+    limit = dof + 4.0 * (2.0 * dof) ** 0.5
+    assert dof > 50, dof
+    assert stat < limit, (stat, dof, limit)
+
+    # Power: the expected statistic of a broken variant (its law as the counts).
+    for mutant in ("no_p_tau", "resample_target", "h_one"):
+        broken = block_verification_law(P, Q, mutant)
+        shifted, _ = chi_square({o: n * p for o, p in broken.items()}, law, n)
+        assert shifted > 2.0 * limit, (mutant, shifted, limit)
