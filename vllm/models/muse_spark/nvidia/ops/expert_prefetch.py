@@ -49,7 +49,8 @@ logger = init_logger(__name__)
 # of the rank, up to 3/4 of the L2) made the decode step 1.2% slower than none (10.01
 # against 9.88 ms), 6 to 16 MiB are all alike (9.73, 9.75, 9.73, 9.73 ms for 6, 8, 12,
 # 16 MiB; TPOT at batch 1 on 8 RTX PRO 6000 with real weights and the 8 CTA launch of
-# ``l2_prefetch.py``).
+# ``l2_prefetch.py``). The model reads VLLM_MUSE_SPARK_SM120_EXPERT_PREFETCH_BYTES,
+# whose default is this value (envs.py cannot import it; a test keeps the two equal).
 EXPERT_PREFETCH_BYTES = 12 << 20
 # CTAs of the prefetch, one thread each issues the requests: 8 and 16 are alike, a CTA
 # per SM (188) is slower.

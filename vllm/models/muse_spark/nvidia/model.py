@@ -2752,13 +2752,20 @@ class MuseSpark1xModel(LlamaModel):
         ]
         if not moes:
             return
-        prefetch = ExpertPrefetch(moes[0]._router_aux_stream)
+        budget_bytes = envs.VLLM_MUSE_SPARK_SM120_EXPERT_PREFETCH_BYTES
+        if budget_bytes <= 0:
+            raise ValueError(
+                "VLLM_MUSE_SPARK_SM120_EXPERT_PREFETCH_BYTES must be positive, got "
+                f"{budget_bytes} (VLLM_MUSE_SPARK_SM120_EXPERT_PREFETCH=0 turns the "
+                "prefetch off)."
+            )
+        prefetch = ExpertPrefetch(moes[0]._router_aux_stream, budget_bytes)
         for moe in moes:
             moe.expert_prefetch = prefetch
         self._expert_prefetch = prefetch
         logger.info_once(
-            "MuseSpark: expert L2 prefetch of the first %d MiB in %d layers.",
-            prefetch.budget_bytes >> 20,
+            "MuseSpark: expert L2 prefetch of the first %.4g MiB in %d layers.",
+            prefetch.budget_bytes / (1 << 20),
             len(moes),
         )
 

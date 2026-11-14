@@ -15,6 +15,7 @@ import numpy as np
 import pytest
 import torch
 
+import vllm.envs as envs
 import vllm.models.muse_spark.nvidia.model as model_ops
 from tests.kernels.moe.test_muse_spark_sm120_decode_moe import (
     E_GLOBAL,
@@ -585,3 +586,33 @@ def test_a_model_without_the_call_site_or_the_aux_stream_has_no_branch(hookable,
     model._configure_expert_prefetch()
     assert model._expert_prefetch is None
     assert all(layer.feed_forward.expert_prefetch is None for layer in model.layers)
+
+
+def test_the_default_budget_is_the_constant(monkeypatch):
+    monkeypatch.delenv("VLLM_MUSE_SPARK_SM120_EXPERT_PREFETCH_BYTES", raising=False)
+    # envs.py cannot import the constant, so it spells the value out.
+    assert envs.environment_variables[
+        "VLLM_MUSE_SPARK_SM120_EXPERT_PREFETCH_BYTES"
+    ]() == EXPERT_PREFETCH_BYTES
+    model = _model_with_layers(hookable=True)
+    model._configure_expert_prefetch()
+    assert model._expert_prefetch.budget_bytes == EXPERT_PREFETCH_BYTES
+
+
+@pytest.mark.parametrize("mib", [6, 20, 28])
+def test_the_budget_follows_the_environment(monkeypatch, mib):
+    monkeypatch.setenv("VLLM_MUSE_SPARK_SM120_EXPERT_PREFETCH_BYTES", str(mib << 20))
+    model = _model_with_layers(hookable=True)
+    model._configure_expert_prefetch()
+    branch = model._expert_prefetch
+    assert branch.budget_bytes == mib << 20
+    assert all(layer.feed_forward.expert_prefetch is branch for layer in model.layers)
+
+
+@pytest.mark.parametrize("value", ["0", "-4096"])
+def test_a_budget_that_is_not_positive_is_refused(monkeypatch, value):
+    monkeypatch.setenv("VLLM_MUSE_SPARK_SM120_EXPERT_PREFETCH_BYTES", value)
+    model = _model_with_layers(hookable=True)
+    with pytest.raises(ValueError, match="EXPERT_PREFETCH_BYTES"):
+        model._configure_expert_prefetch()
+    assert model._expert_prefetch is None

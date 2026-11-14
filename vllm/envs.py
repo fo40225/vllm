@@ -153,6 +153,7 @@ if TYPE_CHECKING:
     VLLM_MUSE_SPARK_SM120_L2_PREFETCH: bool = True
     VLLM_MUSE_SPARK_SM120_L2_PREFETCH_AFTER_EXPERTS_CTAS: int = 4
     VLLM_MUSE_SPARK_SM120_EXPERT_PREFETCH: bool = True
+    VLLM_MUSE_SPARK_SM120_EXPERT_PREFETCH_BYTES: int = 12582912
     VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY: bool = True
     VLLM_MUSE_SPARK_SM120_FUSED_GEMV: bool = True
     VLLM_MUSE_SPARK_SM120_ROUTER_GEMV: bool = True
@@ -1472,6 +1473,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Read once, when the model is constructed.
     "VLLM_MUSE_SPARK_SM120_EXPERT_PREFETCH": lambda: bool(
         int(os.getenv("VLLM_MUSE_SPARK_SM120_EXPERT_PREFETCH", "1"))
+    ),
+    # Muse Spark on SM120: how many bytes one expert prefetch (above) pulls into L2, in
+    # the order the muse decode kernel consumes them (the head of the first expert,
+    # GEMM1 then GEMM2; one expert is 28.3 MB). The default of 12 MiB (12582912) is
+    # about what HBM moves between the end of the routing and the kernel's first loads;
+    # 6 to 16 MiB were alike at batch 1, and a prefetch of every expert of the rank
+    # (96 MiB) was slower than none, because it competes with the kernel's own loads.
+    # A cache-hint tuning, no output changes. Must be positive. Read once, when the
+    # model is constructed.
+    "VLLM_MUSE_SPARK_SM120_EXPERT_PREFETCH_BYTES": lambda: int(
+        os.getenv("VLLM_MUSE_SPARK_SM120_EXPERT_PREFETCH_BYTES", str(12 << 20))
     ),
     # Muse Spark on SM120: let the TP device communicator run the residual
     # boundary of a decode batch inside its collective, when it offers that (see
