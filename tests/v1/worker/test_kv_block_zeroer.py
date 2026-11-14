@@ -423,3 +423,72 @@ def test_zeroes_exactly_one_block_per_layer(layout: KVCacheLayout):
             assert (view[b].view(torch.int8) == 1).all(), layout
     zero_bytes = int((raw == 0).sum().item())
     assert zero_bytes == num_layers * spec.page_size_bytes, layout
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_runner_zeroes_speculator_group_layers_next_to_target_layers():
+    """A draft layer of another precision lives only in the speculator's groups.
+
+    The runner no longer builds a group for draft-only layers, so its KV zeroer walks
+    the speculator's groups as well: the blocks of an fp8-like target layer, of a bf16
+    draft layer in a group of its own, and of a draft layer that also sits in a mixed
+    target group (seen through both lists, one segment) are all zeroed.
+    """
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+    device = torch.device("cuda")
+    num_blocks = 4
+    target_spec = SlidingWindowSpec(
+        block_size=2,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.uint8,
+        sliding_window=4,
+    )
+    draft_spec = SlidingWindowSpec(
+        block_size=2,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.bfloat16,
+        sliding_window=4,
+    )
+    storage = {
+        "target": torch.ones((num_blocks, 1, 2, 2), dtype=torch.uint8, device=device),
+        "draft_only": torch.ones(
+            (num_blocks, 1, 2, 2), dtype=torch.bfloat16, device=device
+        ),
+        "draft_shared": torch.ones(
+            (num_blocks, 1, 2, 2), dtype=torch.bfloat16, device=device
+        ),
+    }
+    shared_group = AttentionGroup(None, ["draft_shared"], draft_spec, 1)
+    runner = SimpleNamespace(
+        device=device,
+        attn_groups=[
+            [AttentionGroup(None, ["target"], target_spec, 0)],
+            [shared_group],
+        ],
+        speculator=SimpleNamespace(
+            builds_own_attn_metadata=True,
+            attn_groups=[
+                [],
+                [shared_group, AttentionGroup(None, ["draft_only"], draft_spec, 1)],
+            ],
+        ),
+        kernel_block_sizes=[2, 2],
+        compilation_config=SimpleNamespace(
+            static_forward_context={
+                name: SimpleNamespace(kv_cache=t) for name, t in storage.items()
+            }
+        ),
+        kv_cache_config=SimpleNamespace(num_blocks=num_blocks),
+    )
+
+    GPUModelRunner._init_kv_zero_meta(runner)
+    runner.kv_block_zeroer.zero_block_ids([2])
+    torch.accelerator.synchronize()
+
+    for name, t in storage.items():
+        expected = torch.ones_like(t)
+        expected[2] = 0
+        assert torch.equal(t, expected), name

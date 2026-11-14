@@ -39,7 +39,9 @@ class DFlashSpeculator(DraftModelSpeculator):
     _speculator_name = "DFlash"  # For logging, so we can share methods with subclasses
     # propose() builds the draft attention metadata from this speculator's own groups
     # (`_build_uniform_attn_metadata`, the graph capture) and ignores the metadata the
-    # target step built.
+    # target step built. The code is shared by every model of the family; it was
+    # booted and compared bitwise with the Muse Spark drafts (DSpark, DFlash2) only,
+    # not with the other DFlash/DSpark drafts (Qwen3, Laguna, DeepSeek V4, Kimi K3).
     builds_own_attn_metadata = True
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
