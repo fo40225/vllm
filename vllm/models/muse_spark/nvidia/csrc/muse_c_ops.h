@@ -194,6 +194,18 @@ void nvfp4_decode_moe_plan(at::Tensor const& topk_ids,
 void nvfp4_decode_act_quant(at::Tensor const& hidden, at::Tensor const& gs,
                             at::Tensor& data, at::Tensor& sf, bool pdl);
 
+// The pre-expert RMSNorm of the MoE layer and the NVFP4 quantization of its output in
+// one launch (muse_spark_rmsnorm_nvfp4.cu), for the large-batch kernel: x [T, 4096] bf16
+// (T = 1..128), w [4096] bf16, out [T, 4096] bf16 = bit for bit the Triton
+// `_rmsnorm_fwd_kernel` of the model (weight after the normalization, `f32(w) + gain`,
+// `eps`), xq_data [T, 2048] u8 / xq_sf [T, 256] u8 = the codes and linear scales that
+// nvfp4_decode_act_quant makes of `out` with gs[0]. The large-batch op takes them with flag
+// 64. pdl: launch as a programmatic dependent of the kernel before it in the stream (which
+// writes x); the kernel that follows may be a programmatic dependent of this one.
+void rmsnorm_nvfp4_quant(at::Tensor const& x, at::Tensor const& w, double eps,
+                         double gain, at::Tensor const& gs, at::Tensor& out,
+                         at::Tensor& xq_data, at::Tensor& xq_sf, bool pdl);
+
 // Muse Spark attention-side ops, ported from vllm-project/vllm#62132 (the
 // stock `torch.ops._C` versions of the same ops). Schemas are identical.
 

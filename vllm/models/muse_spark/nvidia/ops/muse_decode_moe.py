@@ -293,6 +293,7 @@ class MuseDecodeMoE:
         expert_map = torch.arange(
             self.num_local_experts, dtype=torch.int32, device=self.device
         )
+        norm_weight = torch.ones(MUSE_HIDDEN, dtype=torch.bfloat16, device=self.device)
         warm_up = list(_T_PADS)
         if self.max_tokens > MUSE_SMALL_MAX_TOKENS:
             # One launch sets up the large-batch kernel for every token count.
@@ -310,6 +311,11 @@ class MuseDecodeMoE:
                 if t_pad > MUSE_SMALL_MAX_TOKENS:
                     self.build_plan(ids, ids_map)
                     self.run(hidden, ids, ids_map)
+                    # The launches that quantize ahead of the large-batch kernel.
+                    self.quantize_input(hidden)
+                    self.run(hidden, ids, ids_map)
+                    self.rmsnorm_quantize(hidden, norm_weight, 1e-6, 0.0)
+                    self.discard_input()
         torch.accelerator.synchronize()
         if bool(self._scratch.ctl.any()):
             raise RuntimeError("The muse decode kernel left its counters dirty.")
@@ -417,6 +423,29 @@ class MuseDecodeMoE:
             hidden_states.contiguous(), self._gs, data, sf, muse_pdl_enabled()
         )
         self.mark_input_quantized(hidden_states)
+
+    def rmsnorm_quantize(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        gain_center: float,
+    ) -> torch.Tensor:
+        """The pre-expert RMSNorm of ``x`` [T, 4096] and the quantization of its output, in
+        one launch (9 to ``max_tokens`` tokens).
+
+        Returns the normalized rows, bit for bit what the Triton RMSNorm of the model
+        returns (weight after the normalization, ``f32(weight) + gain_center``); the NVFP4
+        codes and scales of those rows are written to the scratch, and ``run`` on these
+        very rows skips its own quantization.
+        """
+        data, sf = self.input_scratch(x.shape[0])
+        out = torch.empty_like(x)
+        torch.ops._muse_C.rmsnorm_nvfp4_quant(
+            x, weight, eps, gain_center, self._gs, out, data, sf, muse_pdl_enabled()
+        )
+        self.mark_input_quantized(out)
+        return out
 
     def mark_input_quantized(self, hidden_states: torch.Tensor) -> None:
         """Say that ``input_scratch`` holds the quantization of ``hidden_states`` with

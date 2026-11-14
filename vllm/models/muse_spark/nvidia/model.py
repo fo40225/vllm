@@ -1393,14 +1393,49 @@ class MuseSpark1xMoE(nn.Module):
             if fused is not None:
                 return fused
             shard = self._project_local_columns(self.pooler, hidden_states)
+            # Where the communicator fuses the gather with the norm (up to 16 rows on the
+            # host plugin) the norm costs nothing in the step: that stays as it was, and the
+            # quantizing launch below serves the sizes it does not.
             if (fused := self._fused_all_gather_rmsnorm(shard)) is not None:
                 return fused
             hidden_states = gather_columns(shard)
         else:
             hidden_states = self.pooler(hidden_states)[0]
         if self.pre_expert_norm is not None:
+            if (fused := self._norm_quant_decode_input(hidden_states)) is not None:
+                return fused
             hidden_states = self.pre_expert_norm(hidden_states)
         return hidden_states
+
+    def _quantizes_in_norm(self, num_tokens: int) -> bool:
+        """Whether the pre-expert norm of a padded batch of this size also quantizes its
+        output for the muse large-batch kernel (``VLLM_MUSE_SPARK_SM120_FUSED_NORM_QUANT``).
+
+        Only in a CUDA graph capture of ``MUSE_SMALL_MAX_TOKENS + 1`` to ``MUSE_MAX_TOKENS``
+        tokens on a layer whose experts run that kernel, with the norm the kernel mirrors
+        (weight applied after the normalization).
+        """
+        norm = self.pre_expert_norm
+        return (
+            envs.VLLM_MUSE_SPARK_SM120_FUSED_NORM_QUANT
+            and torch.cuda.is_current_stream_capturing()
+            and MUSE_SMALL_MAX_TOKENS < num_tokens <= MUSE_MAX_TOKENS
+            and norm is not None
+            and norm.has_weight
+            and not norm.applies_weight_before_norm
+            and norm.variance_size_override is None
+            and isinstance(self.experts, MuseMoERunner)
+            and self.experts.has_muse_decode_engine
+        )
+
+    def _norm_quant_decode_input(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        if not self._quantizes_in_norm(hidden_states.shape[0]):
+            return None
+        norm = self.pre_expert_norm
+        assert norm is not None
+        return cast(MuseMoERunner, self.experts).norm_quant_decode_input(
+            hidden_states, norm.weight, norm.variance_epsilon, norm.fused_gain_center
+        )
 
     def wants_fp32_router_input(self, num_tokens: int) -> bool:
         if not self.fp32_router_input or (

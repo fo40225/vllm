@@ -73,6 +73,9 @@ TORCH_LIBRARY(_muse_C, m) {
   m.def(
       "nvfp4_decode_act_quant(Tensor hidden, Tensor gs, Tensor! data, "
       "Tensor! sf, bool pdl=False) -> ()");
+  m.def(
+      "rmsnorm_nvfp4_quant(Tensor x, Tensor w, float eps, float gain, Tensor gs, "
+      "Tensor! out, Tensor! xq_data, Tensor! xq_sf, bool pdl=False) -> ()");
 
   // Decode weight prefetch into L2, see muse_c_ops.h.
   m.def(
@@ -134,6 +137,7 @@ TORCH_LIBRARY_IMPL(_muse_C, CUDA, m) {
   m.impl("nvfp4_decode_moe_large", &muse_spark::nvfp4_decode_moe_large);
   m.impl("nvfp4_decode_moe_plan", &muse_spark::nvfp4_decode_moe_plan);
   m.impl("nvfp4_decode_act_quant", &muse_spark::nvfp4_decode_act_quant);
+  m.impl("rmsnorm_nvfp4_quant", &muse_spark::rmsnorm_nvfp4_quant);
   m.impl("l2_prefetch", &muse_spark::l2_prefetch);
   m.impl("expert_prefetch", &muse_spark::expert_prefetch);
   m.impl("router_gemv", &muse_spark::router_gemv);

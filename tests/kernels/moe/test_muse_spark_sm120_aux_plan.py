@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """The plan of the large-batch muse decode kernel on the router's aux stream
-(``VLLM_MUSE_SPARK_SM120_AUX_PLAN``), and its activations quantized by another launch.
+(``VLLM_MUSE_SPARK_SM120_AUX_PLAN``), and its activations quantized by another launch,
+in particular by the one of the pre-expert RMSNorm
+(``VLLM_MUSE_SPARK_SM120_FUSED_NORM_QUANT``).
 
 The preparation launch of ``nvfp4_decode_moe_large`` (``k_prep``) has one CTA that
 builds the plan and the route -> row map from the top-k ids, and one CTA per 32 rows
@@ -38,6 +40,7 @@ from tests.kernels.moe.test_muse_spark_sm120_decode_moe import (
     _zipf_ids,
 )
 from tests.kernels.muse_spark_pdl_utils import slow_copy, synchronize_or_exit
+from vllm.models.muse_spark.common.ops.fused_rmsnorm import fused_rmsnorm_fwd
 from vllm.models.muse_spark.nvidia import sm120_nvfp4_moe
 from vllm.models.muse_spark.nvidia.muse_moe_runner import (
     MuseSparkModelOptNvFp4FusedMoE,
@@ -695,3 +698,272 @@ def test_the_experts_queue_a_plan_in_a_capture_for_the_large_batch_sizes_only(
     assert bool(queued) is want
     experts.use_muse_decode = False
     assert not experts.prepare_routed_plan(ids, "map")
+
+
+# ------------------------------------------------------------------------------
+# The pre-expert RMSNorm and the quantization of its output in one launch
+# ------------------------------------------------------------------------------
+def _norm_inputs(kind: str, t: int, seed: int) -> torch.Tensor:
+    g = torch.Generator(device="cuda").manual_seed(900 + seed)
+
+    def r(scale=1.0):
+        x = torch.randn(t, H, device="cuda", generator=g) * scale
+        return x.to(torch.bfloat16)
+
+    if kind == "normal":
+        return r(3.0)
+    if kind == "heavy":  # outlier channels like the pooled latent of a real model
+        x = r(1.0)
+        idx = torch.randint(0, H, (t, 8), device="cuda", generator=g)
+        outliers = torch.randn(t, 8, device="cuda", generator=g) * 300
+        x.scatter_(1, idx, outliers.to(torch.bfloat16))
+        return x
+    if kind == "tiny":
+        return r(1e-18)
+    if kind == "zero":
+        return torch.zeros(t, H, dtype=torch.bfloat16, device="cuda")
+    if kind == "big":
+        return r(3e4)
+    if kind == "ties":  # equal magnitudes: ties of the e2m1 grid after the norm
+        sign = torch.where(torch.arange(H, device="cuda") % 2 == 0, 1.0, -1.0)
+        return (sign * 0.75).expand(t, H).to(torch.bfloat16).contiguous()
+    raise ValueError(kind)
+
+
+NORM_KINDS = ("normal", "heavy", "tiny", "zero", "big", "ties")
+NORM_CONFIGS = ((1e-6, 1.0), (1e-8, 0.0), (1e-5, 0.5), (1e-6, -0.25))
+
+
+@torch.inference_mode()
+def test_rmsnorm_quant_is_the_triton_norm_and_the_quantization_of_its_output(
+    layer: _Layer,
+) -> None:
+    g = torch.Generator(device="cuda").manual_seed(77)
+    w = (torch.randn(H, device="cuda", generator=g) * 0.3).to(torch.bfloat16)
+    gscale = float(layer.gs[0])
+    for t in range(1, MAX_LARGE_T + 1):
+        for kind in NORM_KINDS:
+            x = _norm_inputs(kind, t, t)
+            eps, gain = NORM_CONFIGS[(t + len(kind)) % len(NORM_CONFIGS)]
+            ref = fused_rmsnorm_fwd(
+                x, w, eps, gain_center=gain, input_scale=False, use_kahan_summation=True
+            )
+            out = torch.full_like(x, float("nan"))
+            data = torch.full((t, H // 2), 0xFF, dtype=torch.uint8, device="cuda")
+            sf = torch.full((t, H // 16), 0xFF, dtype=torch.uint8, device="cuda")
+            for pdl in (False, True):
+                torch.ops._muse_C.rmsnorm_nvfp4_quant(
+                    x, w, eps, gain, layer.gs, out, data, sf, pdl
+                )
+                assert torch.equal(out.view(torch.int16), ref.view(torch.int16)), (
+                    t, kind, pdl,
+                )  # fmt: skip
+                q_ref, sf_ref = _stock_quant(ref, gscale)
+                assert torch.equal(data, q_ref), (t, kind, pdl)
+                assert torch.equal(sf, sf_ref), (t, kind, pdl)
+
+
+@torch.inference_mode()
+def test_rmsnorm_quant_rejects_bad_arguments(layer: _Layer) -> None:
+    t = 12
+    x = _norm_inputs("normal", t, 1)
+    w = torch.ones(H, dtype=torch.bfloat16, device="cuda")
+    out = torch.empty_like(x)
+    data = torch.empty(t, H // 2, dtype=torch.uint8, device="cuda")
+    sf = torch.empty(t, H // 16, dtype=torch.uint8, device="cuda")
+    op = torch.ops._muse_C.rmsnorm_nvfp4_quant
+    op(x, w, 1e-6, 1.0, layer.gs, out, data, sf, False)
+    with pytest.raises(RuntimeError):  # weight of another width
+        op(x, w[:H // 2], 1e-6, 1.0, layer.gs, out, data, sf, False)
+    with pytest.raises(RuntimeError):  # fp32 input
+        op(x.float(), w, 1e-6, 1.0, layer.gs, out, data, sf, False)
+    with pytest.raises(RuntimeError):  # scratch of another size
+        op(x, w, 1e-6, 1.0, layer.gs, out, data[:5], sf, False)
+    with pytest.raises(RuntimeError):  # misaligned weight
+        op(x, torch.ones(H + 8, dtype=torch.bfloat16, device="cuda")[1:H + 1], 1e-6,
+           1.0, layer.gs, out, data, sf, False)  # fmt: skip
+    big = _norm_inputs("normal", MAX_LARGE_T + 1, 2)
+    big_data = torch.empty(big.shape[0], H // 2, dtype=torch.uint8, device="cuda")
+    big_sf = torch.empty(big.shape[0], H // 16, dtype=torch.uint8, device="cuda")
+    with pytest.raises(RuntimeError):
+        op(big, w, 1e-6, 1.0, layer.gs, torch.empty_like(big), big_data, big_sf, False)
+
+
+@pytest.mark.parametrize("t", [9, 33, 64, MAX_LARGE_T])
+@torch.inference_mode()
+def test_engine_runs_on_the_output_of_the_norm_and_quantization_launch(
+    layer: _Layer, t: int, monkeypatch
+) -> None:
+    engine = _engine(layer)
+    spy = _Spy(monkeypatch)
+    g = torch.Generator(device="cuda").manual_seed(78)
+    w = (torch.randn(H, device="cuda", generator=g) * 0.3).to(torch.bfloat16)
+    x = _norm_inputs("normal", t, 5)
+    ids = _all_ids(t, 460 + t, layer.e_local)["three_local"]
+    normed = fused_rmsnorm_fwd(x, w, 1e-6, gain_center=1.0, use_kahan_summation=True)
+    ref = _valid(*engine.run(normed, ids, layer.expert_map))
+    got_normed = engine.rmsnorm_quantize(x, w, 1e-6, 1.0)
+    assert torch.equal(got_normed.view(torch.int16), normed.view(torch.int16))
+    engine.build_plan(ids, layer.expert_map)
+    got = _valid(*engine.run(got_normed, ids, layer.expert_map))
+    assert spy.flags[-1] & FLAG_EXTERNAL_XQ and spy.flags[-1] & FLAG_EXTERNAL_PLAN
+    assert torch.equal(got[0], ref[0]) and torch.equal(got[1], ref[1])
+    # Quantized rows of another tensor are not taken for these.
+    engine.rmsnorm_quantize(x, w, 1e-6, 1.0)
+    engine.run(normed, ids, layer.expert_map)
+    assert not spy.flags[-1] & FLAG_EXTERNAL_XQ
+
+
+@pytest.mark.parametrize("t", [9, 64, MAX_LARGE_T])
+@pytest.mark.parametrize("use_graph", [False, True])
+@torch.inference_mode()
+def test_norm_quant_launch_waits_for_the_producer_of_its_input(
+    layer: _Layer, t: int, use_graph: bool, capfd
+) -> None:
+    """The producer of the latent (the all-gather stand-in) lets its dependents launch at
+    once and writes late; the norm + quantization launch is its programmatic dependent
+    and the large-batch kernel the dependent of that."""
+    engine = _engine(layer)
+    g = torch.Generator(device="cuda").manual_seed(79)
+    w = (torch.randn(H, device="cuda", generator=g) * 0.3).to(torch.bfloat16)
+    x = _norm_inputs("heavy", t, 6)
+    stale = _norm_inputs("normal", t, 7)
+    ids = _all_ids(t, 470 + t, layer.e_local)["random"]
+    normed = fused_rmsnorm_fwd(x, w, 1e-6, gain_center=1.0, use_kahan_summation=True)
+    ref = _valid(*engine.run(normed, ids, layer.expert_map))
+    x_in = stale.clone()
+
+    def step():
+        slow_copy((x_in, x))
+        out = engine.rmsnorm_quantize(x_in, w, 1e-6, 1.0)
+        return engine.run(out, ids, layer.expert_map)
+
+    x_in.copy_(stale)
+    step()
+    synchronize_or_exit("the first launch", capfd)
+    if use_graph:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            rows, perm = step()
+        for _ in range(4):
+            x_in.copy_(stale)
+            graph.replay()
+            synchronize_or_exit("a graph replay", capfd)
+            got = _valid(rows, perm)
+            assert torch.equal(got[0], ref[0]) and torch.equal(got[1], ref[1])
+    else:
+        for _ in range(4):
+            x_in.copy_(stale)
+            rows, perm = step()
+            synchronize_or_exit("a launch", capfd)
+            got = _valid(rows, perm)
+            assert torch.equal(got[0], ref[0]) and torch.equal(got[1], ref[1])
+
+
+def test_the_norm_quantizes_for_the_large_batch_sizes_in_a_capture_only(
+    capturing, monkeypatch
+):
+    monkeypatch.setenv("VLLM_MUSE_SPARK_SM120_FUSED_NORM_QUANT", "1")
+
+    def moe(**kw):
+        m = object.__new__(model_ops.MuseSpark1xMoE)
+        torch.nn.Module.__init__(m)
+        norm = SimpleNamespace(
+            has_weight=kw.get("has_weight", True),
+            applies_weight_before_norm=kw.get("weight_first", False),
+            variance_size_override=kw.get("var_override", None),
+        )
+        m.pre_expert_norm = None if kw.get("no_norm") else norm
+        runner = object.__new__(model_ops.MuseMoERunner)
+        torch.nn.Module.__init__(runner)
+        runner.__class__ = type(
+            "R", (model_ops.MuseMoERunner,),
+            {"has_muse_decode_engine": property(lambda self: kw.get("engine", True))},
+        )  # fmt: skip
+        m.experts = runner
+        return m
+
+    for t in (1, 8, 129):
+        assert not moe()._quantizes_in_norm(t)
+    for t in (9, 33, 64, MAX_LARGE_T):
+        assert moe()._quantizes_in_norm(t)
+    for kw in (
+        {"has_weight": False}, {"weight_first": True}, {"var_override": 1024},
+        {"no_norm": True}, {"engine": False},
+    ):  # fmt: skip
+        assert not moe(**kw)._quantizes_in_norm(64), kw
+    monkeypatch.setenv("VLLM_MUSE_SPARK_SM120_FUSED_NORM_QUANT", "0")
+    assert not moe()._quantizes_in_norm(64)
+    monkeypatch.setenv("VLLM_MUSE_SPARK_SM120_FUSED_NORM_QUANT", "1")
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    assert not moe()._quantizes_in_norm(64)
+    monkeypatch.setenv("VLLM_MUSE_SPARK_SM120_FUSED_NORM_QUANT", "")
+    monkeypatch.delenv("VLLM_MUSE_SPARK_SM120_FUSED_NORM_QUANT")
+    assert envs.VLLM_MUSE_SPARK_SM120_FUSED_NORM_QUANT is False
+
+
+def test_pool_and_norm_keeps_the_fused_gather_and_takes_the_norm_quant_launch_after_it(
+    capturing, monkeypatch
+):
+    calls = []
+    t = 32
+    moe = object.__new__(model_ops.MuseSpark1xMoE)
+    torch.nn.Module.__init__(moe)
+    moe.pooler = object()
+    moe.shards_pooler = lambda n: True
+    moe._fused_gemv_all_gather_rmsnorm = lambda x: None
+    moe._project_local_columns = lambda layer, x: x[:, :512].contiguous()
+    fuses = [True]
+    moe._fused_all_gather_rmsnorm = lambda shard: (
+        calls.append("fused_gather") or shard if fuses[0] else None
+    )
+    moe.pre_expert_norm = lambda x: calls.append("plain_norm") or x
+    quantizes = [True]
+    moe._quantizes_in_norm = lambda n: quantizes[0]
+    moe._norm_quant_decode_input = lambda x: (
+        calls.append("norm_quant") or x if quantizes[0] else None
+    )
+    monkeypatch.setattr(model_ops, "gather_columns", lambda shard: shard.repeat(1, 8))
+    x = torch.zeros(t, 8192, dtype=torch.bfloat16, device=DEVICE)
+    # The communicator fuses the gather with the norm: as before, nothing quantizes.
+    moe._pool_and_norm(x)
+    assert calls == ["fused_gather"]
+    # No fused gather for this size: a plain gather, then the norm + quantization.
+    calls.clear()
+    fuses[0] = False
+    moe._pool_and_norm(x)
+    assert calls == ["norm_quant"]
+    # Not quantizing: the model's own norm.
+    calls.clear()
+    quantizes[0] = False
+    moe._pool_and_norm(x)
+    assert calls == ["plain_norm"]
+
+
+def test_the_experts_quantize_in_the_norm_in_a_capture_for_the_large_batch_only(
+    monkeypatch,
+):
+    seen = []
+    experts = object.__new__(MuseSparkSm120NvFp4Experts)
+    experts.use_muse_decode = True
+    experts.muse = SimpleNamespace(
+        max_tokens=MAX_LARGE_T,
+        rmsnorm_quantize=lambda x, w, eps, gain: seen.append((eps, gain)) or x,
+    )
+    w = torch.ones(H, dtype=torch.bfloat16, device=DEVICE)
+
+    def call(t, capturing_now=True, **over):
+        monkeypatch.setattr(sm120_nvfp4_moe, "_capturing", lambda: capturing_now)
+        x = over.get("x", torch.zeros(t, H, dtype=torch.bfloat16, device=DEVICE))
+        return experts.prepare_normed_input(x, over.get("w", w), 1e-6, 1.0)
+
+    assert call(64) is not None and seen == [(1e-6, 1.0)]
+    for t in (4, 8, MAX_LARGE_T + 1):
+        assert call(t) is None
+    assert call(64, capturing_now=False) is None
+    assert call(64, x=torch.zeros(64, H, device=DEVICE)) is None  # fp32
+    assert call(64, w=w[: H // 2]) is None
+    transposed = torch.zeros(H, 64, dtype=torch.bfloat16, device=DEVICE).t()
+    assert call(64, x=transposed) is None
+    experts.use_muse_decode = False
+    assert call(64) is None

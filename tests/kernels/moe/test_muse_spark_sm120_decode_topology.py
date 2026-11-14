@@ -189,3 +189,112 @@ def test_aux_stream_routing_eager_run_is_the_runners_own(
             out = runner.forward_routed(pooled, weights, ids)
         torch.accelerator.synchronize()
         assert torch.equal(out, expected), num_tokens
+
+
+@pytest.mark.parametrize("pdl", ["1", "0"])
+@torch.inference_mode()
+def test_aux_plan_and_norm_quant_graph_replays_like_the_plain_aux_graph(
+    dist_init, workspace_init, layer, pdl, monkeypatch
+) -> None:
+    """The plan of the large-batch kernel built on the aux stream behind the top-k
+    (``build_decode_plan``) and the quantization folded into the pre-expert norm
+    (``norm_quant_decode_input``), through the real runner and its modular experts: the
+    graph is bit for bit the graph without them, over many replays on fresh inputs, and
+    the large-batch kernel really takes both (flags 32 and 64) in the captured graph."""
+    monkeypatch.setenv(PDL_ENV, pdl)
+    router, runner, vllm_config = _build_layer(layer)
+    generator = torch.Generator(device="cuda").manual_seed(2)
+    pooler_weight = (
+        torch.randn(H, D_MODEL, device="cuda", generator=generator) * 0.02
+    ).to(torch.bfloat16)
+    router_weight = (
+        torch.randn(E_LOCAL, D_MODEL, device="cuda", generator=generator) * 0.05
+    ).float()
+    norm_weight = (torch.randn(H, device="cuda", generator=generator) * 0.3).to(
+        torch.bfloat16
+    )
+    aux = torch.cuda.Stream()
+    events = (torch.cuda.Event(), torch.cuda.Event())
+    flags_seen: list[int] = []
+    original = torch.ops._muse_C.nvfp4_decode_moe_large
+
+    depth = [0]
+
+    def spy(*args):
+        # (The expert weights are Parameters, whose __torch_function__ calls the op again.)
+        if depth[0] == 0:
+            flags_seen.append(args[-1])
+        depth[0] += 1
+        try:
+            return original(*args)
+        finally:
+            depth[0] -= 1
+
+    monkeypatch.setattr(torch.ops._muse_C, "nvfp4_decode_moe_large", spy)
+
+    def make(plan: bool, quant: bool):
+        def pool_and_norm(x: torch.Tensor) -> torch.Tensor:
+            pooled = F.linear(x, pooler_weight)
+            if quant:
+                fused = runner.norm_quant_decode_input(
+                    pooled, norm_weight, NORM_EPS, 1.0
+                )
+                if fused is not None:
+                    return fused
+            return fused_rmsnorm_fwd(pooled, norm_weight, NORM_EPS, gain_center=1.0)
+
+        def route(x: torch.Tensor):
+            weights, ids = runner.select_experts(x, F.linear(x.float(), router_weight))
+            if plan:
+                runner.build_decode_plan(ids)
+            return weights, ids
+
+        def forward(x: torch.Tensor) -> torch.Tensor:
+            pooled, (weights, ids) = maybe_execute_in_parallel(
+                lambda: pool_and_norm(x), lambda: route(x), *events, aux
+            )
+            return runner.forward_routed(pooled, weights, ids)
+
+        return forward
+
+    def capture(forward, x_static: torch.Tensor):
+        for _ in range(3):
+            forward(x_static)
+        torch.accelerator.synchronize()
+        flags_seen.clear()  # (the first forward pass prepares the engine: warm-ups)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out = forward(x_static)
+        return graph, out
+
+    with set_current_vllm_config(vllm_config), set_forward_context(None, vllm_config):
+        for num_tokens in (MUSE_SMALL_MAX_TOKENS + 1, 24, 64, MUSE_MAX_TOKENS):
+            graphs = {}
+            for plan, quant in (
+                (False, False),
+                (True, False),
+                (False, True),
+                (True, True),
+            ):
+                x = _random_input(num_tokens, generator)
+                graph, out = capture(make(plan, quant), x)
+                # The capture is the only launch with the engine; eager forwards are CUTLASS.
+                assert len(flags_seen) == 1, (num_tokens, plan, quant)
+                assert bool(flags_seen[0] & 32) == plan, (num_tokens, plan, quant)
+                assert bool(flags_seen[0] & 64) == quant, (num_tokens, plan, quant)
+                graphs[(plan, quant)] = (graph, out, x)
+                # Nothing is left prepared after the layer.
+                experts = runner.routed_experts.quant_method.moe_kernel.fused_experts
+                assert experts.muse._plan_key is None and experts.muse._xq_key is None
+            for replay in range(REPLAYS):
+                new_x = _random_input(num_tokens, generator)
+                for _, _, x in graphs.values():
+                    x.copy_(new_x)
+                for graph, _, _ in graphs.values():
+                    graph.replay()
+                torch.accelerator.synchronize()
+                reference = graphs[(False, False)][1]
+                assert bool(torch.isfinite(reference).all())
+                assert bool((reference != 0).any())
+                for key, (_, out, _) in graphs.items():
+                    assert torch.equal(out, reference), (num_tokens, replay, key)

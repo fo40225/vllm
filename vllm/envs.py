@@ -174,6 +174,7 @@ if TYPE_CHECKING:
     VLLM_MUSE_SPARK_SM120_DECODE_GEMM: bool = True
     VLLM_MUSE_SPARK_SM120_AUX_PLAN: bool = False
     VLLM_MUSE_SPARK_SM120_AUX_PLAN_MAX_TOKENS: int = 64
+    VLLM_MUSE_SPARK_SM120_FUSED_NORM_QUANT: bool = False
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
     VLLM_ROCM_USE_AITER_LINEAR_HIPBMM: bool = False
     VLLM_ROCM_USE_AITER_MOE: bool = True
@@ -1768,6 +1769,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # loses 0.1 to 1 us at 96 and 128 rows.
     "VLLM_MUSE_SPARK_SM120_AUX_PLAN_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_MUSE_SPARK_SM120_AUX_PLAN_MAX_TOKENS", "64")
+    ),
+    # Muse Spark on SM120: the pre-expert RMSNorm of a padded decode batch of 9 to 128 rows
+    # and the NVFP4 quantization of its output (the pooled latent, which the muse
+    # large-batch decode kernel needs as codes and scales) in one launch
+    # (``_muse_C::rmsnorm_nvfp4_quant``), instead of the Triton ``_rmsnorm_fwd_kernel``
+    # (2 us) and the quantizing CTAs of the kernel's preparation launch (``k_prep``,
+    # 7 us at 64 rows, the longer half of it); the kernel then takes the quantized input
+    # with its external-xq flag. The norm's output is the Triton kernel's bit for bit (a
+    # CUDA mirror proven against it) and the codes and scales are the preparation launch's,
+    # so the output does not change. Only where the layer's experts run that kernel in a
+    # CUDA graph capture, and not where the TP communicator fuses the pooler gather with
+    # this norm (the host plugin up to 16 rows: the norm is hidden there). Default off. Read
+    # when a decode graph is captured, so it must not change between a capture and its
+    # replay.
+    "VLLM_MUSE_SPARK_SM120_FUSED_NORM_QUANT": lambda: bool(
+        int(os.getenv("VLLM_MUSE_SPARK_SM120_FUSED_NORM_QUANT", "0"))
     ),
     # Muse Spark on SM120: run the QKV projection and the sharded pooler / unpooler of up
     # to 64 rows (padded decode batches) as one kernel, ``_muse_C::decode_gemm``, instead

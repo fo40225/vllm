@@ -18,6 +18,11 @@ Variants (``--variants``):
   base            the preparation launch (``k_prep``) builds the plan and quantizes
   aux_plan        the plan is built on the aux stream behind the top-k
                   (VLLM_MUSE_SPARK_SM120_AUX_PLAN=1); ``k_prep`` only quantizes
+  norm_quant      the pre-expert RMSNorm and the quantization in one launch
+                  (VLLM_MUSE_SPARK_SM120_FUSED_NORM_QUANT=1); the kernel only builds
+                  its plan in the preparation launch
+  norm_quant_aux  both: norm + quantization in one launch, the plan on the aux stream
+                  (no preparation launch at all)
   aux_plan_xq     UPPER BOUND of folding the quantization into the producer of the
                   activations: the plan as in ``aux_plan``, the quantization done once
                   outside the graph and handed to the kernel (no preparation launch
@@ -122,10 +127,14 @@ class Case:
         self.fork, self.join = torch.cuda.Event(), torch.cuda.Event()
         self.pooled_ref = None
 
-    def _pooler_chain(self):
+    def _pooler_chain(self, quantize: bool = False):
         shard = F.linear(self.x, self.pooler_w)  # [T, 512], this rank's columns
         self.gathered[:, :512].copy_(shard)
         torch.cuda._sleep(self.ag_cycles)  # the all-gather
+        if quantize:
+            return self.layer.engine.rmsnorm_quantize(
+                self.gathered, self.norm_w, 1e-6, 1.0
+            )
         return fused_rmsnorm_fwd(
             self.gathered, self.norm_w, 1e-6, gain_center=1.0, use_kahan_summation=True
         )
@@ -144,10 +153,10 @@ class Case:
         with torch.cuda.stream(self.side):
             self.fork.wait()
             ids, _ = self._router_chain()
-            if variant != "base":
+            if variant in ("aux_plan", "aux_plan_xq", "norm_quant_aux"):
                 eng.build_plan(ids, emap)
             self.join.record(self.side)
-        pooled = self._pooler_chain()
+        pooled = self._pooler_chain(quantize=variant.startswith("norm_quant"))
         self.join.wait()
         if variant == "aux_plan_xq":
             eng.mark_input_quantized(pooled)
@@ -251,7 +260,8 @@ def _time_n(graph, replays, n) -> float:
     torch.cuda.synchronize()
     out = []
     for _ in range(replays):
-        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
         start.record()
         graph.replay()
         end.record()
@@ -266,7 +276,9 @@ def main() -> None:
     ap.add_argument(
         "--batches", type=lambda s: [int(v) for v in s.split(",")], default=BATCHES
     )
-    ap.add_argument("--variants", default="base,aux_plan,aux_plan_xq")
+    ap.add_argument(
+        "--variants", default="base,aux_plan,norm_quant,norm_quant_aux,aux_plan_xq"
+    )
     ap.add_argument("--rounds", type=int, default=3)
     ap.add_argument("--replays", type=int, default=30)
     ap.add_argument("--ag-us", type=float, default=17.0, help="the pooler all-gather")

@@ -887,6 +887,39 @@ class MuseSparkSm120NvFp4Experts(mk.FusedMoEExpertsModular):
             self.muse.discard_plan()
             self.muse.discard_input()
 
+    def prepare_normed_input(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        gain_center: float,
+    ) -> torch.Tensor | None:
+        """The pre-expert RMSNorm of ``x`` with the activation quantization of the large-batch
+        muse kernel folded into the same launch, or None where the kernel would not take it.
+
+        Meant for the norm of the MoE layer in a CUDA graph capture that goes on to call
+        ``apply`` with the returned rows: the launch of the kernel then does not quantize.
+        Returns the normalized rows (what the model's own RMSNorm returns, bit for bit);
+        ``discard_prepared_plan`` drops the quantization if ``apply`` did not take it.
+        """
+        if not (self.use_muse_decode and self.muse is not None and _capturing()):
+            return None
+        if not MUSE_SMALL_MAX_TOKENS < x.shape[0] <= self.muse.max_tokens:
+            return None
+        if not (
+            x.dtype == torch.bfloat16
+            and x.dim() == 2
+            and x.shape[1] == 4096
+            and x.is_contiguous()
+            and weight.dtype == torch.bfloat16
+            and tuple(weight.shape) == (4096,)
+            and weight.is_contiguous()
+            and x.data_ptr() % 16 == 0
+            and weight.data_ptr() % 16 == 0
+        ):
+            return None
+        return self.muse.rmsnorm_quantize(x, weight, eps, gain_center)
+
     def _apply_muse(
         self,
         hidden_states: torch.Tensor,

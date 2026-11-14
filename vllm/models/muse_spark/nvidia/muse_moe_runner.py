@@ -1131,6 +1131,23 @@ class MuseMoERunner(MoERunner):
         if experts is not None:
             experts.discard_prepared_plan()
 
+    def norm_quant_decode_input(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        gain_center: float,
+    ) -> torch.Tensor | None:
+        """The pre-expert RMSNorm of ``x`` and the activation quantization of the muse
+        large-batch kernel in one launch (see ``prepare_normed_input``); None where the
+        experts are not the SM120 native ones on that kernel, or the batch is not one
+        it quantizes ahead for. ``forward`` / ``forward_routed`` drop the quantization if
+        the experts did not take it."""
+        experts = self._sm120_native_experts()
+        if experts is None:
+            return None
+        return experts.prepare_normed_input(x, weight, eps, gain_center)
+
     @property
     def _prepared_nvfp4_experts(self) -> MuseSparkTrtLlmNvFp4Experts | None:
         quant_method = self.routed_experts.quant_method

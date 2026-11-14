@@ -45,6 +45,7 @@ _SOURCES = (
     "muse_nvfp4_split_gemm1.cu",
     "muse_moe_route.cu",
     "muse_nvfp4_decode_moe.cu",
+    "muse_spark_rmsnorm_nvfp4.cu",
     "muse_spark_expert_prefetch.cu",
     "muse_spark_l2_prefetch.cu",
     "muse_spark_router_gemv.cu",
@@ -516,6 +517,20 @@ def _register_decode_fakes() -> None:
         perm_idx: torch.Tensor,
         plan: torch.Tensor,
         flags: int = 0,
+    ) -> None:
+        return None
+
+    @torch.library.register_fake("_muse_C::rmsnorm_nvfp4_quant")
+    def _rmsnorm_nvfp4_quant_fake(
+        x: torch.Tensor,
+        w: torch.Tensor,
+        eps: float,
+        gain: float,
+        gs: torch.Tensor,
+        out: torch.Tensor,
+        xq_data: torch.Tensor,
+        xq_sf: torch.Tensor,
+        pdl: bool = False,
     ) -> None:
         return None
 
