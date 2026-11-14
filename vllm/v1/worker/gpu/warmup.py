@@ -268,10 +268,19 @@ def _warmup_kernels(
     # a uniform decode batch.
     prompt_len = decode_query_len + 1
     prompt_token_ids = list(range(prompt_len))
+    # Dynamic speculative decoding schedules K == 0 for large batches: that step takes
+    # a path of its own in the speculator (no draft step), so it is warmed too.
+    speculative_config = getattr(model_runner, "speculative_config", None)
+    warm_zero_k = (
+        num_spec_steps > 0
+        and speculative_config is not None
+        and speculative_config.uses_dynamic_speculative_decoding()
+    )
     # Upper bound on the decode steps built in `decode_steps` below.
     num_decode_steps = 1
     if not model_runner.is_pooling_model:
         num_decode_steps = 5 if num_spec_steps > 0 else 3
+        num_decode_steps += int(warm_zero_k)
     # Size the block allocation for the worst case: every request advancing
     # decode_query_len tokens on every decode step.
     decode_len = prompt_len + num_decode_steps * decode_query_len
@@ -398,8 +407,16 @@ def _warmup_kernels(
         req_computed = [prompt_len] * num_reqs
         req_blocks = [list(prefill_block_counts) for _ in range(num_reqs)]
 
-        def _run_decode_step(indices: list[int], spec_flags: list[bool]) -> None:
-            """Decode `indices`, spec-decoding the ones flagged in `spec_flags`."""
+        def _run_decode_step(
+            indices: list[int],
+            spec_flags: list[bool],
+            num_spec_tokens_to_schedule: int = num_spec_steps,
+        ) -> None:
+            """Decode `indices`, spec-decoding the ones flagged in `spec_flags`.
+
+            `num_spec_tokens_to_schedule` is the K the scheduler asks the speculator
+            for after this step (0 under dynamic speculative decoding at a large batch).
+            """
             cached_req_data = CachedRequestData.make_empty()
             cached_req_data.req_ids = [req_ids[i] for i in indices]
             cached_req_data.num_computed_tokens = [req_computed[i] for i in indices]
@@ -426,7 +443,7 @@ def _warmup_kernels(
                     step_spec_tokens[req_ids[i]] = [0] * num_spec_steps
 
             decode_output = SchedulerOutput.make_empty()
-            decode_output.num_spec_tokens_to_schedule = num_spec_steps
+            decode_output.num_spec_tokens_to_schedule = num_spec_tokens_to_schedule
             decode_output.scheduled_cached_reqs = cached_req_data
             decode_output.num_scheduled_tokens = step_num_scheduled_tokens
             decode_output.scheduled_spec_decode_tokens = step_spec_tokens
@@ -466,6 +483,10 @@ def _warmup_kernels(
 
         for step_indices, step_spec_flags in decode_steps:
             _run_decode_step(step_indices, step_spec_flags)
+        if warm_zero_k:
+            # K == 0 for the next step: the previous steps ran with the full K, so
+            # this one is the first to take the speculator's no-draft path.
+            _run_decode_step(all_indices, [False] * num_reqs, 0)
 
     # Clean up - process finish_req_ids.
     cleanup_output = SchedulerOutput.make_empty()

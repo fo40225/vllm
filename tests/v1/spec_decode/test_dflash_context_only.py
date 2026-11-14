@@ -59,7 +59,9 @@ class _DraftModel:
         self.calls.precompute.append((states.clone(), positions.clone(), slots))
 
 
-def _setup(monkeypatch, cls, *, dp_size: int = 1):
+def _setup(
+    monkeypatch, cls, *, dp_size: int = 1, enable_adaptive_verification: bool = False
+):
     calls = _Calls()
 
     def prepare_dflash_inputs(*args, **kwargs):
@@ -82,6 +84,7 @@ def _setup(monkeypatch, cls, *, dp_size: int = 1):
     spec.max_num_tokens = MAX_TOKENS
     spec.dp_size = dp_size
     spec.dp_rank = 0
+    spec.enable_adaptive_verification = enable_adaptive_verification
     spec.dcp_size = 1
     spec.pcp_manager = None
     spec.sample_from_anchor = False
@@ -219,3 +222,18 @@ def test_a_data_parallel_launch_skips_the_draft_step_at_k0(monkeypatch):
 
     assert calls.dispatch == 0
     assert len(calls.precompute) == 1
+
+
+def test_adaptive_verification_always_drafts(monkeypatch):
+    # The runner records the draft confidences after every propose and the acceptance
+    # estimator reads the draft step's features: a skipped draft step would leave both
+    # with the values of an older step.
+    spec, calls = _setup(
+        monkeypatch, DSparkSpeculator, enable_adaptive_verification=True
+    )
+
+    with pytest.raises(_Drafting):
+        _propose(spec, 0)
+
+    assert calls.dispatch == 1
+    assert calls.precompute == []

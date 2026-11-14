@@ -568,7 +568,12 @@ class DFlashSpeculator(DraftModelSpeculator):
                 num_reqs,
             )
 
-        if num_speculative_tokens == 0:
+        # Adaptive verification keeps drafting at K == 0: the runner records the draft
+        # confidences after every propose and the acceptance estimator reads the
+        # features of the draft step, so a skipped draft step would leave both with the
+        # values of an older step. The draft step also costs the same for every K > 0
+        # (one N-wide draft graph tier, only the verify width shrinks).
+        if num_speculative_tokens == 0 and not self.enable_adaptive_verification:
             # No drafts are needed: store the context K/V to keep the drafter in
             # sync, and skip the query pass.
             self._store_hidden_states(

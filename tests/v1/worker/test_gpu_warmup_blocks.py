@@ -84,11 +84,16 @@ def _make_runner(
     kv_cache_groups: list[KVCacheGroupSpec],
     num_lookahead_tokens: int,
     num_spec_steps: int = NUM_SPEC_STEPS,
+    dynamic_spec: bool = False,
 ) -> SimpleNamespace:
     """Stub model runner exposing only what the warmup entry points read."""
     return SimpleNamespace(
         num_speculative_steps=num_spec_steps,
-        speculative_config=SimpleNamespace() if num_spec_steps else None,
+        speculative_config=(
+            SimpleNamespace(uses_dynamic_speculative_decoding=lambda: dynamic_spec)
+            if num_spec_steps
+            else None
+        ),
         adaptive_verification=None,
         rejection_sampler=None,
         decode_query_len=num_spec_steps + 1,
@@ -180,6 +185,42 @@ def test_warmup_kernels_reserves_lookahead_blocks(num_spec_steps, extra_lookahea
 
     _assert_covers_lookahead(recorder.steps, num_lookahead_tokens)
     assert set(recorder.num_spec_tokens_to_schedule) == {num_spec_steps}
+
+
+@pytest.mark.parametrize("num_spec_steps", [1, 3, 7])
+def test_warmup_runs_a_decode_step_at_k0_under_dynamic_spec_decoding(num_spec_steps):
+    # K == 0 takes the speculator's no-draft path: warm it before serving.
+    num_lookahead_tokens = num_spec_steps + 1
+    recorder = _StepRecorder()
+
+    warmup_kernels(
+        _make_runner(
+            [_attention_group()],
+            num_lookahead_tokens,
+            num_spec_steps,
+            dynamic_spec=True,
+        ),
+        recorder.execute_model,
+        recorder.sample_tokens,
+    )
+
+    _assert_covers_lookahead(recorder.steps, num_lookahead_tokens)
+    assert set(recorder.num_spec_tokens_to_schedule) == {num_spec_steps, 0}
+    # The K == 0 step is a decode step of single tokens, and the last one.
+    assert recorder.num_spec_tokens_to_schedule[-1] == 0
+    assert recorder.steps[-1][2] == 1
+
+
+def test_warmup_runs_no_k0_step_without_dynamic_spec_decoding():
+    recorder = _StepRecorder()
+
+    warmup_kernels(
+        _make_runner([_attention_group()], NUM_SPEC_STEPS + 1),
+        recorder.execute_model,
+        recorder.sample_tokens,
+    )
+
+    assert set(recorder.num_spec_tokens_to_schedule) == {NUM_SPEC_STEPS}
 
 
 def test_mixed_warmup_reserves_lookahead_blocks():
