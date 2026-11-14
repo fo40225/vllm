@@ -1792,19 +1792,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # temperature (up to 1), top_p (up to 0.95) and top_k (40 to 64), bounds in
     # vllm/v1/worker/gpu/sample/topk_logits.py: the nucleus of the full path's top-k +
     # top-p kernel over the candidates; the other top_p requests keep the full path
-    # (reason "top-p-guard" in the route log). NOT equal to the full path on every row:
-    # that kernel finds its nucleus by an fp32 pivot search, and where the boundary
-    # splits a group of tied tokens it trims the group by a count and an exp / log round
-    # trip that depend on the bits of a sum over the whole row, which the candidates do
-    # not have. The kept sets then differ by 1-3 members of the group (each 0.1-0.5 % of
-    # the row's probability), in either direction, deterministically and identically on
-    # all ranks. Audit on 43,668 real decode rows: a differing row in 7e-5 (top_k 64)
-    # to 1.2e-4 (top_k 40) of the rows at temperature 1, top_p 0.95, fewer below, more
-    # above the class (top_p 0.99: 1.5e-3, temperature 1.5: 1.2e-3); no class has a zero
-    # rate: opt-in, the default 3 keeps every top_p request on the exact full path. The
-    # whole path is off for adaptive verification, a watermark, synthetic acceptance
-    # rates, a rejection sampler of another class, and a draft distribution narrower
-    # than the vocabulary; with a draft distribution of another width than the
+    # (reason "top-p-guard" in the route log), and so do all of them at level 3. NOT
+    # equal to the full path on every row: that kernel finds its nucleus by an fp32
+    # pivot search, and where the boundary splits a group of tied tokens it trims the
+    # group by a count and an exp / log round trip that depend on the bits of a sum over
+    # the whole row, which the candidates do not have. The two kept sets then differ by
+    # members of the group, in either direction, deterministically and identically on
+    # all ranks. Audit on 43,668 real decode rows: a differing row in 7e-5 (top_k 64) to
+    # 1.2e-4 (top_k 40) of the rows at temperature 1, top_p 0.95, fewer below, more above
+    # the class (top_p 0.99: 1.5e-3, temperature 1.5: 1.2e-3); no class has a zero rate.
+    # Usually 1-3 tokens of 0.1-0.5 % of the row's probability each (total variation
+    # 0.0035-0.0093 for a differing row: 17 of the 19 diagnosed in-class cases). The
+    # other 2 are an exact tie at a low temperature: two exactly tied top tokens carry
+    # the whole mass and top_p equals the mass of one of them (temperature 0.1, top_p
+    # 0.5, 2 of 43,668 rows); the candidates keep both, the full path one, and the total
+    # variation of that row is 0.5. No host state sees that case. The audited grid is
+    # temperature 0.05-2, top_p 0.5-0.99, top_k 10-64 at K = 64: top_p below 0.5,
+    # temperature below 0.05 and top_k above 64 (a raised K) are inside the class and
+    # unaudited. The whole path is off for adaptive verification, a watermark, synthetic
+    # acceptance rates, a rejection sampler of another class, and a draft distribution
+    # narrower than the vocabulary; with a draft distribution of another width than the
     # vocabulary, or without one, only the greedy steps take it. Needs
     # VLLM_MUSE_SPARK_SM120_TOPK_LOGITS=1. The share of verified steps on the path and
     # the reasons of the others are logged every 30 s ("steps with drafts"; those steps

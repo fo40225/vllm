@@ -649,18 +649,32 @@ def topk_merge_sample(
 # The candidate kernel's kept set differs from the full path's top-k + top-p kernel
 # (Qrita) at a nucleus boundary that splits a group of tied tokens: Qrita trims the
 # group by an fp32 count and a round-trip test that depend on the bits of a sum over
-# the whole row, which the candidates do not have. The two then differ by 1-3 members
-# of the group (each 0.1-0.5 % of the row's probability), in either direction. No class
-# has a zero rate. Audit on 43,668 real decode rows (two independent captures, 22,776
-# and 20,892, in contexts of temperature 0.6-1.5, flat rows included), kept sets
+# the whole row, which the candidates do not have. The two then differ by members of
+# the group, in either direction, deterministically and identically on all ranks. No
+# class has a zero rate. Audit on 43,668 real decode rows (two independent captures,
+# 22,776 and 20,892, in contexts of temperature 0.6-1.5, flat rows included), kept sets
 # compared row by row against Qrita: a differing row in 7e-5 (top_k 64) to 1.2e-4
 # (top_k 40) of the rows at the corner temperature 1, top_p 0.95, fewer below it. Above
 # it the rate grows: top_p 0.97 3e-4, temperature 1.25 at top_p 0.95 4e-4, temperature
-# 1.5 1.2e-3, top_p 0.99 1.5e-3, temperature 2 3e-3. The bounds are the largest audited
-# class with a worst-cell rate of about 1e-4 per row. The lower bound on top_k is a
-# margin: real rows of top_k 10 to 32 differ as rarely, but synthetic rows of almost
-# equal logits (tie groups of tens of tokens across the k-th place) differ on 0.3-0.6 %
-# of the rows at top_k 10 and 20, and on none at 40 and 64.
+# 1.5 1.2e-3, top_p 0.99 1.5e-3, temperature 2 3e-3.
+#
+# Size of the difference inside the class (19 diagnosed cases): 17 of them are 1-3
+# tokens of one tie group, 0.1-0.5 % of the row's probability each, a total variation
+# of 0.0035-0.0093 for the row. The other 2 are an exact tie: at a low temperature two
+# exactly tied top tokens carry the whole mass and top_p equals the mass of one of them
+# (temperature 0.1, top_p 0.5, top_k 64). The candidates keep both (the exact float64
+# nucleus) and Qrita keeps one, decided by the bits of its sum: the total variation of
+# that row is 0.5. That is 2 of 43,668 rows (4.6e-5) at that cell, an expected total
+# variation of about 2e-5 per row there against about 7e-7 at the temperature 1 / top_p
+# 0.95 corner. No host state sees the case: the bounds below do not exclude it.
+#
+# The bounds are the largest audited class with a worst-cell rate of about 1e-4 per
+# row. The audited grid is temperature 0.05-2, top_p 0.5-0.99, top_k 10-64 at K = 64;
+# top_p below 0.5, temperature below 0.05 and (with a raised TOPK_LOGITS_K) top_k above
+# 64 are inside the class but were not audited. The lower bound on top_k is a margin:
+# real rows of top_k 10 to 32 differ as rarely, but synthetic rows of almost equal
+# logits (tie groups of tens of tokens across the k-th place) differ on 0.3-0.6 % of the
+# rows at top_k 10 and 20, and on none at 40 and 64.
 TOPP_CANDIDATE_MAX_TEMPERATURE = 1.0
 TOPP_CANDIDATE_MAX_TOP_P = 0.95
 TOPP_CANDIDATE_MIN_TOP_K = 40
