@@ -344,6 +344,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # model_state exists (num_new_sampled_tokens_per_step from ModelState).
         self.sampler: Sampler | None = None
         self.rejection_sampler: RejectionSampler | None = None
+        # The aux taps of the memory-profile forward, kept for the dummy verify step
+        # (`profile_run`): a real step holds them from the forward to the draft step.
+        self._profile_aux_hidden_states: list[torch.Tensor] | None = None
         self.batch_sharder: BatchSharder | None = None
         # Candidates per TP rank when the batch can be sampled from the top-k logits of
         # each rank (Sampler.sample_topk_logits), 0 when never.
@@ -873,6 +876,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         valid_dummy_state_slots: bool = False,
         randomize_inputs: bool = False,
         profile_ubatches: bool = False,
+        keep_aux_hidden_states: bool = False,
         **kwargs,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         if skip_attn and not is_profile:
@@ -1013,6 +1017,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.step_timing.drafter_end()
 
         assert hidden_states is not None  # Last PP rank always has hidden_states
+        if keep_aux_hidden_states:
+            self._profile_aux_hidden_states = aux_hidden_states
         sample_hidden_states = hidden_states[input_batch.logits_indices]
         return hidden_states, sample_hidden_states
 
@@ -1078,6 +1084,51 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
                 topk = self.model.compute_topk_logits(hidden_states, ties)
                 self.sampler.sample_topk_logits(topk, dummy_input_batch)
+
+    @torch.inference_mode()
+    def _dummy_rejection_sampler_run(self, hidden_states: torch.Tensor) -> None:
+        """Run the rejection sampler once on the largest batch a step can verify.
+
+        A speculative step verifies ``decode_query_len`` rows of every request:
+        ``max_num_reqs * decode_query_len`` rows of logits go through the
+        full-vocabulary passes of the sampler (processed logits, probabilities), that
+        many times the rows of ``_dummy_sampler_run``. The rows come from the first
+        rows of ``hidden_states``; the values do not matter, the shapes do.
+        """
+        rejection_sampler = self.rejection_sampler
+        assert rejection_sampler is not None and self.speculator is not None
+        if rejection_sampler.watermark_key is not None:
+            # The watermark contexts need the request state of real tokens.
+            return
+        query_len = self.decode_query_len
+        num_reqs = min(self.max_num_reqs, hidden_states.shape[0] // query_len)
+        if query_len < 2 or num_reqs == 0:
+            return
+        num_logits = num_reqs * query_len
+        batch = InputBatch.make_dummy(num_reqs, num_logits, self.input_buffers)
+        cu_num_logits_np = np.arange(num_reqs + 1, dtype=np.int32) * query_len
+        batch = replace(
+            batch,
+            expanded_idx_mapping=batch.idx_mapping.repeat_interleave(query_len),
+            expanded_local_pos=torch.arange(
+                query_len, dtype=torch.int32, device=self.device
+            ).repeat(num_reqs),
+            num_draft_tokens=num_reqs * (query_len - 1),
+            num_draft_tokens_per_req=np.full(num_reqs, query_len - 1, dtype=np.int32),
+            logits_indices=torch.arange(
+                num_logits, dtype=torch.int64, device=self.device
+            ),
+            cu_num_logits=torch.from_numpy(cu_num_logits_np).to(self.device),
+            cu_num_logits_np=cu_num_logits_np,
+        )
+        logits = self.model.compute_logits(hidden_states[:num_logits])
+        # Adaptive verification compacts a batch its budget has not seen yet.
+        adaptive = rejection_sampler.enable_adaptive_verification
+        rejection_sampler.enable_adaptive_verification = False
+        try:
+            rejection_sampler(logits, batch, self.speculator.draft_logits, None)
+        finally:
+            rejection_sampler.enable_adaptive_verification = adaptive
 
     def _resolve_topk_logits_k(self) -> int:
         """Candidates per TP rank of the top-k logits sampling, 0 when it is off.
@@ -1180,6 +1231,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             skip_attn=True,
             is_profile=True,
             randomize_inputs=randomize_inputs,
+            keep_aux_hidden_states=True,
         )
 
         # Only run sampler/pooler on last PP rank (non-last ranks return None).
@@ -1187,8 +1239,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             assert sample_hidden_states is not None
             if self.pooling_runner is None:
                 self._dummy_sampler_run(sample_hidden_states)
+                if self.speculator is not None and self.rejection_sampler is not None:
+                    # The verify step of a full decode batch, with the hidden states
+                    # and aux taps of the largest forward still alive as in a real one.
+                    assert hidden_states is not None
+                    self._dummy_rejection_sampler_run(hidden_states)
             else:
                 self._dummy_pooler_run(hidden_states)
+        self._profile_aux_hidden_states = None
 
         torch.accelerator.synchronize()
         del hidden_states, sample_hidden_states
