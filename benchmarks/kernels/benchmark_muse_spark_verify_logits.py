@@ -23,6 +23,18 @@ included), with the L2 flushed and the ranks synchronized before each step. The 
 are right for about 3 of 7 steps; the outputs of the two paths are compared once per
 configuration (greedy: identical; t1k64: the share of requests with the same tokens).
 
+Scenarios of the per-request levels (VLLM_MUSE_SPARK_SM120_VERIFY_TOPK_LOGITS 3 / 4),
+temperature 1 and top_k 64 for every request:
+
+  minp    every request has min_p 0.05: old against ``l3`` (the candidate kernel with
+          the threshold)
+  toppall every request has top_p 0.95: old against ``l4`` (candidates and the
+          nucleus); at level 3 every request needs the logits: the step is the old one
+  mixtp   one request in 16 has top_p 0.95 (the others none): old (the whole step on
+          the logits) against ``l3`` (one lm_head projection, the candidates of 15 of
+          16 requests, the logits of the others only, two verifiers on request views,
+          the merge: all the host work of the split included) and ``l4`` (candidates)
+
     runsrc_topo.sh benchmarks/kernels/benchmark_muse_spark_verify_logits.py \\
         --out rows.jsonl
 """
@@ -90,10 +102,13 @@ def _inputs(num_reqs: int, weight: torch.Tensor, cap, gather, logit_std: float):
     )
 
 
-def _steps(ctx, num_reqs: int, sampled_rows: bool, weight, cap, gather, marks, sink):
-    """The two verify steps as closures: ``old`` (full logits) and ``new`` (top-K)."""
+def _steps(ctx, num_reqs: int, scenario: str, weight, cap, gather, marks, sink):
+    """The verify steps of a scenario as closures: ``old`` (full logits) and the paths
+    that replace it (``new`` for the candidates of levels 1 / 2, ``l3`` and ``l4``)."""
     from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
     from vllm.v1.worker.gpu.sample.gumbel import apply_temperature
+    from vllm.v1.worker.gpu.sample.min_p import apply_min_p
+    from vllm.v1.worker.gpu.sample.output import SamplerOutput
     from vllm.v1.worker.gpu.sample.topk_logits import (
         TopKLogits,
         local_topk_candidates,
@@ -102,18 +117,44 @@ def _steps(ctx, num_reqs: int, sampled_rows: bool, weight, cap, gather, marks, s
         rejection_sample,
     )
     from vllm.v1.worker.gpu.spec_decode.topk_rejection import topk_verify
+    from vllm.v1.worker.gpu.spec_decode.verify_split import (
+        SplitIndices,
+        merge_outputs,
+        sampler_view,
+    )
 
     dev = "cuda"
+    sampled_rows = scenario != "greedy"
     temperature = torch.full((num_reqs,), 1.0 if sampled_rows else 0.0, device=dev)
     top_k = torch.full((num_reqs,), 64 if sampled_rows else VOCAB, device=dev)
     top_k = top_k.to(torch.int32)
+    min_p = torch.full((num_reqs,), 0.05 if scenario == "minp" else 0.0, device=dev)
+    top_p = torch.ones(num_reqs, device=dev)
+    if scenario == "toppall":
+        top_p.fill_(0.95)
+    elif scenario == "mixtp":
+        top_p[::16] = 0.95
+    use_min_p, use_top_p = scenario == "minp", scenario in ("toppall", "mixtp")
     k = 64 if sampled_rows else 1
-    top_k_rows = top_k[ctx.expanded_idx.long()]
 
     def mark():
         e = torch.cuda.Event(enable_timing=True)
         e.record()
         marks.append(e)
+
+    def process(logits, expanded_idx):
+        """apply_sampling_params as the rejection sampler runs it."""
+        logits = torch.empty_like(logits, dtype=torch.float32).copy_(logits)
+        apply_temperature(logits, expanded_idx, temperature)
+        if use_min_p:
+            apply_min_p(logits, expanded_idx, min_p)
+        if sampled_rows:
+            logits = apply_top_k_top_p(
+                logits,
+                top_k[expanded_idx.long()],
+                top_p[expanded_idx.long()] if use_top_p else None,
+            )
+        return logits
 
     def old_step():
         local = torch.nn.functional.linear(ctx.hidden, weight)
@@ -122,10 +163,7 @@ def _steps(ctx, num_reqs: int, sampled_rows: bool, weight, cap, gather, marks, s
         mark()
         logits = cap(logits)
         if sampled_rows:
-            # apply_sampling_params: fp32 copy, temperature 1 skipped, top-k.
-            logits = torch.empty_like(logits, dtype=torch.float32).copy_(logits)
-            apply_temperature(logits, ctx.expanded_idx, temperature)
-            logits = apply_top_k_top_p(logits, top_k_rows, None)
+            logits = process(logits, ctx.expanded_idx)
         mark()
         sink["old"] = rejection_sample(
             logits,
@@ -145,39 +183,143 @@ def _steps(ctx, num_reqs: int, sampled_rows: bool, weight, cap, gather, marks, s
         )
         mark()
 
-    def new_step():
+    def candidate_step(name):
+        def step():
+            local = torch.nn.functional.linear(ctx.hidden, weight)
+            mark()
+            words = local_topk_candidates(local, k)
+            words = gather(words.view(torch.bfloat16), dim=0)
+            mark()
+            topk = TopKLogits(
+                words=words,
+                capped=cap(words.contiguous()),
+                num_rows=ctx.rows,
+                k=k,
+                tp_size=TP,
+                shard_size=VOCAB // TP,
+            )
+            mark()
+            sink[name] = topk_verify(
+                topk,
+                ctx.draft_sampled,
+                ctx.pos,
+                ctx.cu,
+                ctx.idx_mapping,
+                ctx.expanded_idx,
+                ctx.expanded_pos,
+                temperature,
+                top_k,
+                ctx.seeds,
+                STEPS,
+                draft_logits=ctx.draft_logits,
+                has_sampled=sampled_rows,
+                min_p=min_p if use_min_p else None,
+                top_p=top_p if use_top_p else None,
+            )
+            mark()
+
+        return step
+
+    cu_np = (torch.arange(num_reqs + 1) * (STEPS + 1)).numpy().astype("int32")
+    batch = SimpleNamespace(
+        req_ids=[str(r) for r in range(num_reqs)],
+        num_reqs=num_reqs,
+        num_reqs_after_padding=num_reqs,
+        idx_mapping=ctx.idx_mapping.long(),
+        idx_mapping_np=ctx.idx_mapping.cpu().numpy(),
+        expanded_idx_mapping=ctx.expanded_idx,
+        expanded_local_pos=ctx.expanded_pos,
+        num_scheduled_tokens=cu_np[1:] - cu_np[:-1],
+        num_tokens=ctx.rows,
+        num_tokens_after_padding=ctx.rows,
+        num_draft_tokens=num_reqs * STEPS,
+        num_draft_tokens_per_req=None,
+        seq_lens=torch.full((num_reqs,), 1000, dtype=torch.int32, device=dev),
+        seq_lens_cpu_upper_bound=torch.full((num_reqs,), 1000, dtype=torch.int32),
+        input_ids=ctx.draft_sampled,
+        positions=ctx.pos,
+        logits_indices=torch.arange(ctx.rows, device=dev),
+        cu_num_logits=ctx.cu,
+        cu_num_logits_np=cu_np,
+    )
+    cand_reqs = [r for r in range(num_reqs) if r % 16 != 0]
+    full_reqs = [r for r in range(num_reqs) if r % 16 == 0]
+
+    def split_step():
+        """Level 3 of a mixed batch: the host work of the split included."""
+        import numpy as np
+
+        cand = SplitIndices(batch, np.asarray(cand_reqs), torch.device(dev))
+        full = SplitIndices(batch, np.asarray(full_reqs), torch.device(dev))
         local = torch.nn.functional.linear(ctx.hidden, weight)
         mark()
-        words = local_topk_candidates(local, k)
+        words = local_topk_candidates(local.index_select(0, cand.rows_t), k)
         words = gather(words.view(torch.bfloat16), dim=0)
+        logits = gather(local.index_select(0, full.rows_t), dim=-1)
         mark()
         topk = TopKLogits(
             words=words,
             capped=cap(words.contiguous()),
-            num_rows=ctx.rows,
+            num_rows=cand.rows_t.shape[0],
             k=k,
             tp_size=TP,
             shard_size=VOCAB // TP,
         )
+        logits = cap(logits)
         mark()
-        sink["new"] = topk_verify(
+        vc, vf = sampler_view(batch, cand), sampler_view(batch, full)
+        cand_out = topk_verify(
             topk,
-            ctx.draft_sampled,
-            ctx.pos,
-            ctx.cu,
-            ctx.idx_mapping,
-            ctx.expanded_idx,
-            ctx.expanded_pos,
+            vc.input_ids,
+            vc.positions,
+            vc.cu_num_logits,
+            vc.idx_mapping,
+            vc.expanded_idx_mapping,
+            vc.expanded_local_pos,
             temperature,
             top_k,
             ctx.seeds,
             STEPS,
             draft_logits=ctx.draft_logits,
-            has_sampled=sampled_rows,
+            has_sampled=True,
         )
+        full_out = rejection_sample(
+            process(logits, vf.expanded_idx_mapping),
+            ctx.draft_logits,
+            vf.input_ids,
+            vf.cu_num_logits,
+            vf.positions,
+            vf.idx_mapping,
+            vf.expanded_idx_mapping,
+            vf.expanded_local_pos,
+            temperature,
+            ctx.seeds,
+            STEPS,
+            None,
+            use_fp64=False,
+            use_block_verification=True,
+        )
+
+        def wrap(out):
+            return SamplerOutput(out[0], None, None, out[1], torch.zeros_like(out[1]))
+
+        merged = merge_outputs(
+            num_reqs, [(cand, wrap(cand_out)), (full, wrap(full_out))]
+        )
+        sink["l3"] = (merged.sampled_token_ids, merged.num_sampled)
         mark()
 
-    return mark, {"old": old_step, "new": new_step}
+    steps = {"old": old_step}
+    if scenario in ("greedy", "t1k64"):
+        steps["new"] = candidate_step("new")
+    elif scenario == "minp":
+        steps["l3"] = candidate_step("l3")
+    elif scenario == "toppall":
+        steps["l4"] = candidate_step("l4")
+    else:
+        steps["l3"] = split_step
+        steps["l4"] = candidate_step("l4")
+    return mark, steps
 
 
 def _worker(rank: int, port: int, args) -> None:
@@ -215,13 +357,12 @@ def _worker(rank: int, port: int, args) -> None:
             num_reqs, weight, cap, tensor_model_parallel_all_gather, args.logit_std
         )
         for scenario in args.scenarios:
-            sampled_rows = scenario != "greedy"
             marks: list = []
             sink: dict = {}
             mark, steps = _steps(
                 ctx,
                 num_reqs,
-                sampled_rows,
+                scenario,
                 weight,
                 cap,
                 tensor_model_parallel_all_gather,
@@ -254,14 +395,20 @@ def _worker(rank: int, port: int, args) -> None:
                 row[f"{name}_total_us"] = round(total, 1)
                 row[f"{name}_stage_us"] = [round(x, 1) for x in stage]
             old_s, old_n = sink["old"]
-            new_s, new_n = sink["new"]
-            same = [
-                old_s[r, : int(old_n[r])].tolist() == new_s[r, : int(new_n[r])].tolist()
-                for r in range(num_reqs)
-            ]
-            row["same_tokens_share"] = round(sum(same) / num_reqs, 4)
             row["mean_accepted"] = round(float(old_n.float().mean()) - 1, 2)
-            row["gain_us"] = round(row["old_total_us"] - row["new_total_us"], 1)
+            for name in steps:
+                if name == "old":
+                    continue
+                new_s, new_n = sink[name]
+                same = [
+                    old_s[r, : int(old_n[r])].tolist()
+                    == new_s[r, : int(new_n[r])].tolist()
+                    for r in range(num_reqs)
+                ]
+                row[f"{name}_same_tokens_share"] = round(sum(same) / num_reqs, 4)
+                row[f"{name}_gain_us"] = round(
+                    row["old_total_us"] - row[f"{name}_total_us"], 1
+                )
             if rank == 0:
                 print(json.dumps(row), flush=True)
                 rows_out.append(row)
@@ -279,7 +426,7 @@ def main() -> None:
         "--scenarios",
         nargs="+",
         default=["greedy", "t1k64"],
-        choices=["greedy", "t1k64"],
+        choices=["greedy", "t1k64", "minp", "toppall", "mixtp"],
     )
     parser.add_argument("--iters", type=int, default=40)
     parser.add_argument(
