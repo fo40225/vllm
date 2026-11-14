@@ -4,6 +4,7 @@
 
 import torch
 
+from vllm.models.muse_spark.common.ops import muse_pdl_enabled
 from vllm.triton_utils import tl, triton
 
 
@@ -32,12 +33,19 @@ def _post_expert_finalize_kernel(
     BLOCK_H: tl.constexpr,
     HAS_WEIGHT: tl.constexpr,
     WEIGHT_FIRST: tl.constexpr,
+    USE_PDL: tl.constexpr,
 ):
     t = tl.program_id(0)
     k = tl.arange(0, BLOCK_K)
     offs = tl.arange(0, BLOCK_H)
     k_mask = k < K
     h_mask = offs < H
+    # The weight is a parameter: load it before the wait for the predecessor
+    # (the experts), which writes the rows, the route map and the top-k.
+    if HAS_WEIGHT:
+        w = tl.load(w_ptr + offs, mask=h_mask, other=0.0).to(tl.float32) + gain_center
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
     tw = tl.load(tw_ptr + t * stride_twt + k, mask=k_mask, other=0.0).to(tl.float32)
     local = k_mask
     if HAS_EXPERT_MAP:
@@ -56,10 +64,8 @@ def _post_expert_finalize_kernel(
         mask=local[:, None] & h_mask[None, :],
         other=0.0,
     ).to(tl.float32)
-    if HAS_WEIGHT:
-        w = tl.load(w_ptr + offs, mask=h_mask, other=0.0).to(tl.float32) + gain_center
-        if WEIGHT_FIRST:
-            x = x * w[None, :]
+    if HAS_WEIGHT and WEIGHT_FIRST:
+        x = x * w[None, :]
     scale = tl.rsqrt(tl.sum(x * x, axis=1) / H + eps) * tw
     acc = tl.sum(x * scale[:, None], axis=0)
     if HAS_WEIGHT and not WEIGHT_FIRST:
@@ -93,12 +99,15 @@ def _post_expert_finalize_loop_kernel(
     BLOCK_H: tl.constexpr,
     HAS_WEIGHT: tl.constexpr,
     WEIGHT_FIRST: tl.constexpr,
+    USE_PDL: tl.constexpr,
 ):
     t = tl.program_id(0)
     offs = tl.arange(0, BLOCK_H)
     mask = offs < H
     if HAS_WEIGHT:
         w = tl.load(w_ptr + offs, mask=mask, other=0.0).to(tl.float32) + gain_center
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
     acc = tl.zeros([BLOCK_H], dtype=tl.float32)
     x_row = x_ptr + t * stride_xt
     for k in range(K):
@@ -167,6 +176,7 @@ def fused_post_expert_finalize(
         _post_expert_finalize_kernel if tiled else _post_expert_finalize_loop_kernel
     )
     tile_kwargs = {"BLOCK_K": block_k} if tiled else {}
+    enable_pdl = muse_pdl_enabled()
     kernel[(T,)](
         routed,
         weight if weight is not None else routed,
@@ -190,7 +200,9 @@ def fused_post_expert_finalize(
         BLOCK_H=block_h,
         HAS_WEIGHT=weight is not None,
         WEIGHT_FIRST=weight_first,
+        USE_PDL=enable_pdl,
         num_warps=8 if (block_k * block_h if tiled else block_h) >= 4096 else 4,
         **tile_kwargs,
+        **({"launch_pdl": True} if enable_pdl else {}),
     )
     return out

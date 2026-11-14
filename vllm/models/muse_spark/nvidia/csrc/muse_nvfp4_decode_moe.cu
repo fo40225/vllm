@@ -76,7 +76,7 @@ constexpr int kUnitsPerEntry = 256;    // 4096 / 16 tiles of 16 rows
 constexpr int kFlagTwoLaunch = 1;       // plan B: K1 + K2 instead of k_persistent
 constexpr int kFlagCtlMemset = 2;       // zero the counters with a memset node
 constexpr int kFlagZeroNonLocal = 4;    // zero the rows of non-local routes
-constexpr int kFlagNoPdl = 8;           // plan B: K2 is a plain launch (no PDL)
+constexpr int kFlagNoPdl = 8;           // no PDL: K2 / k_persistent are plain launches
 
 // ---- shared memory layout ---------------------------------------------------
 #ifndef MUSE_DECODE_STAGES
@@ -851,6 +851,24 @@ void ensure_smem_checked(K kernel, int dynamic_bytes, std::atomic<int>& done) {
   ensure_smem(kernel, dynamic_bytes, done);
 }
 
+// Launches `kernel` as a programmatic dependent of the previous kernel of the
+// stream: it may start before the predecessor has finished, and must execute
+// griddepcontrol.wait before it reads anything the predecessor writes.
+void launch_dependent(void (*kernel)(const DecodeParams), const DecodeParams& p,
+                      int grid, int smem, cudaStream_t stream) {
+  cudaLaunchConfig_t cfg{};
+  cfg.gridDim = dim3(grid);
+  cfg.blockDim = dim3(kBlockThreads);
+  cfg.dynamicSmemBytes = smem;
+  cfg.stream = stream;
+  cudaLaunchAttribute attr[1];
+  attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attr[0].val.programmaticStreamSerializationAllowed = 1;
+  cfg.attrs = attr;
+  cfg.numAttrs = 1;
+  C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, kernel, p));
+}
+
 template <int T_PAD>
 void launch_persistent(const DecodeParams& p, int grid, cudaStream_t stream) {
   static std::atomic<int> attr{0};
@@ -859,8 +877,12 @@ void launch_persistent(const DecodeParams& p, int grid, cudaStream_t stream) {
   if (p.flags & kFlagCtlMemset) {
     C10_CUDA_CHECK(cudaMemsetAsync(p.ctl, 0, kCtlWords * sizeof(unsigned), stream));
   }
-  k_persistent<T_PAD><<<grid, kBlockThreads, kSmem, stream>>>(p);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  if (!(p.flags & kFlagNoPdl)) {
+    launch_dependent(k_persistent<T_PAD>, p, grid, kSmem, stream);
+  } else {
+    k_persistent<T_PAD><<<grid, kBlockThreads, kSmem, stream>>>(p);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
 }
 
 template <int T_PAD>
@@ -877,17 +899,7 @@ void launch_decode(const DecodeParams& p, int grid, cudaStream_t stream) {
   k1_gemm1<T_PAD><<<grid, kBlockThreads, kSmem1, stream>>>(p);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   if (!(p.flags & kFlagNoPdl)) {
-    cudaLaunchConfig_t cfg{};
-    cfg.gridDim = dim3(grid);
-    cfg.blockDim = dim3(kBlockThreads);
-    cfg.dynamicSmemBytes = kSmem2;
-    cfg.stream = stream;
-    cudaLaunchAttribute attr[1];
-    attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attr[0].val.programmaticStreamSerializationAllowed = 1;
-    cfg.attrs = attr;
-    cfg.numAttrs = 1;
-    C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, k2_gemm2<T_PAD>, p));
+    launch_dependent(k2_gemm2<T_PAD>, p, grid, kSmem2, stream);
   } else {
     k2_gemm2<T_PAD><<<grid, kBlockThreads, kSmem2, stream>>>(p);
     C10_CUDA_KERNEL_LAUNCH_CHECK();

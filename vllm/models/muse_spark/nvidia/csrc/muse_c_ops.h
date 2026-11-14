@@ -97,7 +97,9 @@ void moe_route_local(at::Tensor const& topk_ids,
 //   the persistent kernel's counters: zero it once, every launch leaves it zero.
 //   dbg_acc optionally receives the raw GEMM1 sums. flags: 1 = two launches
 //   (plan B), 2 = zero the counters with a memset node first, 4 = zero the rows
-//   of non-local routes, 8 = with 1: no programmatic dependent launch; bits 16.. override the grid size (0 = one CTA per SM).
+//   of non-local routes, 8 = no programmatic dependent launch (of K2 with 1, of
+//   the persistent kernel otherwise); bits 16.. override the grid size (0 = one
+//   CTA per SM).
 //   xq_data [T, 2048] u8 / xq_sf [T, 256] u8 (linear scales), when given, are the
 //   activations quantized by the stock op (ops.scaled_fp4_quant with
 //   is_sf_swizzled_layout=False and gs[0]) and replace the in-kernel quantization.

@@ -27,6 +27,7 @@ from dataclasses import dataclass
 import torch
 
 from vllm.logger import init_logger
+from vllm.models.muse_spark.common.ops import muse_pdl_enabled
 from vllm.models.muse_spark.nvidia.ops import muse_c
 
 logger = init_logger(__name__)
@@ -40,6 +41,7 @@ MUSE_INTERMEDIATE = 4096
 MUSE_TOP_K = 8
 # Flags of the op, see muse_c_ops.h.
 _FLAG_ZERO_NON_LOCAL = 4
+_FLAG_NO_PDL = 8
 
 # Set once an engine could not be set up: the other layers would fail alike.
 _setup_failure: str | None = None
@@ -254,7 +256,9 @@ class MuseDecodeMoE:
             scratch.plan,
             scratch.ctl,
             None,
-            self._flags,
+            # Launched as a programmatic dependent of the routing kernel (it
+            # waits for it before it reads the ids) unless PDL is off.
+            self._flags | (0 if muse_pdl_enabled() else _FLAG_NO_PDL),
             None,
             None,
         )

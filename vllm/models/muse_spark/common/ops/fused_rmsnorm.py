@@ -4,6 +4,7 @@
 
 import torch
 
+from vllm.models.muse_spark.common.ops import muse_pdl_enabled
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
@@ -89,15 +90,15 @@ def _rmsnorm_fwd_kernel(
     bT: tl.constexpr,
     bD: tl.constexpr,
     USE_PDL: tl.constexpr,
+    EARLY_TRIGGER: tl.constexpr,
 ):
     """RMSNorm over the last dim of ``[T, D]``; fp32 math, the store rounds once.
 
     ``KAHAN`` uses compensated fp32 instead of fp64 for the cross-tile sum
-    (Blackwell runs fp64 at 1/64 rate).
+    (Blackwell runs fp64 at 1/64 rate). ``EARLY_TRIGGER`` lets a programmatic
+    successor launch as soon as every program is past its wait: the successor
+    waits for this kernel to finish before it reads anything.
     """
-    if USE_PDL:
-        tl.extra.cuda.gdc_wait()
-
     t_idx = tl.program_id(0)
     t = t_idx * bT + tl.arange(0, bT)
     tm = t < T
@@ -108,9 +109,15 @@ def _rmsnorm_fwd_kernel(
         idx = t[:, None] * D + d[None, :]
         mask = tm[:, None] & dm[None, :]
 
-        x = tl.load(x_ptr + idx, mask=mask, other=0.0).to(tl.float32)
+        # The weight is a parameter: load it before the wait, so that the load
+        # overlaps the end of the predecessor.
         if HAS_WEIGHT:
             w = _effective_weight(w_ptr, d, dm, gain_center)
+        if USE_PDL:
+            tl.extra.cuda.gdc_wait()
+            if EARLY_TRIGGER:
+                tl.extra.cuda.gdc_launch_dependents()
+        x = tl.load(x_ptr + idx, mask=mask, other=0.0).to(tl.float32)
 
         if INPUT_SCALE and HAS_WEIGHT:
             x = x * w[None, :]
@@ -140,6 +147,10 @@ def _rmsnorm_fwd_kernel(
                 y = y * w[None, :]
             tl.store(y_ptr + idx, y.to(y_ptr.dtype.element_ty), mask=mask)
     else:
+        if USE_PDL:
+            tl.extra.cuda.gdc_wait()
+            if EARLY_TRIGGER:
+                tl.extra.cuda.gdc_launch_dependents()
         if KAHAN:
             sum_sq = tl.zeros([bT], dtype=tl.float32)
             compensation = tl.zeros([bT], dtype=tl.float32)
@@ -342,6 +353,7 @@ def fused_rmsnorm_fwd(
         bD=bD,
         num_warps=num_warps,
         USE_PDL=enable_pdl,
+        EARLY_TRIGGER=enable_pdl and muse_pdl_enabled(),
         **({"launch_pdl": True} if enable_pdl else {}),
     )
     return y.view(input_shape)
@@ -376,6 +388,7 @@ def _norm_residual_norm_fwd_kernel(
     PER_CHANNEL: tl.constexpr,
     bT: tl.constexpr,
     bD: tl.constexpr,
+    USE_PDL: tl.constexpr,
 ):
     """One residual boundary: post-norm, gated add, and the next pre-norm."""
     t = tl.program_id(0) * bT + tl.arange(0, bT)
@@ -386,8 +399,9 @@ def _norm_residual_norm_fwd_kernel(
     mask = tm[:, None] & dm[None, :]
 
     # All loads before the first reduction: at decode this is latency-bound.
-    x = tl.load(branch_ptr + idx, mask=mask, other=0.0).to(tl.float32)
-    stream = tl.load(stream_ptr + idx, mask=mask, other=0.0).to(tl.float32)
+    # The parameters go first, ahead of the wait for the predecessor (the
+    # all-reduce or all-gather that produces the branch): the stream and the
+    # branch are written by kernels of the step and are loaded after it.
     if PER_CHANNEL:
         beta = tl.load(beta_ptr + d, mask=dm, other=0.0)[None, :]
     else:
@@ -401,6 +415,10 @@ def _norm_residual_norm_fwd_kernel(
         post_w = _effective_weight(post_w_ptr, d, dm, post_gain_center)
     if PRE_HAS_WEIGHT:
         pre_w = _effective_weight(pre_w_ptr, d, dm, pre_gain_center)
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+    x = tl.load(branch_ptr + idx, mask=mask, other=0.0).to(tl.float32)
+    stream = tl.load(stream_ptr + idx, mask=mask, other=0.0).to(tl.float32)
 
     if POST_INPUT_SCALE and POST_HAS_WEIGHT:
         x = x * post_w[None, :]
@@ -528,6 +546,7 @@ def fused_norm_residual_norm_fwd(
     if current_platform.is_rocm():
         # 64-thread wavefronts: 32 warps would exceed the 1024-thread limit.
         num_warps = min(num_warps, 16)
+    enable_pdl = muse_pdl_enabled()
     _norm_residual_norm_fwd_kernel[(triton.cdiv(T, bT),)](
         branch,
         stream,
@@ -554,5 +573,7 @@ def fused_norm_residual_norm_fwd(
         bT=bT,
         bD=bD,
         num_warps=num_warps,
+        USE_PDL=enable_pdl,
+        **({"launch_pdl": True} if enable_pdl else {}),
     )
     return out.view(input_shape), new_stream.view(input_shape)

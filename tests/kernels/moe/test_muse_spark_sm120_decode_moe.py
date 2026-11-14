@@ -24,6 +24,7 @@ from vllm.models.muse_spark.nvidia.sm120_nvfp4_moe import (
     fold_sm120_nvfp4_scales,
 )
 from vllm.platforms import current_platform
+from vllm.triton_utils import tl, triton
 
 if not current_platform.is_device_capability_family(120):
     pytest.skip("Requires an SM120 GPU", allow_module_level=True)
@@ -777,7 +778,9 @@ def test_launch_variants_are_bitwise_equal(layer: _Layer, t: int) -> None:
         variants = {
             "two_launch": dict(flags=FLAG_TWO_LAUNCH),
             "two_launch_no_pdl": dict(flags=FLAG_TWO_LAUNCH | FLAG_NO_PDL),
+            "no_pdl": dict(flags=FLAG_NO_PDL),
             "memset": dict(flags=FLAG_CTL_MEMSET),
+            "memset_no_pdl": dict(flags=FLAG_CTL_MEMSET | FLAG_NO_PDL),
             "grid_1": dict(flags=1 << 16),
             "grid_7": dict(flags=7 << 16),
             "grid_400": dict(flags=400 << 16),
@@ -799,3 +802,71 @@ def test_launch_variants_are_bitwise_equal(layer: _Layer, t: int) -> None:
             engine.run(u, ids, flags=FLAG_ZERO_NON_LOCAL | (grid << 16))
             assert torch.equal(rows[perm >= 0].view(torch.int16), ref[0])
             assert bool((rows[perm < 0].view(torch.int16) == 0).all())
+
+
+@triton.jit
+def _slow_copy_kernel(dst_ptr, src_ptr, n, SPIN: tl.constexpr, BLOCK: tl.constexpr):
+    # Let the dependents of this kernel launch right now, and write the data
+    # only after a spin of about 60 us. acc stays below 1e3, so the second mask
+    # term is always true; it keeps the spin from being removed.
+    tl.extra.cuda.gdc_launch_dependents()
+    acc = tl.zeros([BLOCK], dtype=tl.float32)
+    for _ in range(SPIN):
+        acc = acc * 0.999 + 1.0
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = (offs < n) & (acc < 1e30)
+    tl.store(dst_ptr + offs, tl.load(src_ptr + offs, mask=mask), mask=mask)
+
+
+def _slow_copy(dst: torch.Tensor, src: torch.Tensor) -> None:
+    block = 1024
+    _slow_copy_kernel[(triton.cdiv(src.numel(), block),)](
+        dst.view(-1), src.view(-1), src.numel(), SPIN=20_000, BLOCK=block
+    )
+
+
+@pytest.mark.parametrize("t", [1, 4, 8])
+@pytest.mark.parametrize("use_graph", [False, True])
+@torch.inference_mode()
+def test_persistent_kernel_waits_for_the_routing_and_the_norm(
+    layer: _Layer, t: int, use_graph: bool
+) -> None:
+    """The kernel is a programmatic dependent of the routing kernel: it may start
+    while the top-k ids and the activations are still being written, and must wait
+    before it reads either (``ids`` and ``u`` start as other valid inputs)."""
+    engine = _Engine(layer)
+    u, _, _ = _routing(t, 170)
+    ids = _ids_cases(t, 171)["three_local"]
+    ref = _valid(*engine.run(u, ids, flags=FLAG_NO_PDL))
+    stale_u, _, _ = _routing(t, 172)
+    stale_ids = _ids_cases(t, 173)["all_local"]
+
+    u_in, ids_in = stale_u.clone(), stale_ids.clone()
+
+    def step():
+        _slow_copy(u_in, u)
+        _slow_copy(ids_in, ids)
+        return engine.run(u_in, ids_in)
+
+    def restore():
+        u_in.copy_(stale_u)
+        ids_in.copy_(stale_ids)
+
+    restore()
+    step()  # compiles the Triton producer
+    torch.cuda.synchronize()
+    if use_graph:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            rows, perm = step()
+        for _ in range(4):
+            restore()
+            graph.replay()
+            got = _valid(rows, perm)
+            assert torch.equal(got[0], ref[0]) and torch.equal(got[1], ref[1])
+    else:
+        for _ in range(4):
+            restore()
+            got = _valid(*step())
+            assert torch.equal(got[0], ref[0]) and torch.equal(got[1], ref[1])
+    assert engine.counters_are_zero()

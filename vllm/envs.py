@@ -140,6 +140,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_MUSE_MOE_REDUCE_DTYPE: str = "fp32"
     VLLM_ROCM_MUSE_MOE_ONLINE_QUANT: str = ""
     VLLM_MUSE_SPARK_FUSED_KERNELS: bool = True
+    VLLM_MUSE_SPARK_SM120_PDL: bool = True
     VLLM_MUSE_SPARK_SM120_DECODE_ENGINE: Literal["auto", "muse", "b12x", "cutlass"] = (
         "auto"
     )
@@ -1293,6 +1294,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # them. Set to 0 to force the unfused PyTorch paths, e.g. for A/B tests.
     "VLLM_MUSE_SPARK_FUSED_KERNELS": lambda: bool(
         int(os.getenv("VLLM_MUSE_SPARK_FUSED_KERNELS", "1"))
+    ),
+    # Muse Spark: launch the decode-path kernels that follow another kernel (the
+    # residual boundary, the post-expert finalize and the SM120 decode MoE) as
+    # programmatic dependents, so that their launch and prologue overlap the end
+    # of the predecessor. Bitwise identical to plain launches; set to 0 to launch
+    # them as plain kernels, e.g. for A/B tests. Read at every launch, so it must
+    # not change between a CUDA graph capture and its replay.
+    "VLLM_MUSE_SPARK_SM120_PDL": lambda: bool(
+        int(os.getenv("VLLM_MUSE_SPARK_SM120_PDL", "1"))
     ),
     # Muse Spark on SM120: the engine of the NVFP4 MoE for a few tokens (padded
     # batches of up to 8 inside CUDA graphs). "auto" picks the _muse_C decode

@@ -4,6 +4,7 @@
 
 import torch
 
+from vllm.models.muse_spark.common.ops import muse_pdl_enabled
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
@@ -69,10 +70,18 @@ def _routing_kernel(
     HAS_MULTIPLIER: tl.constexpr,
     HAS_EPS: tl.constexpr,
     USE_PDL: tl.constexpr,
+    EARLY_TRIGGER: tl.constexpr,
 ) -> None:
-    """One program per token; constexpr ``TOPK`` keeps the selection in registers."""
+    """One program per token; constexpr ``TOPK`` keeps the selection in registers.
+
+    ``EARLY_TRIGGER`` lets a programmatic successor (the decode MoE) launch once
+    every program is past its wait; the successor waits for this kernel to finish
+    before it reads the top-k.
+    """
     if USE_PDL:
         tl.extra.cuda.gdc_wait()
+        if EARLY_TRIGGER:
+            tl.extra.cuda.gdc_launch_dependents()
 
     token_id = tl.program_id(0)
     if token_id >= num_tokens:
@@ -212,6 +221,7 @@ def fused_musespark1x_routing(
         HAS_MULTIPLIER=router_output_multiplier is not None,
         HAS_EPS=router_score_division_eps is not None,
         USE_PDL=enable_pdl,
+        EARLY_TRIGGER=enable_pdl and muse_pdl_enabled(),
         # Keep Muse's repeated 256-expert selections within one warp.
         num_warps=1 if num_experts == 256 or current_platform.is_rocm() else 4,
         **({"launch_pdl": True} if enable_pdl else {}),

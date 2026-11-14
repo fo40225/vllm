@@ -13,6 +13,23 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 
+def muse_pdl_enabled() -> bool:
+    """Whether the Muse Spark kernels launch as programmatic dependents.
+
+    Needs a GPU that supports PDL (SM90+) and ``VLLM_MUSE_SPARK_SM120_PDL``. A
+    kernel launched this way may start before its predecessor has finished, so
+    it must call ``gdc_wait`` before it reads anything a kernel of the step
+    writes (or writes anything such a kernel reads).
+    """
+    from vllm.platforms import current_platform
+
+    return (
+        envs.VLLM_MUSE_SPARK_SM120_PDL
+        and current_platform.is_cuda()
+        and current_platform.is_arch_support_pdl()
+    )
+
+
 def has_compiled_op(name: str) -> bool:
     """Whether the compiled ``torch.ops._C`` extension registers op ``name``.
 

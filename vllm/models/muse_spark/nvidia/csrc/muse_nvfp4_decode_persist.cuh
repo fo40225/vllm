@@ -98,6 +98,13 @@ __global__ void __launch_bounds__(kBlockThreads, 1)
     mbar_init(smem_u32(&xq_free), 4);
     mbar_fence_init();
   }
+  // PDL: everything above only touches this CTA's shared memory. The plan reads
+  // the routing kernel's ids and the weights read the activations, so wait for
+  // the predecessor first (a no-op when this launch is not a programmatic
+  // dependent). Then let the successor (the finalize kernel, which waits for
+  // this kernel to finish before it reads anything) launch.
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
   build_plan(p, CMAX, plan, scratch);  // also the barrier-init fence
   MUSE_STAMP(1, tid == 0);
   if (blockIdx.x == 0) publish_plan(p, plan, scratch);
