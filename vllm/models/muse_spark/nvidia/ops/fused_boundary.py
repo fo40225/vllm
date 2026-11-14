@@ -37,24 +37,28 @@ result by running the two steps itself)::
     all_gather_rmsnorm(shard, weight, eps, gain_center) -> Tensor | None
         ``fused_rmsnorm_fwd(all_gather(shard, -1), weight, eps, gain_center=...)``.
 
-The two all-gathers follow a GEMV: the sharded pooler / unpooler of the MoE layer computes this rank's
-columns of ``x @ W.T`` (``W`` = the rank's rows of the replicated weight), and the columns are gathered. A
-communicator may also run the GEMV itself, together with the gather, so that every GEMV block sends its columns to
-the peers as soon as they are done (a host plugin does it for its machine, and loads the weights before its
-predecessor kernel has finished). It then owns the arithmetic of the GEMV: fp32 accumulation, one rounding to the
-output dtype, in an order of its own that does not depend on the batch size, the rank or the run (the model's
-cuBLAS GEMV has another order; the results differ in the last bit of some elements, deterministically)::
+The two all-gathers follow a GEMV: the sharded pooler / unpooler of the MoE layer
+computes this rank's columns of ``x @ W.T`` (``W`` = the rank's rows of the replicated
+weight), and the columns are gathered. A communicator may also run the GEMV itself,
+together with the gather, so that every GEMV block sends its columns to the peers as
+soon as they are done (a host plugin does it for its machine, and loads the weights
+before its predecessor kernel has finished). It then owns the arithmetic of the GEMV:
+fp32 accumulation, one rounding to the output dtype, in an order of its own that does
+not depend on the batch size, the rank or the run (the model's cuBLAS GEMV has another
+order; the results differ in the last bit of some elements, deterministically)::
 
     supports_fused_residual_boundary(kind, num_tokens) -> bool
         also: kind: "gemv_all_gather_rmsnorm" | "gemv_all_gather_boundary"
     gemv_all_gather_rmsnorm(x, weight, norm_weight, eps, gain_center) -> Tensor | None
-        x: bf16 [T, 8192], weight: this rank's bf16 rows [512, 8192]; the pooler. Returns the rows
-        ``fused_rmsnorm_fwd(all_gather(gemv(x, weight), -1), norm_weight, eps, gain_center=...)`` as
-        ``all_gather_rmsnorm`` does for the gathered shard.
-    gemv_all_gather_residual_boundary(x, weight, stream, *, <same keywords as all_gather_residual_boundary>)
+        x: bf16 [T, 8192], weight: this rank's bf16 rows [512, 8192]; the pooler.
+        Returns the rows ``fused_rmsnorm_fwd(all_gather(gemv(x, weight), -1),
+        norm_weight, eps, gain_center=...)`` as ``all_gather_rmsnorm`` does for the
+        gathered shard.
+    gemv_all_gather_residual_boundary(x, weight, stream, *, <same keywords>)
         -> (out, new_stream) | None
-        x: bf16 [T, 4096], weight: this rank's bf16 rows [1024, 4096]; the unpooler. As
-        ``all_gather_residual_boundary`` for the shard ``gemv(x, weight)``.
+        x: bf16 [T, 4096], weight: this rank's bf16 rows [1024, 4096]; the unpooler.
+        As ``all_gather_residual_boundary`` for the shard ``gemv(x, weight)``; the
+        keywords are those of ``all_gather_residual_boundary``.
 
 The decode CUDA graphs capture whatever the communicator launches.
 """

@@ -94,7 +94,9 @@ class FakeCommunicator:
         return fused_rmsnorm_fwd(gather(shard), weight, eps, gain_center=gain_center)
 
     # The GEMV the communicator runs itself: here the same bf16 product as the model's.
-    def gemv_all_gather_residual_boundary(self, x, weight, stream, *, out_fp32=None, **kw):
+    def gemv_all_gather_residual_boundary(
+        self, x, weight, stream, *, out_fp32=None, **kw
+    ):
         self.calls.append("gemv_all_gather_boundary")
         if self.returns_none:
             return None
@@ -441,7 +443,7 @@ def test_unpooler_shard_stays_in_the_layer_without_fusion_across_layers(monkeypa
 
 
 def make_projected(boundary, rows, k=64):
-    """A projected stream whose GEMV is `x @ w.T` (this rank's `HIDDEN // TP_SIZE` rows)."""
+    """A projected stream whose GEMV is `x @ w.T` (this rank's rows of the weight)."""
     x = torch.randn(rows, k, device="cuda", dtype=torch.bfloat16)
     w = torch.randn(HIDDEN // TP_SIZE, k, device="cuda", dtype=torch.bfloat16) * 0.1
     projected = MuseSpark1xProjectedStream(
@@ -628,7 +630,14 @@ def test_pooler_gemv_gather_and_norm_run_in_the_communicator(monkeypatch, rows):
 @requires_cuda
 @pytest.mark.parametrize(
     "case",
-    ["flag off", "no weight", "weight first", "too many tokens", "fp32", "returns None"],
+    [
+        "flag off",
+        "no weight",
+        "weight first",
+        "too many tokens",
+        "fp32",
+        "returns None",
+    ],
 )
 def test_pooler_gemv_gather_and_norm_decline(monkeypatch, case):
     moe = make_pooler_gemv_stub(
@@ -646,4 +655,5 @@ def test_pooler_gemv_gather_and_norm_decline(monkeypatch, case):
     )
     use_communicator(monkeypatch, communicator)
     assert moe._fused_gemv_all_gather_rmsnorm(x) is None
-    assert communicator.calls == (["gemv_all_gather_rmsnorm"] if case == "returns None" else [])
+    expected_calls = ["gemv_all_gather_rmsnorm"] if case == "returns None" else []
+    assert communicator.calls == expected_calls

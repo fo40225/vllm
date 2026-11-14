@@ -1498,18 +1498,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY": lambda: bool(
         int(os.getenv("VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY", "1"))
     ),
-    # Muse Spark on SM120: with the fused boundaries (above), also let the TP
-    # device communicator run the sharded pooler / unpooler GEMV of a decode batch
-    # (up to 8 tokens) together with the all-gather that follows it, when it offers
-    # that (ops/fused_boundary.py: gemv_all_gather_rmsnorm /
-    # gemv_all_gather_residual_boundary). Every GEMV block sends its columns to the
-    # peers as soon as they are done, and the weights are loaded while the
-    # all-reduce in front of the GEMV is still running. The communicator owns the
-    # GEMV arithmetic (fp32 accumulation in a fixed order, one rounding), which is
-    # not the order of the cuBLAS GEMV: the outputs are deterministic and equal on
-    # every rank, but differ from the two-step path in the last bit of some
-    # elements. Set to 0 to get the cuBLAS GEMV plus the fused gather back. Read
-    # once, when the model is constructed.
+    # Muse Spark on SM120: with the fused boundaries (above), also let the TP device
+    # communicator run the sharded pooler / unpooler GEMV of a decode batch (the
+    # communicator sets the limit: the host plugin serves the padded batches up to
+    # MUSE_TOPO_GEMV_MAX_ROWS, 4 by default, never more than 8) together with the all-
+    # gather that follows it, when it offers that (ops/fused_boundary.py:
+    # gemv_all_gather_rmsnorm / gemv_all_gather_residual_boundary). Every GEMV block
+    # sends its columns to the peers as soon as they are done, and the weights are
+    # loaded while the all-reduce in front of the GEMV is still running. The
+    # communicator owns the GEMV arithmetic (fp32 accumulation in a fixed order, one
+    # rounding), which is not the order of the cuBLAS GEMV: the outputs are
+    # deterministic and equal on every rank, but differ from the two-step path in the
+    # last bit of some elements. Set to 0 to get the cuBLAS GEMV plus the fused gather
+    # back. Read once, when the model is constructed.
     "VLLM_MUSE_SPARK_SM120_FUSED_GEMV": lambda: bool(
         int(os.getenv("VLLM_MUSE_SPARK_SM120_FUSED_GEMV", "1"))
     ),
@@ -1518,12 +1519,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # that reads the FP32 router weights once, in a fixed summation order that does not
     # depend on the batch size (cuBLAS runs a dot-product kernel plus a reduction, or a
     # SIMT sgemm plus a split-K reduction). The logits differ from the cuBLAS ones in
-    # the last bits, deterministically. The kernel also lets the routing kernel behind it
-    # start early. Needs the _muse_C extension and the FP32 router input, which the
+    # the last bits, deterministically. The kernel also lets the routing kernel behind
+    # it start early. Needs the _muse_C extension and the FP32 router input, which the
     # boundary kernel writes in the decode CUDA graphs (the router runs beside the
-    # pooler there) only with the expert prefetch (VLLM_MUSE_SPARK_SM120_EXPERT_PREFETCH=1);
-    # without it the router stays on cuBLAS (logged once at capture). Set to 0 for the
-    # cuBLAS router. Read once, when the model is constructed.
+    # pooler there) only with the expert prefetch
+    # (VLLM_MUSE_SPARK_SM120_EXPERT_PREFETCH=1): without the prefetch the flag is logged
+    # off at start-up and the router stays on cuBLAS, so an A/B of the prefetch also
+    # changes the router. Only the decode CUDA graphs use it: an eager forward
+    # (--enforce-eager, a batch that is not captured) routes from the BF16 input on
+    # cuBLAS, so eager and graph logits differ in the last bits (compare graph with
+    # graph). It is independent of the host communicator plugin: a run on NCCL only
+    # routes with it too, and its routing rounding differs (deterministically) from the
+    # cuBLAS router of earlier builds. Set to 0 for the cuBLAS router. Read once, when
+    # the model is constructed.
     "VLLM_MUSE_SPARK_SM120_ROUTER_GEMV": lambda: bool(
         int(os.getenv("VLLM_MUSE_SPARK_SM120_ROUTER_GEMV", "1"))
     ),
