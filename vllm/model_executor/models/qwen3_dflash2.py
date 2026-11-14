@@ -1,14 +1,27 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections.abc import Callable
+
 import torch
 import torch.nn.functional as F
 from torch import nn
 
+from vllm import envs
 from vllm.compilation.backends import set_model_tag
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
-from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
+)
+from vllm.logger import init_logger
+from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
+    ReplicatedLinear,
+    UnquantizedLinearMethod,
+)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.triton_utils import tl, triton
@@ -18,8 +31,11 @@ from .qwen3_dflash import (
     DFlashQwen3DecoderLayer,
     DFlashQwen3ForCausalLM,
     DFlashQwen3Model,
+    draft_column_shard_enabled,
 )
 from .utils import maybe_prefix
+
+logger = init_logger(__name__)
 
 
 @triton.jit
@@ -388,6 +404,40 @@ class DFlash2Qwen3Model(DFlashQwen3Model):
                 prefix=maybe_prefix(prefix, "candidate_selector"),
             )
 
+    def _build_fc(
+        self,
+        *,
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        prefix: str,
+    ) -> nn.Module:
+        # Column-sharded over TP, the output all-gathered: each rank reads 1/tp of the
+        # weight and runs 1/tp of the GEMM (see VLLM_MUSE_SPARK_SM120_DRAFT_FC_SHARD).
+        # Mode 2 keeps the replicated weight: see ``make_aux_combiner``.
+        mode = envs.VLLM_MUSE_SPARK_SM120_DRAFT_FC_SHARD
+        if mode not in (0, 1, 2):
+            raise ValueError(
+                f"VLLM_MUSE_SPARK_SM120_DRAFT_FC_SHARD={mode}: expected 0, 1 or 2."
+            )
+        if not draft_column_shard_enabled(mode == 1, output_size, "aux fc"):
+            return super()._build_fc(
+                input_size=input_size,
+                output_size=output_size,
+                params_dtype=params_dtype,
+                prefix=prefix,
+            )
+        return ColumnParallelLinear(
+            input_size=input_size,
+            output_size=output_size,
+            bias=False,
+            gather_output=True,
+            params_dtype=params_dtype,
+            quant_config=self.quant_config,
+            prefix=prefix,
+            return_bias=False,
+        )
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return super().embed_input_ids(input_ids) * self.input_embedding_scale
 
@@ -404,6 +454,69 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
             scale=float(draft_config.get("output_multiplier", 1.0)),
             soft_cap=softcap if softcap > 0 else None,
         )
+
+    @staticmethod
+    def _keep_fc_in_propose(reason: str) -> None:
+        """Say why VLLM_MUSE_SPARK_SM120_DRAFT_FC_SHARD=2 does not apply (a launch
+        that sets it must not look like one that runs it: the speculator logs the
+        success line only when the target takes the projection)."""
+        logger.warning_once(
+            "VLLM_MUSE_SPARK_SM120_DRAFT_FC_SHARD=2 does not apply: %s. The aux "
+            "projection stays in the propose step.",
+            reason,
+        )
+
+    def make_aux_combiner(
+        self, dtype: torch.dtype
+    ) -> Callable[[list[torch.Tensor], bool], torch.Tensor] | None:
+        """The aux projection as the target's forward runs it, or None.
+
+        VLLM_MUSE_SPARK_SM120_DRAFT_FC_SHARD=2: the fc weight stays replicated, but the
+        work is split. With the sequence-parallel stream (``local_rows``) every rank
+        holds the taps of its own T / tp rows only: it projects those with the full
+        weight and the target gathers the one [T / tp, hidden] result, where the
+        replicated draft gathered all 5 taps and projected the whole chunk on every
+        rank (19.3 ms and 5 tap gathers of 3.3 ms against 2.4 ms and one gather of
+        3.3 ms at an 8185-token chunk). Without it (a decode batch under the
+        sequence-parallel floor, graph captured) the taps hold all the rows: every rank
+        projects them with its own 1/tp of the output rows of the weight (a contiguous
+        slice, no extra memory) and the result is all-gathered, as in mode 1.
+        """
+        if envs.VLLM_MUSE_SPARK_SM120_DRAFT_FC_SHARD != 2:
+            return None
+        tp_size = get_tensor_model_parallel_world_size()
+        if tp_size == 1:
+            return None  # nothing to split over
+        if not self.model.use_aux_hidden_state:
+            return self._keep_fc_in_propose("the draft takes no aux hidden states")
+        fc = self.model.fc
+        if not isinstance(fc.quant_method, UnquantizedLinearMethod):
+            # A packed quantized weight cannot be sliced by rows or fed to F.linear.
+            return self._keep_fc_in_propose("its fc is quantized")
+        if not draft_column_shard_enabled(True, fc.output_size, "aux fc"):
+            return self._keep_fc_in_propose(
+                f"its fc width {fc.output_size} does not divide over TP={tp_size}"
+            )
+        rows_per_rank = fc.output_size // tp_size
+        tp_rank = get_tensor_model_parallel_rank()
+
+        def combine(taps: list[torch.Tensor], local_rows: bool) -> torch.Tensor:
+            # Targets may hand over taps in a wider dtype; the draft's fc was trained on
+            # features cast to its own dtype (as in ``combine_hidden_states``).
+            hidden = torch.cat([tap.to(dtype) for tap in taps], dim=-1)
+            if hidden.shape[-1] != fc.input_size:
+                raise ValueError(
+                    f"DFlash drafter expects {fc.input_size} concatenated aux hidden "
+                    f"features but received {hidden.shape[-1]} (the draft's "
+                    "target_layer_ids do not match the target's aux layers)."
+                )
+            hidden = hidden.to(fc.params_dtype)
+            if local_rows:
+                return fc(hidden)
+            weight = fc.weight.narrow(0, tp_rank * rows_per_rank, rows_per_rank)
+            return tensor_model_parallel_all_gather(F.linear(hidden, weight), -1)
+
+        return combine
 
     def compute_candidates(
         self, hidden_states: torch.Tensor

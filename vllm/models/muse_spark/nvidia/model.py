@@ -2836,9 +2836,17 @@ def _after_gemm2_hook_site(layer: MuseSpark1xDecoderLayer) -> MuseMoERunner | No
     return None
 
 
+# (taps, local_rows) -> the drafter's projection of the taps (see set_aux_combiner).
+AuxCombiner = Callable[[list[torch.Tensor], bool], torch.Tensor]
+
+
 # Runs uncompiled under breakable cudagraphs; drop LlamaModel's torch.compile.
 @ignore_torch_compile
 class MuseSpark1xModel(LlamaModel):
+    # The drafter's aux projection, when it runs inside the forward (see
+    # ``set_aux_combiner``); None: the forward returns the taps.
+    _aux_combiner: AuxCombiner | None = None
+
     def __init__(
         self,
         *,
@@ -3343,6 +3351,20 @@ class MuseSpark1xModel(LlamaModel):
         hidden_states = self.embed_tokens(input_ids)
         return self.tok_embeddings_norm(hidden_states, out_dtype=self.residual_dtype)
 
+    def set_aux_combiner(self, combiner: AuxCombiner | None) -> None:
+        """Run the drafter's aux projection inside the forward.
+
+        ``combiner(taps, local_rows)`` projects the aux taps of the rows it is given
+        into one [rows, hidden] tensor. With the sequence-parallel stream the taps are
+        each rank's own T / tp rows (``local_rows``): the projection runs on those and
+        its output is gathered once, instead of gathering every tap and projecting the
+        full chunk on every rank. Otherwise the taps hold all the rows. The forward then
+        returns that one tensor as the only aux hidden state (per microbatch: the
+        microbatches merge rows in token order). Only without pipeline stages.
+        """
+        assert combiner is None or get_pp_group().world_size == 1
+        self._aux_combiner = combiner
+
     def _as_aux_tap(self, state: torch.Tensor) -> torch.Tensor:
         """A hidden state as a drafter takes it (the model dtype, see ``__init__``)."""
         dtype = self.aux_hidden_state_dtype
@@ -3432,11 +3454,21 @@ class MuseSpark1xModel(LlamaModel):
             output, _ = norm_residual_then_norm(
                 x, self.norm, out_dtype=self.default_dtype
             )
+        combiner = self._aux_combiner if aux_hidden_states else None
         if sp_active:
             output = sp_all_gather(output)[: positions.shape[0]]
-            aux_hidden_states = [
-                sp_all_gather(a)[: positions.shape[0]] for a in aux_hidden_states
-            ]
+            if combiner is not None:
+                aux_hidden_states = [
+                    sp_all_gather(combiner(aux_hidden_states, True))[
+                        : positions.shape[0]
+                    ]
+                ]
+            else:
+                aux_hidden_states = [
+                    sp_all_gather(a)[: positions.shape[0]] for a in aux_hidden_states
+                ]
+        elif combiner is not None:
+            aux_hidden_states = [combiner(aux_hidden_states, False)]
         aux_hidden_states = remote_aux + aux_hidden_states
         if aux_hidden_states:
             return output, aux_hidden_states

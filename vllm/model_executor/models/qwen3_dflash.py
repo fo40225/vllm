@@ -81,6 +81,30 @@ def dflash_has_any_non_causal(config: Qwen3Config) -> bool:
     )
 
 
+def draft_column_shard_enabled(enabled: bool, output_size: int, name: str) -> bool:
+    """Whether a draft projection of ``output_size`` columns is column-sharded over TP.
+
+    ``enabled`` is the flag of that projection. It needs TP > 1 and a width the ranks
+    divide evenly; otherwise the projection stays replicated (with a warning when
+    the width is the reason).
+    """
+    if not enabled:
+        return False
+    tp_size = get_tensor_model_parallel_world_size()
+    if tp_size == 1:
+        return False
+    if output_size % tp_size:
+        logger.warning_once(
+            "The %s of the draft (%d columns) does not divide over TP=%d: it stays "
+            "replicated.",
+            name,
+            output_size,
+            tp_size,
+        )
+        return False
+    return True
+
+
 def _get_dflash_fc_input_size(vllm_config: VllmConfig) -> int:
     spec_config = vllm_config.speculative_config
     assert spec_config is not None
@@ -474,16 +498,13 @@ class DFlashQwen3Model(nn.Module):
             ]
         )
         if self.use_aux_hidden_state:
-            self.fc = ReplicatedLinear(
+            self.fc = self._build_fc(
                 input_size=_get_dflash_fc_input_size(
                     vllm_config,
                 ),
                 output_size=self.config.hidden_size,
-                bias=False,
                 params_dtype=vllm_config.model_config.dtype,
-                quant_config=self.quant_config,
                 prefix=maybe_prefix(prefix, "fc"),
-                return_bias=False,
             )
         self.hidden_norm = RMSNorm(
             self.config.hidden_size,
@@ -492,6 +513,25 @@ class DFlashQwen3Model(nn.Module):
         self.norm = RMSNorm(
             self.config.hidden_size,
             eps=self.config.rms_norm_eps,
+        )
+
+    def _build_fc(
+        self,
+        *,
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        prefix: str,
+    ) -> nn.Module:
+        """The aux projection [num_taps * target_hidden -> hidden] of the drafter."""
+        return ReplicatedLinear(
+            input_size=input_size,
+            output_size=output_size,
+            bias=False,
+            params_dtype=params_dtype,
+            quant_config=self.quant_config,
+            prefix=prefix,
+            return_bias=False,
         )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:

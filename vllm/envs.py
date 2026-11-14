@@ -171,6 +171,7 @@ if TYPE_CHECKING:
     VLLM_MUSE_SPARK_SM120_TOPK_LOGITS_K: int = 64
     VLLM_MUSE_SPARK_SM120_TOPK_LOGITS_MIN_TOKENS: int = 2
     VLLM_MUSE_SPARK_SM120_VERIFY_TOPK_LOGITS: int = 2
+    VLLM_MUSE_SPARK_SM120_DRAFT_FC_SHARD: int = 0
     VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT: bool = True
     VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT_TABLE: str | None = None
     VLLM_MUSE_SPARK_SM120_DENSE_Q: bool = True
@@ -1779,6 +1780,32 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # do not count in the lines of the top-k logits sampling). Read once, in load_model.
     "VLLM_MUSE_SPARK_SM120_VERIFY_TOPK_LOGITS": lambda: int(
         os.getenv("VLLM_MUSE_SPARK_SM120_VERIFY_TOPK_LOGITS", "2")
+    ),
+    # Muse Spark on SM120: how the aux projection (fc, [5 * 8192 -> 8192], 671 MB) of
+    # the DFlash2 draft is computed. It runs eagerly in the propose step on all the rows
+    # of the verify batch (and of a prefill chunk): 0.48 ms at 8 rows (the weight read),
+    # 1.3 / 2.4 ms at 512 / 1024 rows, 19.3 ms at an 8185-token chunk. 0: on every rank
+    # from the replicated weight (the draft as loaded). 1: column shards: every rank
+    # holds and reads 1/tp of the weight (-560 MiB per rank at TP8: re-derive
+    # --kv-cache-memory-bytes), runs 1/tp of the GEMM and all-gathers the [T, 8192]
+    # output. It does not make the taps cheaper to gather: under the sequence-parallel
+    # stream the target still gathers its 5 taps before the draft's input is built.
+    # 2: the weight stays replicated (the weights do not change; the idle memory moved
+    # by about -270 MiB at identical bytes, which the weights do not explain: re-derive
+    # --kv-cache-memory-bytes) and the work is split: a decode batch under the
+    # sequence-parallel floor runs every rank's 1/tp slice of the output rows of the
+    # weight and gathers the result (as 1), and under the sequence-parallel stream the
+    # target hands the draft only each rank's T / tp rows of the taps: the fc runs on
+    # those and ONE [T, 8192] gather replaces the 5 tap gathers (the fc then runs inside
+    # the target's forward, so the draft needs no propose-step fc). The values are the
+    # same dot products (the GEMM tiling differs, so draft logits differ at the rounding
+    # level, identically on all ranks); the draft is a proposal, the rejection sampler
+    # keeps the output distribution. Not with pipeline stages. A launch that cannot
+    # apply it (TP 1, a quantized fc) keeps the projection in the propose step; the log
+    # line "the aux projection runs in the target's forward" says when it runs.
+    # Read once, when the draft model is constructed.
+    "VLLM_MUSE_SPARK_SM120_DRAFT_FC_SHARD": lambda: int(
+        os.getenv("VLLM_MUSE_SPARK_SM120_DRAFT_FC_SHARD", "0")
     ),
     # Muse Spark on SM120: place the experts of every MoE layer on the EP ranks by the
     # table of the model snapshot (vllm/models/muse_spark/nvidia/data/

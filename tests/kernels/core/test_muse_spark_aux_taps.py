@@ -100,3 +100,96 @@ def test_a_stage_that_keeps_the_stream_dtype_hands_the_tensor_on_as_it_is():
     state = torch.ones(2, 2, dtype=torch.float32)
     assert _model(None)._as_aux_tap(state) is state
     assert _model(torch.bfloat16)._as_aux_tap(state).dtype == torch.bfloat16
+
+
+class _SPLayer:
+    """A layer that adds 1/3 to the stream and takes part in the sequence-parallel
+    stream like the real ones (``is_sequence_parallel``)."""
+
+    is_sequence_parallel = False
+
+    def __call__(self, positions, x):
+        return x + 1.0 / 3.0
+
+
+def _sp_model(aux_layers=(2, 4)) -> model_ops.MuseSpark1xModel:
+    model = _model(torch.bfloat16, aux_layers)
+    model.layers = [_SPLayer() for _ in range(NUM_LAYERS)]
+    return model
+
+
+def test_the_combiner_replaces_the_taps_with_its_projection():
+    model = _sp_model()
+    seen = []
+
+    def combiner(taps, local_rows):
+        seen.append((len(taps), local_rows, taps[0].shape[0]))
+        return torch.cat(taps, dim=-1)[:, :HIDDEN] * 2
+
+    model.set_aux_combiner(combiner)
+    output, aux = _forward(model)
+    _, plain = _forward(_sp_model())
+
+    # One tensor, from the taps of all the rows (no sequence-parallel stream here).
+    assert seen == [(2, False, TOKENS)]
+    assert len(aux) == 1 and output.shape == (TOKENS, HIDDEN)
+    assert torch.equal(aux[0], torch.cat(plain, dim=-1)[:, :HIDDEN] * 2)
+
+
+def test_no_combiner_returns_the_taps_as_before():
+    _, aux = _forward(_sp_model())
+    assert len(aux) == 2
+
+
+def test_with_the_sequence_parallel_stream_the_combiner_projects_the_local_rows(
+    monkeypatch,
+):
+    """Under the sequence-parallel stream the taps are the rank's own rows; the one
+    projected result is gathered, instead of every tap."""
+    gathers = []
+    local_rows = TOKENS // 2
+
+    def sp_shard(x):
+        return x[:local_rows]
+
+    def sp_all_gather(x):
+        gathers.append(tuple(x.shape))
+        return torch.cat([x, x], dim=0)
+
+    monkeypatch.setattr(model_ops, "sp_shard", sp_shard)
+    monkeypatch.setattr(model_ops, "sp_all_gather", sp_all_gather)
+    monkeypatch.setattr(model_ops, "_sequence_parallel_active", lambda *a: True)
+
+    model = _sp_model()
+    model.is_sequence_parallel = True
+    model.is_sequence_parallel_input = True
+    seen = []
+
+    def combiner(taps, local):
+        seen.append((len(taps), local, taps[0].shape[0]))
+        return torch.cat(taps, dim=-1)[:, :HIDDEN]
+
+    model.set_aux_combiner(combiner)
+    output, aux = _forward(model)
+
+    assert seen == [(2, True, local_rows)]
+    # The output gather and the gather of the one projected tensor: not one per tap.
+    assert gathers == [(local_rows, HIDDEN), (local_rows, HIDDEN)]
+    assert len(aux) == 1 and aux[0].shape == (TOKENS, HIDDEN)
+
+    gathers.clear()
+    plain_model = _sp_model()
+    plain_model.is_sequence_parallel = True
+    plain_model.is_sequence_parallel_input = True
+    _, plain = _forward(plain_model)
+    assert len(gathers) == 1 + 2 and len(plain) == 2
+
+
+def test_the_combiner_only_runs_where_taps_are_made():
+    # A forward without aux layers has no taps to combine.
+    model = _sp_model(aux_layers=())
+    called = []
+    model.set_aux_combiner(lambda taps, local: called.append(1))
+    output = _forward(model)
+    assert not called
+    assert isinstance(output, torch.Tensor)

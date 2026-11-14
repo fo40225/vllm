@@ -8,6 +8,7 @@ import torch.nn as nn
 
 from vllm.config import VllmConfig, replace
 from vllm.config.compilation import CUDAGraphMode
+from vllm.distributed import get_pp_group
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
@@ -43,6 +44,8 @@ class DFlashSpeculator(DraftModelSpeculator):
     # booted and compared bitwise with the Muse Spark drafts (DSpark, DFlash2) only,
     # not with the other DFlash/DSpark drafts (Qwen3, Laguna, DeepSeek V4, Kimi K3).
     builds_own_attn_metadata = True
+    # The target's forward already projected the aux taps (see ``load_draft_model``).
+    aux_combined_by_target = False
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         parallel_config = vllm_config.parallel_config
@@ -252,7 +255,46 @@ class DFlashSpeculator(DraftModelSpeculator):
         target_model: nn.Module,
         target_attn_layer_names: set[str],
     ) -> nn.Module:
-        return load_dflash_model(target_model, self.vllm_config)
+        draft_model = load_dflash_model(target_model, self.vllm_config)
+        self._hand_aux_projection_to_target(target_model, draft_model)
+        return draft_model
+
+    def _hand_aux_projection_to_target(
+        self, target_model: nn.Module, draft_model: nn.Module
+    ) -> None:
+        """Let the target's forward run the draft's aux projection, if the draft asks.
+
+        A draft model that offers ``make_aux_combiner`` (DFlash2 with
+        VLLM_MUSE_SPARK_SM120_DRAFT_FC_SHARD=2) gets its aux fc computed where the taps
+        are made: on each rank's own rows under the sequence-parallel stream, with one
+        gather of the result instead of one per tap. A target without the hook, or with
+        pipeline stages, keeps the taps and the projection in ``propose``.
+        """
+        make_combiner = getattr(draft_model, "make_aux_combiner", None)
+        combiner = None if make_combiner is None else make_combiner(self.dtype)
+        if combiner is None:
+            return
+        language_model = (
+            target_model.get_language_model()
+            if hasattr(target_model, "get_language_model")
+            else target_model
+        )
+        holder = getattr(language_model, "model", language_model)
+        set_combiner = getattr(holder, "set_aux_combiner", None)
+        if set_combiner is None or get_pp_group().world_size != 1:
+            logger.warning(
+                "%s: the target cannot run the draft's aux projection (no "
+                "set_aux_combiner, or pipeline stages): it stays in the propose step.",
+                self._speculator_name,
+            )
+            return
+        set_combiner(combiner)
+        self.aux_combined_by_target = True
+        logger.info(
+            "%s: the aux projection runs in the target's forward "
+            "(VLLM_MUSE_SPARK_SM120_DRAFT_FC_SHARD=2).",
+            self._speculator_name,
+        )
 
     def set_attn(
         self,
@@ -451,7 +493,13 @@ class DFlashSpeculator(DraftModelSpeculator):
         (Muse Spark keeps its residual stream in FP32). Each tap is cast first, so
         the fc GEMM sees the draft dtype and the [T, num_taps * hidden] concat
         buffer is built at that width. A no-op when the dtypes already match.
+
+        When the target runs the projection inside its forward (the draft model's
+        ``make_aux_combiner``) the one aux hidden state it returns is the result.
         """
+        if self.aux_combined_by_target:
+            (hidden_states,) = aux_hidden_states
+            return hidden_states
         return self.model.combine_hidden_states(
             torch.cat([x.to(self.dtype) for x in aux_hidden_states], dim=-1)
         )
