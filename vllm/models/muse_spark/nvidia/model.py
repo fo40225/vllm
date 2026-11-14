@@ -68,7 +68,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4Config
-from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
+from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.utils import dispatch_unquantized_gemm
 from vllm.model_executor.models.interfaces import MixtureOfExperts, SupportsLoRA
 from vllm.model_executor.models.llama import LlamaForCausalLM, LlamaMLP, LlamaModel
@@ -1081,13 +1081,14 @@ class MuseSpark1xAttention(nn.Module):
         self.is_sequence_parallel_output = False
         self.gemm_rs = None
 
+        # get_rope shares one instance (and its cos/sin cache, ~256 MiB in
+        # fp32 at 1M positions) across all layers with the same parameters.
         self.rotary_emb = (
-            RotaryEmbedding(
+            get_rope(
                 head_size=self.head_dim,
-                rotary_dim=self.head_dim,
-                max_position_embeddings=max_position_embeddings,
-                base=rope_theta,
+                max_position=max_position_embeddings,
                 is_neox_style=False,
+                rope_parameters={"rope_type": "default", "rope_theta": rope_theta},
                 dtype=(
                     torch.float
                     if not is_draft or config.rope_use_fp32_in_outer_product
