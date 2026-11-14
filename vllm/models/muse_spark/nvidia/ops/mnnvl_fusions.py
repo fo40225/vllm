@@ -24,7 +24,11 @@ def tp_group_spans_nodes() -> bool:
 
 
 def _all_tp_ranks(flag: bool) -> bool:
-    value = torch.tensor(int(flag))
+    # The CPU (gloo) group reduces CPU tensors. A model is built under a default device
+    # that is the GPU, so a bare ``torch.tensor`` here is a CUDA tensor: gloo then
+    # touches the GPU from worker threads whose current device is 0, and every rank
+    # but 0 gets a CUDA context on GPU 0.
+    value = torch.tensor(int(flag), device="cpu")
     dist.all_reduce(value, op=dist.ReduceOp.MIN, group=get_tp_group().cpu_group)
     return bool(value.item())
 

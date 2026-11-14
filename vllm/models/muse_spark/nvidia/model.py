@@ -776,7 +776,8 @@ def _agreed_by_tp_group(verdict: bool) -> bool:
     group = get_tp_group()
     if group.world_size == 1:
         return verdict
-    flag = torch.tensor([int(verdict)], dtype=torch.int32)
+    # The CPU group reduces CPU tensors, whatever the default device is.
+    flag = torch.tensor([int(verdict)], dtype=torch.int32, device="cpu")
     torch.distributed.all_reduce(
         flag, op=torch.distributed.ReduceOp.MIN, group=group.cpu_group
     )
@@ -797,7 +798,9 @@ def _agreed_scale_by_tp_group(scale: float | None) -> bool:
     if group.world_size == 1:
         return usable
     value = scale if usable else 0.0
-    stats = torch.tensor([float(usable), value, -value], dtype=torch.float64)
+    stats = torch.tensor(
+        [float(usable), value, -value], dtype=torch.float64, device="cpu"
+    )
     torch.distributed.all_reduce(
         stats, op=torch.distributed.ReduceOp.MIN, group=group.cpu_group
     )

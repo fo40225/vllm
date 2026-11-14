@@ -76,8 +76,10 @@ def maybe_create_gemm_rs(
     ):
         return None
     tp_group = get_tp_group()
+    # The CPU group reduces CPU tensors, whatever the default device is.
     eligible = torch.tensor(
-        int(any(MuseSparkGemmRs.supports_projection(p) for p in projections))
+        int(any(MuseSparkGemmRs.supports_projection(p) for p in projections)),
+        device="cpu",
     )
     dist.all_reduce(eligible, op=dist.ReduceOp.MIN, group=tp_group.cpu_group)
     if not eligible.item():
