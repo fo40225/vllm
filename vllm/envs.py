@@ -1849,26 +1849,31 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MUSE_SPARK_SM120_DRAFT_FC_SHARD": lambda: int(
         os.getenv("VLLM_MUSE_SPARK_SM120_DRAFT_FC_SHARD", "2")
     ),
-    # Muse Spark on SM120: the DFlash2 draft's weights in FP8 (e4m3, one scale per output
-    # channel, quantized at load from the bf16 checkpoint). At decode the draft's GEMMs
-    # (gate_up, down, QKV, O, the ten kernel projections and the candidate head) are
-    # weight-streaming bound at 1.2-1.4 TB/s, so e4m3 halves their time. 0: bf16 (the
+    # Muse Spark on SM120: the DFlash2 draft's weights in FP8 (e4m3, one scale per
+    # output channel, quantized at load from the bf16 checkpoint). At decode the draft's
+    # GEMMs (gate_up, down, QKV, O, the ten kernel projections and the candidate head)
+    # are weight-streaming bound at 1.2-1.4 TB/s, so e4m3 halves their time. 0: bf16 (the
     # draft as loaded). 1: the linear layers of the draft layers (and their kernel
     # projections); the aux fc stays bf16 (FC_SHARD=2 slices and gathers it). 2: also an
     # FP8 copy of the target's lm_head shard for the draft's candidate top-k (the target
     # keeps its bf16 head, so this costs half a shard, 197 MiB, instead of freeing
     # memory). The verification is exact (the draft is a proposal, the rejection sampler
-    # keeps the output distribution); the cost is acceptance length, so every change of
-    # the value needs the AL check. Frees about 670 MiB per rank at 1 (re-derive
-    # --kv-cache-memory-bytes). Read once, when the draft model is loaded.
+    # keeps the output distribution); the cost is acceptance length.
+    # THE FLAG, THE KERNEL AND --kv-cache-memory-bytes ARE ONE PROPERTY: the layers free
+    # about 670 MiB per rank, but the idle memory moves by a different amount per
+    # (flag, kernel) (flag 2 cutlass -418 MiB, flag 1 cutlass -616, flag 2 marlin -542),
+    # so the exact bytes are derived per state (host scripts/check_spec_launch.sh).
+    # Read once, when the draft model is loaded; no weight reload.
     "VLLM_MUSE_SPARK_SM120_DRAFT_FP8": lambda: int(
         os.getenv("VLLM_MUSE_SPARK_SM120_DRAFT_FP8", "0")
     ),
     # Muse Spark on SM120: the GEMM behind VLLM_MUSE_SPARK_SM120_DRAFT_FP8 for the draft
     # layers: "marlin" = weight-only FP8 (bf16 activations: the lowest error, the same
-    # time as cutlass up to 64 rows, slower above) or "cutlass" = FP8 weights and dynamic
-    # per-token FP8 activations on the FP8 tensor cores. The candidate head always runs
-    # cutlass (Marlin is slower than bf16 above 64 rows there).
+    # time as cutlass up to 64 rows, slower above; repeatable only with
+    # VLLM_MARLIN_USE_ATOMIC_ADD=0, its default) or "cutlass" = FP8 weights and dynamic
+    # per-token FP8 activations on the FP8 tensor cores (a static schedule without
+    # split-K, bitwise repeatable). The candidate head always runs cutlass (Marlin is
+    # slower than bf16 above 64 rows there).
     "VLLM_MUSE_SPARK_SM120_DRAFT_FP8_KERNEL": lambda: os.getenv(
         "VLLM_MUSE_SPARK_SM120_DRAFT_FP8_KERNEL", "cutlass"
     ),

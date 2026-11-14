@@ -11,6 +11,7 @@ candidate head returns the bf16 head's top-k (up to ties) and never a padded col
 """
 
 import glob
+import json
 import os
 from types import SimpleNamespace
 
@@ -19,6 +20,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from vllm import envs
 from vllm.distributed import parallel_state
 from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
@@ -29,9 +31,14 @@ from vllm.model_executor.layers.muse_draft_fp8 import (
     FP8_DTYPE,
     DraftFp8Head,
     DraftFp8LinearMethod,
+    cutlass_fp8_linear,
     quantize_draft_linear,
     quantize_rows,
 )
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    UnquantizedEmbeddingMethod,
+)
+from vllm.model_executor.models import qwen3_dflash2
 from vllm.model_executor.models.qwen3_dflash2 import DFlash2Qwen3ForCausalLM
 
 FLAG = "VLLM_MUSE_SPARK_SM120_DRAFT_FP8"
@@ -159,8 +166,30 @@ def fake_draft(num_layers: int = 2, k: int = 64, n: int = 32):
         )
     fc = lin(k, 5 * k, 99)
     fake = SimpleNamespace(model=SimpleNamespace(layers=layers, fc=fc))
+    # What ``load_weights`` builds before the hook runs (the bf16 fused context K/V).
+    fake.model._fused_kv_weight = torch.zeros(4, k, dtype=torch.bfloat16)
     fake.fp8_head = None
+    fake.candidate_logits_processor = SimpleNamespace(head_dtype=None)
+    # The hook asks for its layer list through the real method.
+    fake._fp8_linears = lambda: DFlash2Qwen3ForCausalLM._fp8_linears(fake)
     return fake
+
+
+class LogRecorder:
+    """Stands in for the module logger: keeps the formatted lines per level."""
+
+    def __init__(self, monkeypatch):
+        self.lines = {"info": [], "warning": []}
+        for level in self.lines:
+            monkeypatch.setattr(
+                qwen3_dflash2.logger, level, self._recorder(level), raising=False
+            )
+
+    def _recorder(self, level):
+        def record(msg, *args, **kwargs):
+            self.lines[level].append(msg % args)
+
+        return record
 
 
 def draft_linears(fake):
@@ -174,7 +203,7 @@ def draft_linears(fake):
 
 
 def test_hook_is_a_noop_when_the_flag_is_off(monkeypatch):
-    monkeypatch.delenv(FLAG, raising=False)
+    monkeypatch.setenv(FLAG, "0")
     fake = fake_draft()
     before = [lin.weight.data.clone() for lin in draft_linears(fake)]
     DFlash2Qwen3ForCausalLM.process_weights_after_loading(fake)
@@ -192,9 +221,7 @@ def test_hook_rejects_a_bad_flag(monkeypatch, flag):
 
 @pytest.mark.parametrize("flag", ["1", "2"])
 @pytest.mark.parametrize("kernel", KERNELS)
-def test_hook_quantizes_the_draft_linears_and_leaves_the_fc(
-    monkeypatch, flag, kernel
-):
+def test_hook_quantizes_the_draft_linears_and_leaves_the_fc(monkeypatch, flag, kernel):
     if kernel == "marlin" and not torch.cuda.is_available():
         pytest.skip("the Marlin repack needs a GPU")
     monkeypatch.setenv(FLAG, flag)
@@ -223,6 +250,7 @@ def test_hook_quantizes_the_draft_linears_and_leaves_the_fc(
 def test_hook_skips_layers_that_are_not_plain_bf16(monkeypatch):
     monkeypatch.setenv(FLAG, "1")
     monkeypatch.setenv(KERNEL_FLAG, "cutlass")
+    log = LogRecorder(monkeypatch)
     fake = fake_draft(num_layers=1)
     quantized = fake.model.layers[0].mlp.down_proj
     quantized.quant_method = DraftFp8LinearMethod("cutlass", 64, 32)  # not unquantized
@@ -232,11 +260,131 @@ def test_hook_skips_layers_that_are_not_plain_bf16(monkeypatch):
     assert quantized.quant_method.kernel == "cutlass"
     assert isinstance(other.quant_method, UnquantizedLinearMethod)
     assert other.weight.dtype == torch.float32
+    # 5 of 6 layers run FP8 (one was already): the float32 one stays, a warning and
+    # no success line.
+    assert not log.lines["info"]
+    assert len(log.lines["warning"]) == 1
+    assert "does not apply in full: 5 of 6" in log.lines["warning"][0]
+
+
+@pytest.mark.parametrize("kernel", KERNELS)
+def test_hook_logs_the_success_line_the_launch_check_reads(monkeypatch, kernel):
+    if kernel == "marlin" and not torch.cuda.is_available():
+        pytest.skip("the Marlin repack needs a GPU")
+    monkeypatch.setenv(FLAG, "2")
+    monkeypatch.setenv(KERNEL_FLAG, kernel)
+    log = LogRecorder(monkeypatch)
+    fake = fake_draft(num_layers=5)
+    if torch.cuda.is_available():
+        for lin in draft_linears(fake):
+            lin.to("cuda")
+    DFlash2Qwen3ForCausalLM.process_weights_after_loading(fake)
+    assert not log.lines["warning"]
+    (line,) = log.lines["info"]
+    assert line.startswith(
+        f"DFlash2 draft weights in FP8 (VLLM_MUSE_SPARK_SM120_DRAFT_FP8=2, kernel "
+        f"{kernel}): 30 linear layers quantized, "
+    )
+    # A second call finds everything quantized and says nothing.
+    DFlash2Qwen3ForCausalLM.process_weights_after_loading(fake)
+    assert len(log.lines["info"]) == 1 and not log.lines["warning"]
 
 
 def test_a_bad_kernel_name_is_rejected():
     with pytest.raises(ValueError, match="expected one of"):
         DraftFp8LinearMethod("triton", 8, 8)
+
+
+def test_a_bad_kernel_name_is_rejected_before_any_weight_changes(monkeypatch):
+    monkeypatch.setenv(FLAG, "1")
+    monkeypatch.setenv(KERNEL_FLAG, "triton")
+    fake = fake_draft(num_layers=1)
+    before = [lin.weight.data.clone() for lin in draft_linears(fake)]
+    with pytest.raises(ValueError, match="expected one of"):
+        DFlash2Qwen3ForCausalLM.process_weights_after_loading(fake)
+    for lin, w in zip(draft_linears(fake), before, strict=True):
+        assert isinstance(lin.quant_method, UnquantizedLinearMethod)
+        assert torch.equal(lin.weight.data, w)
+    with pytest.raises(ValueError, match="expected one of"):
+        quantize_draft_linear(next(draft_linears(fake)), "triton")
+
+
+def test_hook_refuses_to_quantize_without_the_fused_context_kv_weight(monkeypatch):
+    monkeypatch.setenv(FLAG, "1")
+    monkeypatch.setenv(KERNEL_FLAG, "cutlass")
+    fake = fake_draft(num_layers=1)
+    fake.model._fused_kv_weight = None  # a build that came after the quantization
+    with pytest.raises(RuntimeError, match="fused context K/V weight is missing"):
+        DFlash2Qwen3ForCausalLM.process_weights_after_loading(fake)
+    assert all(
+        isinstance(lin.quant_method, UnquantizedLinearMethod)
+        for lin in draft_linears(fake)
+    )
+
+
+def test_hook_builds_the_fused_context_kv_weight_when_load_weights_did_not(
+    monkeypatch,
+):
+    monkeypatch.setenv(FLAG, "1")
+    monkeypatch.setenv(KERNEL_FLAG, "cutlass")
+    fake = fake_draft(num_layers=1)
+    del fake.model._fused_kv_weight
+    built = []
+
+    def build():
+        built.append(
+            sum(
+                isinstance(lin.quant_method, DraftFp8LinearMethod)
+                for lin in draft_linears(fake)
+            )
+        )
+        fake.model._fused_kv_weight = torch.zeros(4, 64, dtype=torch.bfloat16)
+
+    fake.model._build_fused_kv_buffers = build
+    DFlash2Qwen3ForCausalLM.process_weights_after_loading(fake)
+    assert built == [0]  # before the first layer was quantized
+    assert all(
+        isinstance(lin.quant_method, DraftFp8LinearMethod)
+        for lin in draft_linears(fake)
+    )
+
+
+def test_a_layer_cutlass_cannot_take_stays_bf16_and_is_reported(monkeypatch):
+    # N or K not a multiple of 16: cutlass_scaled_mm would run a Triton kernel.
+    layer = linear_with(realistic_weight(24, 64, seed=20))  # N = 24
+    assert quantize_draft_linear(layer, "cutlass") == 0
+    assert isinstance(layer.quant_method, UnquantizedLinearMethod)
+    layer = linear_with(realistic_weight(32, 72, seed=21))  # K = 72
+    assert quantize_draft_linear(layer, "cutlass") == 0
+    assert isinstance(layer.quant_method, UnquantizedLinearMethod)
+    monkeypatch.setenv(FLAG, "1")
+    monkeypatch.setenv(KERNEL_FLAG, "cutlass")
+    log = LogRecorder(monkeypatch)
+    fake = fake_draft(num_layers=1, k=64, n=24)  # N = 24 in the layers with N rows
+    DFlash2Qwen3ForCausalLM.process_weights_after_loading(fake)
+    assert not log.lines["info"]
+    assert "does not apply in full" in log.lines["warning"][0]
+
+
+def test_quantize_rows_rounds_the_scale_to_bf16_when_asked():
+    weight = realistic_weight(64, 128, seed=22)
+    wq, scale = quantize_rows(weight, scale_in_bf16=True)
+    assert torch.equal(scale, scale.bfloat16().float())
+    assert torch.all(wq.float().abs() <= 448.0)
+    # The weights are quantized against that scale: the error stays at the e4m3 level.
+    dequant = wq.float() * scale[:, None]
+    rel = (dequant - weight.float()).pow(2).mean().sqrt()
+    assert rel / weight.float().pow(2).mean().sqrt() < 0.04
+    plain = quantize_rows(weight)[1]
+    assert not torch.equal(plain, scale)  # the fp32 scales are not all bf16 values
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_quantize_rows_refuses_a_non_finite_weight(bad):
+    weight = realistic_weight(8, 32, seed=23)
+    weight[5, 7] = bad
+    with pytest.raises(ValueError, match="non-finite"):
+        quantize_rows(weight)
 
 
 def test_attach_fp8_head_gates_on_the_flag(monkeypatch):
@@ -248,8 +396,51 @@ def test_attach_fp8_head_gates_on_the_flag(monkeypatch):
     DFlash2Qwen3ForCausalLM.attach_fp8_head(fake, head)  # not mode 2: nothing
     assert fake.fp8_head is None
     monkeypatch.setenv(FLAG, "2")
+    log = LogRecorder(monkeypatch)
     DFlash2Qwen3ForCausalLM.attach_fp8_head(fake, head)  # not a plain matrix: warns
     assert fake.fp8_head is None
+    assert "DRAFT_FP8=2 does not apply to the head" in log.lines["warning"][0]
+
+
+def cpu_head(rows: int = 40, hidden: int = 64):
+    return SimpleNamespace(
+        weight=nn.Parameter(
+            realistic_weight(rows, hidden, seed=24), requires_grad=False
+        ),
+        quant_method=UnquantizedEmbeddingMethod(),
+        tp_size=1,
+        shard_indices=SimpleNamespace(org_vocab_start_index=0, num_org_vocab_padding=0),
+    )
+
+
+def test_attach_fp8_head_copies_a_plain_head(monkeypatch):
+    monkeypatch.setenv(FLAG, "2")
+    log = LogRecorder(monkeypatch)
+    fake = fake_draft(num_layers=1)
+    DFlash2Qwen3ForCausalLM.attach_fp8_head(fake, cpu_head())
+    assert isinstance(fake.fp8_head, DraftFp8Head)
+    assert fake.fp8_head.weight_q.shape == (48, 64)  # 40 rows padded to 16
+    assert (
+        "DFlash2 candidate head in FP8 (VLLM_MUSE_SPARK_SM120_DRAFT_FP8=2)"
+        in (log.lines["info"][0])
+    )
+    assert not log.lines["warning"]
+
+
+def test_attach_fp8_head_skips_a_head_dtype_that_differs_from_the_model(monkeypatch):
+    monkeypatch.setenv(FLAG, "2")
+    log = LogRecorder(monkeypatch)
+    fake = fake_draft(num_layers=1)
+    # --hf-overrides head_dtype: LogitsProcessor._apply_head would reject the FP8 head
+    # at the first draft step; the copy is skipped at load instead.
+    fake.candidate_logits_processor = SimpleNamespace(head_dtype=torch.float32)
+    DFlash2Qwen3ForCausalLM.attach_fp8_head(fake, cpu_head())
+    assert fake.fp8_head is None
+    assert "head_dtype" in log.lines["warning"][0]
+    assert "does not apply to the head" in log.lines["warning"][0]
+    fake.candidate_logits_processor = SimpleNamespace(head_dtype=torch.bfloat16)
+    DFlash2Qwen3ForCausalLM.attach_fp8_head(fake, cpu_head())
+    assert fake.fp8_head is not None  # the same dtype as the model: fine
 
 
 # --------------------------------------------------------------------------------
@@ -261,9 +452,9 @@ def test_attach_fp8_head_gates_on_the_flag(monkeypatch):
 # (Marlin) and 3.7% with e4m3 activations too (cutlass); the bounds leave 50% margin.
 BOUND_MAX = {"cutlass": 0.06, "marlin": 0.04}
 BOUND_RMS = {"cutlass": 0.065, "marlin": 0.045}
-# Three chained quantized GEMMs with the multiplicative conv coefficients and SiLU-and-mul
-# between them (the MLP half of a draft layer): the errors compound (measured relative
-# RMS 9.1% cutlass, 6.5% marlin, at 8 / 128 / 256 rows alike).
+# Three chained quantized GEMMs with the multiplicative conv coefficients and
+# SiLU-and-mul between them (the MLP half of a draft layer): the errors compound
+# (measured relative RMS 9.1% cutlass, 6.5% marlin, at 8 / 128 / 256 rows alike).
 BLOCK_BOUND_RMS = {"cutlass": 0.11, "marlin": 0.08}
 
 
@@ -292,7 +483,8 @@ def test_error_against_fp32_on_the_real_shapes(shape, kernel):
 @needs_cuda
 @pytest.mark.parametrize("kernel", KERNELS)
 def test_zero_and_padded_rows_stay_finite(kernel):
-    """CUDA graph padding rows can hold zeros: the per-token scale must not divide by 0."""
+    """CUDA graph padding rows can hold zeros: the per-token scale must not divide
+    by 0."""
     n, k = SHAPES["qkv"]
     layer = linear_with(realistic_weight(n, k, seed=5, device="cuda"))
     quantize_draft_linear(layer, kernel)
@@ -304,6 +496,22 @@ def test_zero_and_padded_rows_stay_finite(kernel):
 
 
 @needs_cuda
+def test_zero_rows_give_an_empty_result():
+    """F.linear accepts M = 0; the per-token quant kernel launches one block per row."""
+    n, k = SHAPES["qkv"]
+    layer = linear_with(realistic_weight(n, k, seed=25, device="cuda"))
+    quantize_draft_linear(layer, "cutlass")
+    y = layer(torch.empty(0, k, device="cuda", dtype=torch.bfloat16))
+    assert y.shape == (0, n) and y.dtype == torch.bfloat16
+    wq, scale = quantize_rows(realistic_weight(n, k, seed=25, device="cuda"))
+    empty = cutlass_fp8_linear(
+        torch.empty(2, 0, k, device="cuda", dtype=torch.bfloat16), wq, scale
+    )
+    assert empty.shape == (2, 0, n)
+    torch.cuda.synchronize()
+
+
+@needs_cuda
 @pytest.mark.parametrize("kernel", KERNELS)
 @pytest.mark.parametrize("shape", ["gate_up", "down", "kernel_projection"])
 def test_repeat_is_bitwise_and_rows_are_independent(shape, kernel):
@@ -312,7 +520,9 @@ def test_repeat_is_bitwise_and_rows_are_independent(shape, kernel):
     quantize_draft_linear(layer, kernel)
     x = torch.randn(256, k, device="cuda", dtype=torch.bfloat16)
     first = layer(x)
-    torch.matmul(torch.randn(2048, 2048, device="cuda"), torch.randn(2048, 2048, device="cuda"))
+    torch.matmul(
+        torch.randn(2048, 2048, device="cuda"), torch.randn(2048, 2048, device="cuda")
+    )
     assert torch.equal(first, layer(x))
     # Per-token activation scales: a row's output does not depend on the other rows
     # (CUTLASS) -- Marlin, a weight-only kernel, has no activation scales at all. The
@@ -366,12 +576,16 @@ def test_draft_mlp_block_forward_error(kernel, default_vllm_config):
 
     hidden, inter = 8192, 28672
     conv = DFlashGroupedConv(
-        hidden, taps=2, group_size=16, block_size=8, params_dtype=torch.bfloat16,
+        hidden,
+        taps=2,
+        group_size=16,
+        block_size=8,
+        params_dtype=torch.bfloat16,
         prefix="conv",
     ).to("cuda")
     mlp = Qwen3MLP(hidden, inter, "silu", quant_config=None, prefix="mlp").to("cuda")
-    conv.base_kernel.data = (
-        0.5 * torch.randn(2, 2, hidden, device="cuda", dtype=torch.bfloat16)
+    conv.base_kernel.data = 0.5 * torch.randn(
+        2, 2, hidden, device="cuda", dtype=torch.bfloat16
     )
     conv.kernel_projection.weight.data = realistic_weight(
         2048, hidden, seed=11, device="cuda"
@@ -456,8 +670,8 @@ def test_the_fp8_head_returns_the_bf16_top_k_and_no_padded_column(default_vllm_c
             len(set(a.tolist()) & set(b.tolist())) / k
             for a, b in zip(ids.cpu(), ref_ids.cpu(), strict=True)
         ]
-        # The rank-aligned values agree within the FP8 error of a logit (e4m3 weights and
-        # activations: about 3.5% of the largest element, as in the layer test).
+        # The rank-aligned values agree within the FP8 error of a logit (e4m3 weights
+        # and activations: about 3.5% of the largest element, as in the layer test).
         assert (values - ref_values).abs().max() < 0.05 * values.abs().max()
     # Random Gaussian logits have close ranks: the FP8 head swaps some tied entries.
     assert sum(overlap) / len(overlap) > 0.7, sum(overlap) / len(overlap)
@@ -494,6 +708,196 @@ def test_the_head_graph_replay_equals_eager(default_vllm_config):
     torch.cuda.synchronize()
     ids, values = processor.get_top_k_tokens(fp8_head, hidden, 16)
     assert torch.equal(ids_static, ids) and torch.equal(values_static, values)
+
+
+# --------------------------------------------------------------------------------
+# TP8 (8 GPUs): row-parallel partials with per-rank scales, rank-identical replicated
+# layers, the FP8 head under the cross-rank top-k gather.
+# --------------------------------------------------------------------------------
+
+TP_ROWS = (8, 128)
+TP_QUERIES = 16
+
+
+def _fp8_tp_worker(rank: int, world: int, port: int, out_path: str) -> None:
+    from vllm.config import ParallelConfig, VllmConfig, set_current_vllm_config
+    from vllm.distributed import (
+        get_tp_group,
+        init_distributed_environment,
+        initialize_model_parallel,
+        tensor_model_parallel_all_gather,
+    )
+    from vllm.distributed.parallel_state import graph_capture
+    from vllm.model_executor.layers.linear import RowParallelLinear
+
+    torch.cuda.set_device(rank)
+    if os.environ.get("MUSE_TOPO_ENABLE") == "1":
+        # The host plugin patches the TP communicator (the collectives of production).
+        from vllm.plugins import load_general_plugins
+
+        load_general_plugins()
+    config = VllmConfig(parallel_config=ParallelConfig(tensor_parallel_size=world))
+    with set_current_vllm_config(config):
+        init_distributed_environment(
+            world_size=world,
+            rank=rank,
+            local_rank=rank,
+            distributed_init_method=f"tcp://127.0.0.1:{port}",
+            backend="nccl",
+        )
+        initialize_model_parallel(tensor_model_parallel_size=world)
+
+    def identical_on_all_ranks(t: torch.Tensor) -> bool:
+        everyone = tensor_model_parallel_all_gather(t.reshape(1, -1), 0)
+        return bool((everyone == everyone[0]).all())
+
+    def captured_equals_eager(fn, eager: torch.Tensor) -> bool:
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with (
+            graph_capture(device=torch.device("cuda", rank)) as capture,
+            torch.cuda.graph(graph, stream=capture.stream),
+        ):
+            out = fn()
+        graph.replay()
+        torch.cuda.synchronize()
+        return bool(torch.equal(out, eager))
+
+    results = {}
+    g = torch.Generator(device="cpu").manual_seed(31)
+    with set_current_vllm_config(config), torch.inference_mode():
+        # Row parallel: o_proj (64 heads x 128 = 8192 -> 8192) and down (28672 -> 8192).
+        # Every rank holds a K / 8 slice of the weight and scales its own partial.
+        for name, k_full in (("o", 8192), ("down", 28672)):
+            full = realistic_weight(8192, k_full, seed=40 + len(name), device="cuda")
+            k_rank = k_full // world
+            with torch.device("cuda"):
+                layer = RowParallelLinear(
+                    k_full,
+                    8192,
+                    bias=False,
+                    input_is_parallel=True,
+                    params_dtype=torch.bfloat16,
+                    return_bias=False,
+                    prefix=f"{name}_proj",
+                )
+            layer.weight.data = full[
+                :, rank * k_rank : (rank + 1) * k_rank
+            ].contiguous()
+            assert quantize_draft_linear(layer, "cutlass") > 0
+            for m in TP_ROWS:
+                x_full = torch.randn(m, k_full, generator=g).to("cuda", torch.bfloat16)
+                reference = x_full.float() @ full.float().t()
+                x_rank = x_full[:, rank * k_rank : (rank + 1) * k_rank].contiguous()
+                y = layer(x_rank)
+                results[f"{name}_{m}"] = dict(
+                    error=errors(y, reference),
+                    same_on_all_ranks=identical_on_all_ranks(y),
+                    graph_equal=captured_equals_eager(
+                        lambda lin=layer, a=x_rank: lin(a), y.clone()
+                    ),
+                )
+        # Replicated kernel projection: the same weights and inputs on every rank give
+        # bitwise the same output.
+        kp = realistic_weight(2048, 8192, seed=50, device="cuda")
+        with torch.device("cuda"):
+            kproj = ReplicatedLinear(
+                8192, 2048, bias=False, params_dtype=torch.bfloat16, return_bias=False
+            )
+        kproj.weight.data = kp.clone()
+        assert quantize_draft_linear(kproj, "cutlass") > 0
+        for m in TP_ROWS:
+            x = torch.randn(m, 8192, generator=g).to("cuda", torch.bfloat16)
+            y = kproj(x)
+            results[f"kproj_{m}"] = dict(
+                error=errors(y, x.float() @ kp.float().t()),
+                same_on_all_ranks=identical_on_all_ranks(y),
+                graph_equal=captured_equals_eager(lambda a=x: kproj(a), y.clone()),
+            )
+        # The candidate head: a vocabulary shard per rank (202048 / 8), queries aimed
+        # at tokens of every shard (the hidden state is the token's own row, so the
+        # top-1 is decisive), the cross-rank top-k gather over the FP8 values.
+        shard = VOCAB_SHARD
+        weight = realistic_weight(shard, HIDDEN, seed=60 + rank, device="cuda")
+        head = SimpleNamespace(
+            weight=nn.Parameter(weight, requires_grad=False),
+            quant_method=SimpleNamespace(
+                apply=lambda h, x, bias=None: F.linear(x, h.weight)
+            ),
+            tp_size=world,
+            shard_indices=SimpleNamespace(
+                org_vocab_start_index=rank * shard, num_org_vocab_padding=0
+            ),
+        )
+        fp8_head = DraftFp8Head(head)
+        picks = torch.randint(0, shard, (TP_QUERIES // world,), generator=g).cuda()
+        aimed = weight[picks] * (0.2 / 0.02)
+        queries = tensor_model_parallel_all_gather(aimed, dim=0)  # [16, 8192]
+        queries = torch.cat(
+            [queries, torch.randn(48, HIDDEN, generator=g).to("cuda", torch.bfloat16)]
+        )
+        processor = LogitsProcessor(
+            world * shard, scale=0.1767766952966369, soft_cap=20.0
+        )
+        ref_ids, ref_values = processor.get_top_k_tokens(head, queries, 16)
+        ids, values = processor.get_top_k_tokens(fp8_head, queries, 16)
+        aimed_rows = slice(0, TP_QUERIES)
+        overlap = [
+            len(set(a.tolist()) & set(b.tolist())) / 16
+            for a, b in zip(ids.cpu(), ref_ids.cpu(), strict=True)
+        ]
+        results["head"] = dict(
+            top1_equal=bool((ids[aimed_rows, 0] == ref_ids[aimed_rows, 0]).all()),
+            value_error=float((values - ref_values).abs().max() / values.abs().max()),
+            overlap=sum(overlap) / len(overlap),
+            shards_hit=len({int(i) // shard for i in ids[aimed_rows, 0].tolist()}),
+            in_range=bool((ids >= 0).all() and (ids < world * shard).all()),
+            same_on_all_ranks=identical_on_all_ranks(ids)
+            and identical_on_all_ranks(values),
+            graph_equal=captured_equals_eager(
+                lambda: processor.get_top_k_tokens(fp8_head, queries, 16)[1], values
+            ),
+        )
+        torch.distributed.barrier()
+    if rank == 0:
+        topo = getattr(get_tp_group().device_communicator, "topo_comm", None)
+        results["_collectives"] = "muse_topo" if topo is not None else "nccl"
+        with open(out_path, "w") as f:
+            json.dump(results, f)
+    torch.distributed.barrier()
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 8, reason="Requires 8 GPUs")
+def test_the_fp8_layers_and_head_on_8_ranks(tmp_path):
+    """Real per-rank shapes and collectives (the host plugin's when MUSE_TOPO_ENABLE=1):
+    row-parallel o_proj / down with a per-rank weight scale and a per-token activation
+    scale, summed by the all-reduce, stay within the single-rank error bound of the
+    fp32 reference and are identical on all ranks; the replicated kernel projection is
+    bitwise the same on every rank; the FP8 head's cross-rank top-k gather returns the
+    aimed tokens of every shard, identical on all ranks; CUDA graph replay equals
+    eager."""
+    import torch.multiprocessing as mp
+
+    out_path = str(tmp_path / "results.json")
+    port = 29200 + os.getpid() % 1000
+    mp.spawn(_fp8_tp_worker, args=(8, port, out_path), nprocs=8)
+    with open(out_path) as f:
+        results = json.load(f)
+    print("collectives:", results.pop("_collectives"))
+    for name, result in results.items():
+        print(name, result)
+    for name, result in results.items():
+        assert result["same_on_all_ranks"], (name, result)
+        assert result["graph_equal"], (name, result)
+        if name == "head":
+            assert result["top1_equal"], result
+            assert result["in_range"], result
+            assert result["shards_hit"] >= 3, result  # the queries span the shards
+            assert result["value_error"] < 0.05, result
+            assert result["overlap"] > 0.6, result
+        else:
+            assert result["error"][0] < BOUND_MAX["cutlass"], (name, result)
+            assert result["error"][1] < BOUND_RMS["cutlass"], (name, result)
 
 
 # --------------------------------------------------------------------------------

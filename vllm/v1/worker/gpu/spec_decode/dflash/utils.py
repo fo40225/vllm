@@ -73,7 +73,8 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
         dflash_model.lm_head = target_lm_head
 
     attach_fp8_head = getattr(dflash_model, "attach_fp8_head", None)
-    if attach_fp8_head is not None and getattr(dflash_model, "lm_head", None) is not None:
-        attach_fp8_head(dflash_model.lm_head)
+    head = getattr(dflash_model, "lm_head", None)
+    if attach_fp8_head is not None and head is not None:
+        attach_fp8_head(head)
 
     return dflash_model

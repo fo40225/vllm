@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import time
 from collections.abc import Callable
 
 import torch
@@ -19,12 +20,15 @@ from vllm.distributed import (
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
+    LinearBase,
     ReplicatedLinear,
     UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.muse_draft_fp8 import (
     DraftFp8Head,
+    DraftFp8LinearMethod,
+    check_kernel,
     quantize_draft_linear,
 )
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -461,17 +465,36 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
             scale=float(draft_config.get("output_multiplier", 1.0)),
             soft_cap=softcap if softcap > 0 else None,
         )
-        # The FP8 copy of the target's lm_head (VLLM_MUSE_SPARK_SM120_DRAFT_FP8=2), set by
-        # ``attach_fp8_head`` once the draft has been given the target's head.
+        # The FP8 copy of the target's lm_head (VLLM_MUSE_SPARK_SM120_DRAFT_FP8=2), set
+        # by ``attach_fp8_head`` once the draft has been given the target's head.
         self.fp8_head: DraftFp8Head | None = None
+
+    def _fp8_linears(self) -> list[LinearBase]:
+        """The linear layers VLLM_MUSE_SPARK_SM120_DRAFT_FP8 quantizes: per draft layer
+        the QKV, O, gate_up and down projections and the two kernel projections (30 on
+        the production draft: 5 layers x 6)."""
+        linears: list[LinearBase] = []
+        for layer in self.model.layers:
+            linears += [
+                layer.self_attn.qkv_proj,
+                layer.self_attn.o_proj,
+                layer.mlp.gate_up_proj,
+                layer.mlp.down_proj,
+                layer.attention_conv.kernel_projection,
+                layer.mlp_conv.kernel_projection,
+            ]
+        return linears
 
     def process_weights_after_loading(self) -> None:
         """Quantize the draft layers to FP8 (VLLM_MUSE_SPARK_SM120_DRAFT_FP8 >= 1).
 
         Runs from the model loader after the weights are loaded and finalized, which
         is after ``load_weights`` built the fused context K/V weight: that stays bf16
-        (the context projection is a prefill-sized GEMM, 21 MB per rank). The aux fc
-        stays bf16 as well: VLLM_MUSE_SPARK_SM120_DRAFT_FC_SHARD=2 slices its rows.
+        (the context projection is a prefill-sized GEMM, 21 MB per rank), and it is
+        checked here, because a fused weight built after this hook would be missing
+        (the context K/V would then run through the quantized QKV projections). The aux
+        fc stays bf16 as well: VLLM_MUSE_SPARK_SM120_DRAFT_FC_SHARD=2 slices its rows.
+        Weights are loaded once at boot; a ``reload_weights`` is not supported.
         """
         mode = envs.VLLM_MUSE_SPARK_SM120_DRAFT_FP8
         if mode not in (0, 1, 2):
@@ -481,29 +504,55 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
         if mode == 0:
             return
         kernel = envs.VLLM_MUSE_SPARK_SM120_DRAFT_FP8_KERNEL
-        count = 0
+        check_kernel(kernel)  # before any weight is replaced
+        linears = self._fp8_linears()
+        if all(isinstance(lin.quant_method, DraftFp8LinearMethod) for lin in linears):
+            return  # a second call: already quantized
+        if not hasattr(self.model, "_fused_kv_weight"):
+            self.model._build_fused_kv_buffers()  # dummy weights: build it now, bf16
+        if self.model._fused_kv_weight is None and any(
+            isinstance(layer.self_attn.qkv_proj.quant_method, UnquantizedLinearMethod)
+            for layer in self.model.layers
+        ):
+            raise RuntimeError(
+                "VLLM_MUSE_SPARK_SM120_DRAFT_FP8: the fused context K/V weight is "
+                "missing, so the context K/V would run through the FP8 QKV projections."
+            )
+        on_gpu = torch.cuda.is_available()
+        allocated_before = torch.cuda.memory_allocated() if on_gpu else 0
+        start = time.perf_counter()
         freed = 0
-        for layer in self.model.layers:
-            for linear in (
-                layer.self_attn.qkv_proj,
-                layer.self_attn.o_proj,
-                layer.mlp.gate_up_proj,
-                layer.mlp.down_proj,
-                layer.attention_conv.kernel_projection,
-                layer.mlp_conv.kernel_projection,
-            ):
-                saved = quantize_draft_linear(linear, kernel)
-                count += saved > 0
-                freed += saved
-        if torch.cuda.is_available():
+        for linear in linears:
+            freed += quantize_draft_linear(linear, kernel)
+        count = sum(
+            isinstance(lin.quant_method, DraftFp8LinearMethod) for lin in linears
+        )
+        if on_gpu:
             torch.cuda.empty_cache()  # hand the bf16 weights back to the driver
+        allocated_after = torch.cuda.memory_allocated() if on_gpu else 0
+        if count != len(linears):
+            logger.warning(
+                "VLLM_MUSE_SPARK_SM120_DRAFT_FP8=%d does not apply in full: %d of %d "
+                "draft linear layers were quantized (kernel %s), the others stay "
+                "bf16 (a quantized draft checkpoint, a bias, or a shape the kernel "
+                "does not take).",
+                mode,
+                count,
+                len(linears),
+                kernel,
+            )
+            return
         logger.info(
             "DFlash2 draft weights in FP8 (VLLM_MUSE_SPARK_SM120_DRAFT_FP8=%d, "
-            "kernel %s): %d linear layers quantized, %.0f MiB freed per rank.",
+            "kernel %s): %d linear layers quantized, %.0f MiB freed per rank "
+            "(allocated %.0f -> %.0f MiB, %.2f s).",
             mode,
             kernel,
             count,
             freed / 2**20,
+            allocated_before / 2**20,
+            allocated_after / 2**20,
+            time.perf_counter() - start,
         )
 
     def attach_fp8_head(self, lm_head: nn.Module) -> None:
@@ -512,9 +561,11 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
         if envs.VLLM_MUSE_SPARK_SM120_DRAFT_FP8 != 2:
             return
         weight = getattr(lm_head, "weight", None)
+        head_dtype = self.candidate_logits_processor.head_dtype
         if (
             not isinstance(
-                lm_head.quant_method, (UnquantizedEmbeddingMethod, UnquantizedLinearMethod)
+                lm_head.quant_method,
+                (UnquantizedEmbeddingMethod, UnquantizedLinearMethod),
             )
             or weight is None
             or weight.dtype not in (torch.bfloat16, torch.float16)
@@ -524,7 +575,20 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
                 "not a plain bf16 matrix. The candidate top-k keeps the bf16 head."
             )
             return
+        if head_dtype is not None and head_dtype != weight.dtype:
+            # LogitsProcessor._apply_head takes a plain-weight path for such a head
+            # and would raise at the first draft step.
+            logger.warning(
+                "VLLM_MUSE_SPARK_SM120_DRAFT_FP8=2 does not apply to the head: "
+                "head_dtype %s differs from the model dtype %s. The candidate top-k "
+                "keeps the bf16 head.",
+                head_dtype,
+                weight.dtype,
+            )
+            return
         self.fp8_head = DraftFp8Head(lm_head)
+        if weight.is_cuda:
+            torch.cuda.empty_cache()  # the fp32 quantization temporaries
         logger.info(
             "DFlash2 candidate head in FP8 (VLLM_MUSE_SPARK_SM120_DRAFT_FP8=2): an "
             "extra copy of %.0f MiB per rank.",

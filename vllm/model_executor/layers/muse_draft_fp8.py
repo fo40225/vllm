@@ -14,8 +14,14 @@ all-reduce then sums). Two kernels run them (VLLM_MUSE_SPARK_SM120_DRAFT_FP8_KER
   ``cutlass_scaled_mm`` with per-token x per-channel scales; also uses the FP8 tensor
   cores, so it keeps its gain above 128 rows where the draft turns compute bound.
 
-Both are plain device ops of a fixed schedule (no atomics: run-to-run deterministic)
-and capture into CUDA graphs.
+Both capture into CUDA graphs and are run-to-run deterministic: the SM120 CUTLASS c3x
+kernels (a persistent static scheduler, no stream-K or split-K) reduce the whole K
+extent inside one CTA, and Marlin is atomics-free as long as VLLM_MARLIN_USE_ATOMIC_ADD
+stays at its default 0 (with 1 its partial sums are added with atomics and the draft
+logits are no longer bitwise repeatable).
+
+The weights are loaded once, at boot: a later ``reload_weights`` would copy bf16 into
+the FP8 parameters, so a reload is not supported with the flag set.
 """
 
 from types import SimpleNamespace
@@ -40,19 +46,32 @@ FP8_MAX = 448.0
 _MIN_SCALE = 1.0 / (FP8_MAX * 512)
 # Rows are quantized in chunks so the fp32 temporaries stay near 64 MB.
 _QUANT_CHUNK_ELEMS = 16 * 1024 * 1024
-# CUTLASS needs N % 16 == 0 (vLLM otherwise falls back to a Triton kernel).
+# CUTLASS needs N % 16 == 0 and K % 16 == 0 (vLLM otherwise falls back to Triton).
 _CUTLASS_ROW_ALIGN = 16
 
 KERNELS = ("marlin", "cutlass")
 
 
+def check_kernel(kernel: str) -> None:
+    """Reject an unknown VLLM_MUSE_SPARK_SM120_DRAFT_FP8_KERNEL before any weight is
+    replaced."""
+    if kernel not in KERNELS:
+        raise ValueError(
+            f"VLLM_MUSE_SPARK_SM120_DRAFT_FP8_KERNEL={kernel!r}: expected one of "
+            f"{KERNELS}."
+        )
+
+
 def quantize_rows(
-    weight: torch.Tensor, pad_rows_to: int = 1
+    weight: torch.Tensor, pad_rows_to: int = 1, scale_in_bf16: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """[N, K] bf16/fp16 -> ([N', K] e4m3, [N'] fp32 scale) with one scale per row.
 
     ``weight ~= wq * scale[:, None]``; N' is N rounded up to ``pad_rows_to`` (the extra
-    rows are zero with scale 1).
+    rows are zero with scale 1). ``scale_in_bf16`` rounds the scale to bf16 before the
+    division, for a kernel that keeps the scale in bf16 (Marlin): the weights are then
+    quantized against the scale the kernel applies. A non-finite weight raises (its
+    row scale would be NaN or Inf and the row silently wrong).
     """
     n, k = weight.shape
     n_padded = -(-n // pad_rows_to) * pad_rows_to
@@ -63,6 +82,13 @@ def quantize_rows(
         end = min(start + step, n)
         rows = weight[start:end].float()
         row_scale = (rows.abs().amax(dim=1) / FP8_MAX).clamp_min(_MIN_SCALE)
+        if scale_in_bf16:
+            row_scale = row_scale.to(torch.bfloat16).float()
+        if not torch.isfinite(row_scale).all():
+            raise ValueError(
+                "the FP8 draft quantizer found a non-finite weight "
+                f"(rows {start}..{end} of {n})"
+            )
         wq[start:end] = (
             (rows / row_scale[:, None]).clamp_(-FP8_MAX, FP8_MAX).to(FP8_DTYPE)
         )
@@ -73,8 +99,11 @@ def quantize_rows(
 def cutlass_fp8_linear(
     x: torch.Tensor, wq: torch.Tensor, scale: torch.Tensor
 ) -> torch.Tensor:
-    """x [..., K] bf16 @ (wq [N', K] e4m3 * scale [N'])^T -> [..., N'] bf16 (W8A8)."""
+    """``x`` [..., K] bf16 @ (``wq`` [N', K] e4m3 * ``scale`` [N'])^T -> [..., N'] bf16
+    (W8A8)."""
     x2 = x.reshape(-1, x.shape[-1])
+    if x2.shape[0] == 0:  # the per-token quant kernel launches one block per row
+        return x.new_empty(*x.shape[:-1], wq.shape[0])
     if not x2.is_contiguous():
         x2 = x2.contiguous()
     xq, x_scale = ops.scaled_fp8_quant(x2, None, None, use_per_token_if_dynamic=True)
@@ -91,11 +120,7 @@ class DraftFp8LinearMethod(LinearMethodBase):
     requires_device_loading = False
 
     def __init__(self, kernel: str, out_features: int, in_features: int) -> None:
-        if kernel not in KERNELS:
-            raise ValueError(
-                f"VLLM_MUSE_SPARK_SM120_DRAFT_FP8_KERNEL={kernel!r}: expected one of "
-                f"{KERNELS}."
-            )
+        check_kernel(kernel)
         self.kernel = kernel
         self.out_features = out_features
         self.in_features = in_features
@@ -136,9 +161,12 @@ class DraftFp8LinearMethod(LinearMethodBase):
 def quantize_draft_linear(layer: LinearBase, kernel: str) -> int:
     """Quantize a loaded bf16 draft linear layer in place; returns the bytes freed.
 
-    Layers that are not plain unquantized bf16/fp16 (a quantized draft checkpoint) are
-    left alone and count as 0.
+    Layers that are not plain unquantized bf16/fp16 (a quantized draft checkpoint), have
+    a bias, or (cutlass) have a shape CUTLASS does not take are left alone and return 0:
+    the caller finds the quantized layers by their ``DraftFp8LinearMethod`` (the bytes
+    freed of a tiny layer can be zero or negative).
     """
+    check_kernel(kernel)
     if not isinstance(layer.quant_method, UnquantizedLinearMethod):
         return 0
     weight = layer.weight.data
@@ -146,9 +174,22 @@ def quantize_draft_linear(layer: LinearBase, kernel: str) -> int:
         return 0
     if getattr(layer, "bias", None) is not None:
         return 0  # the FP8 GEMMs take no bias (the draft has none)
-    before = weight.numel() * weight.element_size()
     out_features, in_features = weight.shape
-    wq, scale = quantize_rows(weight)
+    if kernel == "cutlass" and (
+        out_features % _CUTLASS_ROW_ALIGN or in_features % _CUTLASS_ROW_ALIGN
+    ):
+        # cutlass_scaled_mm silently runs a Triton kernel for such a shape (speed,
+        # determinism and graph behaviour untested): keep the layer in bf16 instead.
+        logger.warning(
+            "DFlash2 FP8 draft: a %dx%d layer is not a multiple of %d in N and K, "
+            "which CUTLASS needs: it stays bf16.",
+            out_features,
+            in_features,
+            _CUTLASS_ROW_ALIGN,
+        )
+        return 0
+    before = weight.numel() * weight.element_size()
+    wq, scale = quantize_rows(weight, scale_in_bf16=kernel == "marlin")
     if kernel == "marlin":
         from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
             prepare_fp8_layer_for_marlin,
@@ -178,7 +219,7 @@ def quantize_draft_linear(layer: LinearBase, kernel: str) -> int:
 
 
 class _HeadMethod:
-    """The ``quant_method`` of ``DraftFp8Head`` as ``LogitsProcessor._apply_head`` calls it."""
+    """The ``quant_method`` of ``DraftFp8Head``, as ``_apply_head`` calls it."""
 
     def apply(
         self, head: "DraftFp8Head", x: torch.Tensor, bias: torch.Tensor | None = None
@@ -191,12 +232,12 @@ class _HeadMethod:
 class DraftFp8Head(nn.Module):
     """An e4m3 copy of a vocab-parallel lm_head shard for the draft's candidate top-k.
 
-    The draft shares the target's bf16 lm_head (which the target needs as it is), so the
-    FP8 head is an extra copy (half the bytes of the shard) that the draft reads instead.
-    It stands in for the head in ``LogitsProcessor.get_top_k_tokens``: the rows are padded
-    to a multiple of 16 for CUTLASS and the logits come back as wide as the padded
-    shard, the padding counted in ``shard_indices.num_org_vocab_padding`` so that the
-    top-k masks those columns to -inf as it masks the vocabulary padding.
+    The draft shares the target's bf16 lm_head (which the target needs as it is), so
+    the FP8 head is an extra copy (half the bytes of the shard) that the draft reads
+    instead. It stands in for the head in ``LogitsProcessor.get_top_k_tokens``: the rows
+    are padded to a multiple of 16 for CUTLASS and the logits come back as wide as the
+    padded shard, the padding counted in ``shard_indices.num_org_vocab_padding`` so that
+    the top-k masks those columns to -inf as it masks the vocabulary padding.
     """
 
     def __init__(self, lm_head: nn.Module) -> None:
