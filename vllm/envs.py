@@ -170,7 +170,7 @@ if TYPE_CHECKING:
     VLLM_MUSE_SPARK_SM120_TOPK_LOGITS: bool = True
     VLLM_MUSE_SPARK_SM120_TOPK_LOGITS_K: int = 64
     VLLM_MUSE_SPARK_SM120_TOPK_LOGITS_MIN_TOKENS: int = 2
-    VLLM_MUSE_SPARK_SM120_VERIFY_TOPK_LOGITS: int = 0
+    VLLM_MUSE_SPARK_SM120_VERIFY_TOPK_LOGITS: int = 2
     VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT: bool = True
     VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT_TABLE: str | None = None
     VLLM_MUSE_SPARK_SM120_DENSE_Q: bool = True
@@ -1759,7 +1759,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # [rows, vocab] logits, their fp32 copy and the full-vocabulary passes of the
     # rejection sampler. 0: the full verification; 1: steps in which every request is
     # greedy (the argmax of each row: for finite logits the tokens of the full path,
-    # bit for bit); 2: also steps with requests of temperature > 0 and
+    # bit for bit); 2 (default): also steps with requests of temperature > 0 and
     # top_k <= K (the default top_k of the Muse Spark checkpoint is 64), with the block
     # method and a draft distribution as wide as the vocabulary (the production
     # drafter): the accepted length and the resampled token are drawn with the uniforms
@@ -1778,7 +1778,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the reasons of the others are logged every 30 s ("steps with drafts"; those steps
     # do not count in the lines of the top-k logits sampling). Read once, in load_model.
     "VLLM_MUSE_SPARK_SM120_VERIFY_TOPK_LOGITS": lambda: int(
-        os.getenv("VLLM_MUSE_SPARK_SM120_VERIFY_TOPK_LOGITS", "0")
+        os.getenv("VLLM_MUSE_SPARK_SM120_VERIFY_TOPK_LOGITS", "2")
     ),
     # Muse Spark on SM120: place the experts of every MoE layer on the EP ranks by the
     # table of the model snapshot (vllm/models/muse_spark/nvidia/data/

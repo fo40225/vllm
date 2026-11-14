@@ -154,10 +154,13 @@ def test_the_level_follows_the_flag(monkeypatch, level):
     assert (runner.topk_verify_stats is not None) == (level > 0)
 
 
-def test_the_flag_is_off_by_default(monkeypatch):
+def test_the_flag_is_on_by_default(monkeypatch):
+    """The default is level 2: greedy and sampled steps are verified from the
+    candidates (the accuracy policy: identical for greedy, distribution-exact for
+    sampled rows)."""
     got, runner = resolve(monkeypatch, None)
-    assert got == 0 and not runner.topk_verify_sampled
-    assert runner.topk_verify_stats is None
+    assert got == 2 and runner.topk_verify_sampled
+    assert runner.topk_verify_stats is not None
 
 
 @pytest.mark.parametrize(
