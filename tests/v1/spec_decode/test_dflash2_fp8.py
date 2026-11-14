@@ -202,6 +202,13 @@ def draft_linears(fake):
         yield layer.mlp_conv.kernel_projection
 
 
+def test_the_flag_defaults_to_the_head_copy_and_cutlass(monkeypatch):
+    monkeypatch.delenv(FLAG, raising=False)
+    monkeypatch.delenv(KERNEL_FLAG, raising=False)
+    assert envs.VLLM_MUSE_SPARK_SM120_DRAFT_FP8 == 2
+    assert envs.VLLM_MUSE_SPARK_SM120_DRAFT_FP8_KERNEL == "cutlass"
+
+
 def test_hook_is_a_noop_when_the_flag_is_off(monkeypatch):
     monkeypatch.setenv(FLAG, "0")
     fake = fake_draft()
