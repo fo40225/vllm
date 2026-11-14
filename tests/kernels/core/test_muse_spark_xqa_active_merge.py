@@ -576,6 +576,19 @@ def test_install_wraps_gen_xqa_module_once(monkeypatch):
     assert am.install() and am.fi_xqa.gen_xqa_module is wrapped
 
 
+def test_shadow_module_is_refused_after_install(monkeypatch):
+    """The module of the installed hook has the name of the shadow module."""
+    original = am.fi_xqa.gen_xqa_module
+    monkeypatch.setattr(am.fi_xqa, "gen_xqa_module", original)  # restored afterwards
+    assert am.install()
+    args = (torch.bfloat16, torch.float8_e4m3fn, 16, 64, 8, True, torch.bfloat16, 1)
+    with pytest.raises(RuntimeError, match="after install"):
+        am.shadow_xqa_module(*args, False)
+    with pytest.raises(RuntimeError, match="after install"):
+        with am.use_shadow_modules():
+            am.fi_xqa._get_xqa_module_cached(*args, False)
+
+
 def test_install_declines_for_another_flashinfer(monkeypatch):
     original = am.fi_xqa.gen_xqa_module
     monkeypatch.setattr(am, "unavailable_reason", lambda: "FlashInfer 9.9")

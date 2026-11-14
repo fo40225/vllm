@@ -16,8 +16,10 @@ changed (a CUDA graph cannot change it), the output is bitwise the one of the st
 kernel (the partials that are left out are exact zeros).
 
 ``install`` routes ``flashinfer.xqa.gen_xqa_module`` through the shadow for every XQA
-module that the process builds afterwards. ``shadow_xqa_module`` gives the shadow
-module of one configuration next to the stock one (tests and benchmarks).
+module that the process builds afterwards (the model calls it when
+``VLLM_MUSE_SPARK_SM120_XQA_ACTIVE_MERGE`` is on). ``shadow_xqa_module`` gives the
+shadow module of one configuration next to the stock one (tests and benchmarks, in a
+process that did not call ``install``).
 """
 
 import contextlib
@@ -28,7 +30,6 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
-from vllm import envs
 from vllm.logger import init_logger
 from vllm.models.muse_spark.nvidia import flashinfer_shadow as shadow
 
@@ -119,11 +120,6 @@ def install() -> bool:
     return True
 
 
-def maybe_install() -> bool:
-    """``install`` when ``VLLM_MUSE_SPARK_SM120_XQA_ACTIVE_MERGE`` is on."""
-    return envs.VLLM_MUSE_SPARK_SM120_XQA_ACTIVE_MERGE and install()
-
-
 def shadow_xqa_module(*module_args: Any) -> Any:
     """The shadow module of a configuration, built even where ``install`` did not run.
 
@@ -131,8 +127,15 @@ def shadow_xqa_module(*module_args: Any) -> Any:
     (input dtype, KV dtype, page size, head dim, head group ratio, sliding window,
     output dtype, q_seq_len, ragged Q). The module has its own name and torch op, so
     it works next to the stock module of the same configuration. Raises when it
-    cannot be the shadow.
+    cannot be the shadow, and in a process that called ``install`` (the module of a
+    configuration that ``install`` built has the same name, and FlashInfer would
+    register its torch op a second time).
     """
+    if getattr(fi_xqa.gen_xqa_module, _PATCHED_ATTR, False):
+        raise RuntimeError(
+            "shadow_xqa_module cannot be used after install(): the installed hook "
+            "serves the shadow modules through flashinfer.xqa itself"
+        )
     with _swap_lock:
         module = _shadow_modules.get(module_args)
         if module is None:
