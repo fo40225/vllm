@@ -203,7 +203,13 @@ def _model_with_layers(hookable: bool) -> model_ops.MuseSpark1xModel:
         moe.experts = experts
         moe.experts.hooks = []
         moe.experts.supports_after_gemm2_hook = hookable
-        layers.append(SimpleNamespace(feed_forward=moe, self_attn=SimpleNamespace()))
+        layers.append(
+            SimpleNamespace(
+                feed_forward=moe,
+                self_attn=SimpleNamespace(),
+                fuses_unpooler_gemv=lambda num_tokens: False,
+            )
+        )
     model = object.__new__(model_ops.MuseSpark1xModel)
     model.layers = layers
     model.start_layer, model.end_layer = 0, 3
@@ -267,6 +273,12 @@ def _model_with_launchable_hooks() -> model_ops.MuseSpark1xModel:
     return model
 
 
+def _capturing(monkeypatch) -> None:
+    """The hooks launch only inside a graph capture: pretend there is one (the launch
+    itself is replaced in these tests)."""
+    monkeypatch.setattr(L2Prefetcher, "active", staticmethod(lambda: True))
+
+
 def _launches_of_the_hooks(monkeypatch) -> list[tuple[int, int | None]]:
     """What the two hooks of layer 0 launch, with the lists of order 0: (number of
     tensors, CTA count or None)."""
@@ -278,6 +290,7 @@ def _launches_of_the_hooks(monkeypatch) -> list[tuple[int, int | None]]:
     monkeypatch.setenv(ORDER_KNOB, "0")
     monkeypatch.setattr(muse_c, "preflight", lambda: None)
     monkeypatch.setattr(L2Prefetcher, "launch", launch)
+    _capturing(monkeypatch)
     model = _model_with_launchable_hooks()
     model._configure_l2_prefetch()
     model.layers[0].feed_forward.experts.hooks[0](1)
@@ -383,6 +396,7 @@ def _hook_lists(monkeypatch, layer, num_tokens, order=None, ctas=C):
         launches.append(([model.names[id(t)] for t in tensors], num_ctas))
 
     monkeypatch.setattr(L2Prefetcher, "launch", launch)
+    _capturing(monkeypatch)
     model._configure_l2_prefetch()
     hooked = model.layers[layer]
     for hook in [*hooked.feed_forward.experts.hooks, hooked.self_attn.after_qkv_hook]:
@@ -509,3 +523,29 @@ def test_an_order_the_prefetch_does_not_have_is_refused_at_construction(
     monkeypatch.setattr(muse_c, "preflight", lambda: None)
     with pytest.raises(ValueError, match=ORDER_KNOB):
         _named_model()._configure_l2_prefetch()
+
+
+def test_the_hooks_do_nothing_outside_a_capture(monkeypatch):
+    """Eager steps of up to 256 rows (small prefill chunks) run the hooks too: they must
+    neither launch nor ask the layer about its collectives."""
+    monkeypatch.setattr(muse_c, "preflight", lambda: None)
+    monkeypatch.setenv(ORDER_KNOB, "4")
+    assert not torch.cuda.is_current_stream_capturing()
+    assert not L2Prefetcher.active()
+    model = _named_model()
+    launches = []
+    monkeypatch.setattr(
+        L2Prefetcher, "launch", lambda self, tensors, num_ctas=None: launches.append(1)
+    )
+
+    def ask(num_tokens):
+        raise AssertionError("asked the layer outside a capture")
+
+    for layer in model.layers:
+        layer.fuses_unpooler_gemv = ask
+        layer.feed_forward.sharded_weights = lambda num_tokens, op: ask(num_tokens)
+    model._configure_l2_prefetch()
+    for layer in model.layers[1:4]:
+        for hook in [*layer.feed_forward.experts.hooks, layer.self_attn.after_qkv_hook]:
+            hook(1)
+    assert launches == []

@@ -131,7 +131,9 @@ class L2Prefetcher:
         self._forked = False
 
     @staticmethod
-    def _active() -> bool:
+    def active() -> bool:
+        """Whether a launch now would be captured: only inside a full CUDA graph
+        capture. Callers that build their tensor lists skip that work outside it."""
         if not torch.cuda.is_current_stream_capturing():
             return False
         from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
@@ -173,7 +175,7 @@ class L2Prefetcher:
     ) -> None:
         """Prefetch ``tensors`` after the work queued on the current stream, with
         ``num_ctas`` CTAs (default: the prefetcher's)."""
-        if not self._active():
+        if not self.active():
             return
         tensors = self.select(tensors)
         if not tensors:

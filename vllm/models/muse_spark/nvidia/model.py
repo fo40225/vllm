@@ -2927,7 +2927,7 @@ class MuseSpark1xModel(LlamaModel):
             next_attn = next_layer.self_attn
 
             def hook(num_tokens: int) -> None:
-                if num_tokens > L2_PREFETCH_MAX_TOKENS:
+                if num_tokens > L2_PREFETCH_MAX_TOKENS or not prefetcher.active():
                     return
                 unpooler = moe.sharded_weights(num_tokens, moe.unpooler)
                 if order.skip_fused_unpooler and layer.fuses_unpooler_gemv(num_tokens):
@@ -2948,7 +2948,7 @@ class MuseSpark1xModel(LlamaModel):
             attn = layer.self_attn
 
             def hook(num_tokens: int) -> None:
-                if num_tokens > L2_PREFETCH_MAX_TOKENS:
+                if num_tokens > L2_PREFETCH_MAX_TOKENS or not prefetcher.active():
                     return
                 # The O GEMM follows the attention: its weight leads the launch, and
                 # the launch is as fast as the one behind the experts.
