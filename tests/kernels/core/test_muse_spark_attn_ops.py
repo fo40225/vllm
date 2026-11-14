@@ -139,9 +139,11 @@ def assert_fp8_cache_close(got, expected, exact_fraction=0.999):
     )
 
 
-def make_case(num_tokens, nq, nkv, dtype, device, with_gate=True, seed=0):
+def make_case(
+    num_tokens, nq, nkv, dtype, device, with_gate=True, seed=0, head_dim=HEAD_DIM
+):
     torch.manual_seed(seed)
-    qsz, kvsz = nq * HEAD_DIM, nkv * HEAD_DIM
+    qsz, kvsz = nq * head_dim, nkv * head_dim
     gate = qsz if with_gate else 0
     qkv = torch.randn(num_tokens, qsz + 2 * kvsz + gate, dtype=dtype, device=device)
     return qkv, qsz, kvsz, gate
@@ -161,10 +163,13 @@ def check_qk_norm_rope(
     rotary_dim=HEAD_DIM,
     with_gate=True,
     rope_dtype=torch.float32,
+    head_dim=HEAD_DIM,
 ):
     device, eps, max_pos = "cuda", 1e-5, 4096
 
-    qkv, qsz, kvsz, gate = make_case(num_tokens, nq, nkv, dtype, device, with_gate)
+    qkv, qsz, kvsz, gate = make_case(
+        num_tokens, nq, nkv, dtype, device, with_gate, head_dim=head_dim
+    )
     qkv_orig = qkv.clone()
     cos_sin = (
         make_cos_sin_cache(max_pos, rotary_dim, 500_000.0, device, rope_dtype)
@@ -180,7 +185,7 @@ def check_qk_norm_rope(
         positions,
         nq,
         nkv,
-        HEAD_DIM,
+        head_dim,
         eps,
         cos_sin_cache=cos_sin,
         rotary_dim=rotary_dim if use_rope else 0,
@@ -190,10 +195,10 @@ def check_qk_norm_rope(
     q_in, k_in, v_in, og_in = split_qkv(qkv_orig, qsz, kvsz, gate)
 
     q_ref = qk_norm_rope_ref(
-        q_in.view(num_tokens, nq, HEAD_DIM), positions, cos_sin, rotary_dim, eps
+        q_in.view(num_tokens, nq, head_dim), positions, cos_sin, rotary_dim, eps
     ).view(num_tokens, qsz)
     k_ref = qk_norm_rope_ref(
-        k_in.view(num_tokens, nkv, HEAD_DIM), positions, cos_sin, rotary_dim, eps
+        k_in.view(num_tokens, nkv, head_dim), positions, cos_sin, rotary_dim, eps
     ).view(num_tokens, kvsz)
 
     # rsqrtf and lane summation order cost a couple of fp32 ulp, well inside
@@ -252,15 +257,35 @@ def test_qk_norm_rope_layout_variants(fused_insert, num_tokens, variant):
 def test_kv_insert(
     fused_insert, num_tokens, nq, nkv, kv_cache_dtype, use_rope, scales, storage
 ):
+    check_kv_insert(
+        fused_insert, num_tokens, nq, nkv, kv_cache_dtype, use_rope, scales, storage
+    )
+
+
+def check_kv_insert(
+    fused_insert,
+    num_tokens,
+    nq,
+    nkv,
+    kv_cache_dtype,
+    use_rope,
+    scales,
+    storage,
+    head_dim=HEAD_DIM,
+    rotary_dim=None,
+):
     device, dtype, eps = "cuda", torch.bfloat16, 1e-5
-    rotary_dim, max_pos, block_size = HEAD_DIM, 4096, 16
+    rotary_dim = head_dim if rotary_dim is None else rotary_dim
+    max_pos, block_size = 4096, 16
     is_fp8 = kv_cache_dtype != "auto"
     if is_fp8 and kv_cache_dtype == "fp8_e5m2" and storage != torch.uint8:
         pytest.skip("e5m2 codes are stored as raw bytes")
     if not is_fp8 and storage != torch.uint8:
         pytest.skip("the storage dtype only matters for an fp8 cache")
 
-    qkv, qsz, kvsz, gate = make_case(num_tokens, nq, nkv, dtype, device, seed=1)
+    qkv, qsz, kvsz, gate = make_case(
+        num_tokens, nq, nkv, dtype, device, seed=1, head_dim=head_dim
+    )
     qkv_orig = qkv.clone()
     cos_sin = (
         make_cos_sin_cache(max_pos, rotary_dim, 500_000.0, device) if use_rope else None
@@ -272,7 +297,7 @@ def test_kv_insert(
     num_blocks = (num_tokens + block_size - 1) // block_size + 1
     cache_dtype = storage if is_fp8 else dtype
     kv_cache = torch.zeros(
-        num_blocks, nkv, block_size, 2 * HEAD_DIM, dtype=cache_dtype, device=device
+        num_blocks, nkv, block_size, 2 * head_dim, dtype=cache_dtype, device=device
     )
     slot_mapping = torch.randperm(
         num_blocks * block_size, dtype=torch.int64, device=device
@@ -291,7 +316,7 @@ def test_kv_insert(
         positions,
         nq,
         nkv,
-        HEAD_DIM,
+        head_dim,
         eps,
         cos_sin_cache=cos_sin,
         rotary_dim=rotary_dim if use_rope else 0,
@@ -307,10 +332,10 @@ def test_kv_insert(
     q_in, k_in, v_in, og_in = split_qkv(qkv_orig, qsz, kvsz, gate)
 
     q_ref = qk_norm_rope_ref(
-        q_in.view(num_tokens, nq, HEAD_DIM), positions, cos_sin, rotary_dim, eps
+        q_in.view(num_tokens, nq, head_dim), positions, cos_sin, rotary_dim, eps
     ).view(num_tokens, qsz)
     k_ref = qk_norm_rope_ref(
-        k_in.view(num_tokens, nkv, HEAD_DIM), positions, cos_sin, rotary_dim, eps
+        k_in.view(num_tokens, nkv, head_dim), positions, cos_sin, rotary_dim, eps
     ).view(num_tokens, kvsz)
     torch.testing.assert_close(q_out, q_ref, rtol=1e-2, atol=1e-2)
     torch.testing.assert_close(k_out, k_ref, rtol=1e-2, atol=1e-2)
@@ -318,10 +343,10 @@ def test_kv_insert(
     torch.testing.assert_close(og_out, og_in, rtol=0, atol=0)
 
     expected = torch.zeros_like(kv_cache)
-    exp_k, exp_v = expected.transpose(1, 2).split(HEAD_DIM, dim=-1)
+    exp_k, exp_v = expected.transpose(1, 2).split(head_dim, dim=-1)
     ops.reshape_and_cache_flash(
-        k_out.view(num_tokens, nkv, HEAD_DIM),
-        v_out.view(num_tokens, nkv, HEAD_DIM),
+        k_out.view(num_tokens, nkv, head_dim),
+        v_out.view(num_tokens, nkv, head_dim),
         exp_k,
         exp_v,
         slot_mapping,
@@ -333,6 +358,138 @@ def test_kv_insert(
         torch.testing.assert_close(kv_cache, expected, rtol=0, atol=0)
     else:
         assert_fp8_cache_close(kv_cache.view(torch.uint8), expected.view(torch.uint8))
+
+
+def full_wave_tokens(nq, nkv, head_dim, insert_kv):
+    """Fewest tokens whose one-head-per-group grid fills a wave of resident blocks.
+
+    The launcher widens its head groups from there on. This mirrors its wave
+    (256-thread blocks, as many per SM as the thread limit allows, at most the 6
+    that its register cap guarantees) so the tests straddle the switch on any GPU.
+    """
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    resident = max(1, min(props.max_threads_per_multi_processor // 256, 6))
+    wave = props.multi_processor_count * resident
+    slots = nq + nkv + (nkv if insert_kv else 0)
+    # Smallest n with ceil(n * slots * lanes / 256) >= wave, 8 elements per lane.
+    return ((wave - 1) * 256) // (slots * (head_dim // 8)) + 1
+
+
+# (nq, nkv, head_dim, rotary_dim): head layouts beyond this model's TP4/TP8 ones,
+# including an odd slot count (only one head per group can divide it).
+HEAD_CONFIGS = [
+    pytest.param(8, 1, 64, 64, id="q8-kv1-hd64"),
+    pytest.param(12, 4, 64, 32, id="q12-kv4-hd64-partial-rope"),
+    pytest.param(7, 1, 64, 64, id="q7-kv1-hd64-odd-slots"),
+    pytest.param(64, 8, 64, 64, id="q64-kv8-hd64"),
+    pytest.param(8, 1, 128, 128, id="q8-kv1-hd128"),
+    pytest.param(32, 8, 128, 64, id="q32-kv8-hd128-partial-rope"),
+    pytest.param(12, 4, 256, 128, id="q12-kv4-hd256"),
+]
+
+
+@pytest.mark.parametrize("nq,nkv,head_dim,rotary_dim", HEAD_CONFIGS)
+@pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
+@pytest.mark.parametrize("use_rope", [True, False])
+def test_head_configurations(
+    fused_insert, nq, nkv, head_dim, rotary_dim, kv_cache_dtype, use_rope
+):
+    """Every head layout is right below, at and far above the group widening point."""
+    wave_tokens = full_wave_tokens(nq, nkv, head_dim, insert_kv=True)
+    for num_tokens in (5, wave_tokens - 1, wave_tokens, 2 * wave_tokens + 1):
+        check_kv_insert(
+            fused_insert,
+            num_tokens,
+            nq,
+            nkv,
+            kv_cache_dtype,
+            use_rope,
+            (0.37, 1.83),
+            torch.uint8,
+            head_dim=head_dim,
+            rotary_dim=rotary_dim,
+        )
+    # No cache bound: one slot fewer per K head, so a different widening point.
+    check_qk_norm_rope(
+        fused_insert,
+        2 * full_wave_tokens(nq, nkv, head_dim, insert_kv=False) + 1,
+        nq,
+        nkv,
+        torch.bfloat16,
+        use_rope,
+        rotary_dim=rotary_dim,
+        head_dim=head_dim,
+    )
+
+
+@pytest.mark.parametrize(
+    "nq,nkv,head_dim,rotary_dim",
+    [
+        pytest.param(16, 2, 64, 64, id="tp8"),
+        pytest.param(32, 4, 64, 64, id="tp4"),
+        pytest.param(7, 1, 64, 64, id="odd-slots"),
+        pytest.param(12, 4, 256, 128, id="hd256"),
+    ],
+)
+@pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
+def test_group_width_does_not_change_the_bits(
+    fused_insert, nq, nkv, head_dim, rotary_dim, kv_cache_dtype
+):
+    """A token's output cannot depend on how many tokens share the launch.
+
+    The batch size picks the head group width, so the first n tokens of a large
+    batch (wide groups) must match a launch of just those n (narrow groups).
+    """
+    device, dtype, block_size, max_pos = "cuda", torch.bfloat16, 16, 4096
+    is_fp8 = kv_cache_dtype != "auto"
+    wave_tokens = full_wave_tokens(nq, nkv, head_dim, insert_kv=True)
+    total = 2 * wave_tokens + 1
+    qkv, _, _, _ = make_case(total, nq, nkv, dtype, device, seed=3, head_dim=head_dim)
+    positions = torch.randint(0, max_pos, (total,), dtype=torch.int64, device=device)
+    cos_sin = make_cos_sin_cache(max_pos, rotary_dim, 500_000.0, device)
+    num_blocks = (total + block_size - 1) // block_size + 1
+    slots = torch.randperm(num_blocks * block_size, dtype=torch.int64, device=device)
+    slots = slots[:total].contiguous()
+    slots[::3] = -1
+    k_scale = torch.tensor(0.37, dtype=torch.float32, device=device)
+    v_scale = torch.tensor(1.83, dtype=torch.float32, device=device)
+
+    def run(n, placed):
+        """Launch on the first n tokens; only the first `placed` write the cache."""
+        x = qkv[:n].clone()
+        cache = torch.zeros(
+            num_blocks,
+            nkv,
+            block_size,
+            2 * head_dim,
+            dtype=torch.uint8 if is_fp8 else dtype,
+            device=device,
+        )
+        slot_mapping = slots[:n].clone()
+        slot_mapping[placed:] = -1
+        fused_insert(
+            x,
+            positions[:n],
+            nq,
+            nkv,
+            head_dim,
+            1e-5,
+            cos_sin_cache=cos_sin,
+            rotary_dim=rotary_dim,
+            slot_mapping=slot_mapping,
+            kv_cache=cache,
+            block_size=block_size,
+            kv_cache_dtype=kv_cache_dtype,
+            k_scale=k_scale if is_fp8 else None,
+            v_scale=v_scale if is_fp8 else None,
+        )
+        return x, cache.view(torch.uint8) if is_fp8 else cache.view(torch.int16)
+
+    for n in (1, 5, wave_tokens - 1, wave_tokens, total - 1):
+        x_prefix, cache_prefix = run(n, n)
+        x_full, cache_full = run(total, n)
+        assert torch.equal(x_full[:n], x_prefix), n
+        assert torch.equal(cache_full, cache_prefix), n
 
 
 # The fused Q output requires E4M3FN; scaled_fp8_quant uses the platform dtype.

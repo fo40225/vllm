@@ -12,7 +12,8 @@
  * boundary becomes at::Tensor, the helpers of vLLM's csrc (type conversion,
  * fp8 cache dtype parsing) are replaced by the local ones below, and the ROCm
  * and pre-Ampere paths are dropped (`_muse_C` builds for SM12x only). The
- * kernel and its launch heuristics are unchanged.
+ * kernel is unchanged; the choice of head group width is not (see
+ * launchFusedMuseSpark).
  *
  * A group of ``head_dim * sizeof(scalar_t) / 16`` lanes owns one head (8 lanes
  * for bf16 head_dim=64), so each lane moves one 16-byte vector, the rotated
@@ -156,6 +157,11 @@ inline int device_sm_count() {
   static std::atomic<int> count[kMaxCachedDevices];
   return device_attribute(cudaDevAttrMultiProcessorCount, count);
 }
+
+inline int device_max_threads_per_sm() {
+  static std::atomic<int> threads[kMaxCachedDevices];
+  return device_attribute(cudaDevAttrMaxThreadsPerMultiProcessor, threads);
+}
 }  // namespace
 
 // 16 bytes per lane: the widest vector access, and the reason a head is owned
@@ -164,6 +170,13 @@ constexpr int kBytesPerLane = 16;
 
 using WarpMask = unsigned;
 constexpr unsigned kWarpSize = 32;
+
+// The kernel is issue-bound, so it is built to keep the SM full: the register
+// cap that __launch_bounds__ derives from kMinBlocksPerSM (40 registers at 256
+// threads on a 64K-register SM) lets that many blocks be resident wherever the
+// thread limit allows it (6 x 256 = 1536 threads on SM12x).
+constexpr int kBlockSize = 256;
+constexpr int kMinBlocksPerSM = 6;
 
 // Slot -> (token, head) needs a division by a value only known at launch. The
 // kernel is issue-bound, and a 32-bit hardware division is ~20 instructions of
@@ -319,7 +332,8 @@ template <typename scalar_t, typename cache_t, KVCacheDtype kv_dt,
           typename rope_t, int HEAD_DIM, int HEADS_PER_GROUP, bool kDoRope,
           bool kInsertKV>
 __global__
-__launch_bounds__(256, 6) void fusedMuseSparkQKNormRopeKVInsertKernel(
+__launch_bounds__(kBlockSize, kMinBlocksPerSM) void
+fusedMuseSparkQKNormRopeKVInsertKernel(
     scalar_t* __restrict__ qkv,                // [N, qkv_stride] in/out
     rope_t const* __restrict__ cos_sin_cache,  // [max_pos, rotary_dim]
     int64_t const* __restrict__ positions,     // [N] i64
@@ -506,7 +520,6 @@ void launchFusedMuseSparkTyped(
       static_cast<int64_t>(num_tokens) * chunks_per_token * kLanes;
   if (total_lanes == 0) return;
 
-  constexpr int kBlockSize = 256;
   int const grid =
       static_cast<int>((total_lanes + kBlockSize - 1) / kBlockSize);
 
@@ -560,43 +573,32 @@ void launchFusedMuseSpark(
     int64_t const qkv_stride, int const block_size, int64_t const kv_s_block,
     int64_t const kv_s_head, int64_t const kv_s_token, bool const do_rope,
     bool const insert_kv, cudaStream_t stream) {
-  // The group width must divide the slot count. Widen only while the grid
-  // still covers a full wave; decode-sized batches keep the narrow schedule.
+  // Two heads per group pay the slot division, the position load and the
+  // cos/sin load once for both, at the price of half the blocks. Widen as soon
+  // as the one-head grid alone fills a wave of resident blocks, i.e. once there
+  // is parallelism to spare; decode-sized batches keep the narrow schedule. The
+  // width must divide the slot count. The width only decides which lanes touch
+  // which head, never what is written.
+  //
+  // Four heads per group were swept too (RTX PRO 6000 Blackwell, 188 SMs,
+  // head_dim 64..256, 8..128 q heads, auto / fp8 caches, RoPE and NoPE, 1 to
+  // 16384 tokens): at best 2% faster than the better of 1 and 2 (noise level),
+  // 1.3x slower at the median. The RoPE variants spill registers under the cap
+  // that kMinBlocksPerSM puts on the kernel.
   int const slots_per_token = nq + nkv + (insert_kv ? nkv : 0);
   constexpr int kElemsSel = kBytesPerLane / sizeof(scalar_t);
-  constexpr int kBlockSel = 256;
   int const lanes_per_head = head_dim / kElemsSel;
+  int const resident_blocks =
+      std::max(1, std::min(device_max_threads_per_sm() / kBlockSize,
+                           kMinBlocksPerSM));
   int64_t const full_wave =
-      static_cast<int64_t>(device_sm_count()) * (2048 / kBlockSel);
-  int heads_per_group = 1;
-  for (int h : {4, 2}) {
-    if (slots_per_token % h != 0) continue;
-    int64_t const blocks = (static_cast<int64_t>(num_tokens) *
-                                (slots_per_token / h) * lanes_per_head +
-                            kBlockSel - 1) /
-                           kBlockSel;
-    if (blocks >= full_wave) {
-      heads_per_group = h;
-      break;
-    }
-  }
-
-  // TP4/TP8 amortize head addressing before filling a full CTA wave. RoPE
-  // benefits earlier; FP8 conversion keeps wider groups expensive for longer.
-  if (insert_kv && head_dim == 64 &&
-      ((nq == 16 && nkv == 2) || (nq == 32 && nkv == 4))) {
-    int64_t const query_heads = static_cast<int64_t>(num_tokens) * nq;
-    if (do_rope && query_heads >= 24576) {
-      heads_per_group = std::max(heads_per_group, 2);
-      if constexpr (kv_dt == KVCacheDtype::kAuto) {
-        if (query_heads >= 49152) heads_per_group = 4;
-      }
-    } else if (!do_rope && query_heads >= 32768) {
-      if constexpr (kv_dt == KVCacheDtype::kAuto) {
-        heads_per_group = std::max(heads_per_group, 2);
-      }
-    }
-  }
+      static_cast<int64_t>(device_sm_count()) * resident_blocks;
+  int64_t const narrow_blocks =
+      (static_cast<int64_t>(num_tokens) * slots_per_token * lanes_per_head +
+       kBlockSize - 1) /
+      kBlockSize;
+  int const heads_per_group =
+      (slots_per_token % 2 == 0 && narrow_blocks >= full_wave) ? 2 : 1;
 
 #define DISPATCH_ARGS(RT, HD, HPG)                                         \
   launchFusedMuseSparkTyped<scalar_t, cache_t, kv_dt, RT, HD, HPG>(        \
@@ -607,9 +609,6 @@ void launchFusedMuseSpark(
 
 #define DISPATCH_HPG(RT, HD)    \
   switch (heads_per_group) {    \
-    case 4:                     \
-      DISPATCH_ARGS(RT, HD, 4); \
-      break;                    \
     case 2:                     \
       DISPATCH_ARGS(RT, HD, 2); \
       break;                    \
