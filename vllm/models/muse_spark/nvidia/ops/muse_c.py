@@ -32,6 +32,7 @@ from torch.utils import cpp_extension
 
 from vllm import envs
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
@@ -99,16 +100,42 @@ def _nvcc_version(nvcc: str) -> tuple[int, int]:
     return version
 
 
-def _gencode_flags(nvcc_version: tuple[int, int]) -> list[str]:
+def _gencode_archs(nvcc_version: tuple[int, int]) -> list[str]:
     # Same arch selection as vLLM's SM12x NVFP4 kernels: CUDA 13 compiles the
     # 12.0f family, which also covers sm_121.
     if nvcc_version >= (13, 0):
-        archs = ["120f"]
-    elif nvcc_version >= (12, 9):
-        archs = ["120a", "121a"]
-    else:
-        archs = ["120a"]
-    return [f"-gencode=arch=compute_{a},code=sm_{a}" for a in archs]
+        return ["120f"]
+    if nvcc_version >= (12, 9):
+        return ["120a", "121a"]
+    return ["120a"]
+
+
+def _gencode_flags(nvcc_version: tuple[int, int]) -> list[str]:
+    return [
+        f"-gencode=arch=compute_{a},code=sm_{a}" for a in _gencode_archs(nvcc_version)
+    ]
+
+
+def _uncovered_device(nvcc_version: tuple[int, int]) -> str | None:
+    """Why the binary of this nvcc would not run on the GPU in this process, if so.
+
+    The cubins carry no PTX, and an arch-specific one (sm_120a, sm_121a) runs on
+    that capability only, so a 12.8 toolkit (sm_120a alone) builds an extension that
+    fails at its first kernel launch on an SM121 GPU (GB10) with "no kernel image".
+    """
+    # NVML, so that the CUDA context is not created here.
+    capability = current_platform.get_device_capability()
+    if capability is None or capability.major != 12:
+        return None
+    archs = _gencode_archs(nvcc_version)
+    if "120f" in archs or f"12{capability.minor}a" in archs:
+        return None
+    return (
+        f"nvcc {nvcc_version[0]}.{nvcc_version[1]} builds the {_EXT_NAME} extension "
+        f"for {', '.join(f'sm_{a}' for a in archs)} only, which does not run on "
+        f"this GPU (compute capability {capability.major}.{capability.minor}); "
+        "nvcc >= 12.9 is needed"
+    )
 
 
 def _build_flags(nvcc_version: tuple[int, int]) -> tuple[list[str], list[str]]:
@@ -162,13 +189,16 @@ def preflight() -> str | None:
     Cheap and without side effects, so that callers can choose a path that
     does not need the extension before they commit to one that does. A host
     with a finished build needs no ninja, but still nvcc: the build directory
-    is keyed on it.
+    is keyed on it. The GPU must be one that the nvcc builds for: a toolkit older
+    than 12.9 emits no code for an SM121 GPU.
     """
     try:
         nvcc = _nvcc_path()
         nvcc_version = _nvcc_version(nvcc)
     except Exception as e:
         return str(e)
+    if (reason := _uncovered_device(nvcc_version)) is not None:
+        return reason
     cflags, cuda_cflags = _build_flags(nvcc_version)
     build_dir = _build_directory(nvcc, cflags, cuda_cflags)
     if _built_library(build_dir) is None and not cpp_extension.is_ninja_available():
@@ -199,6 +229,10 @@ def _build_exclusive(build_dir: str) -> Iterator[None]:
 def _load_locked() -> None:
     nvcc = _nvcc_path()
     nvcc_version = _nvcc_version(nvcc)
+    # For the callers that load without the preflight: an extension that would
+    # fail at its first launch is an error here, where the callers fall back.
+    if (reason := _uncovered_device(nvcc_version)) is not None:
+        raise RuntimeError(reason)
     cflags, cuda_cflags = _build_flags(nvcc_version)
     build_dir = _build_directory(nvcc, cflags, cuda_cflags)
     os.makedirs(build_dir, exist_ok=True)

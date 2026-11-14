@@ -52,6 +52,7 @@ from vllm.models.muse_spark.nvidia.sm120_nvfp4_moe import (
     swap_gate_up_halves_,
 )
 from vllm.platforms import current_platform
+from vllm.platforms.interface import DeviceCapability
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 
 if not current_platform.is_device_capability_family(120):
@@ -2222,6 +2223,45 @@ def test_muse_c_preflight_names_what_is_missing(monkeypatch, muse_c_build) -> No
     monkeypatch.setattr(muse_c, "_nvcc_path", no_nvcc)
     muse_c.preflight.cache_clear()
     assert "nvcc was not found" in muse_c.preflight()
+
+
+@pytest.mark.parametrize(
+    "capability,nvcc_version,runs",
+    [
+        ((12, 0), (12, 8), True),
+        ((12, 1), (12, 8), False),
+        ((12, 0), (12, 9), True),
+        ((12, 1), (12, 9), True),
+        ((12, 0), (13, 0), True),
+        ((12, 1), (13, 0), True),
+        # Not an SM12x GPU: the callers' own family checks decide there.
+        ((9, 0), (12, 8), True),
+        (None, (12, 8), True),
+    ],
+)
+def test_muse_c_preflight_checks_that_the_arches_cover_the_gpu(
+    monkeypatch, muse_c_build, capability, nvcc_version, runs
+) -> None:
+    """nvcc 12.8 builds sm_120a only, which does not run on an SM121 GPU (GB10):
+    the preflight must refuse it (and so must load), not let the first kernel
+    launch fail with "no kernel image"."""
+    monkeypatch.setattr(cpp_extension, "is_ninja_available", lambda: True)
+    monkeypatch.setattr(muse_c, "_nvcc_version", lambda path: nvcc_version)
+    monkeypatch.setattr(
+        current_platform,
+        "get_device_capability",
+        lambda device_id=0: None if capability is None else DeviceCapability(*capability),
+    )
+    muse_c.preflight.cache_clear()
+    reason = muse_c.preflight()
+    if runs:
+        assert reason is None
+        return
+    assert reason is not None and "12.1" in reason and "sm_120a" in reason
+    assert "12.9" in reason
+    muse_c.preflight.cache_clear()
+    with pytest.raises(RuntimeError, match="12.1"):
+        muse_c.load()
 
 
 def _rank_routing(
