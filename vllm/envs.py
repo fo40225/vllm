@@ -154,6 +154,7 @@ if TYPE_CHECKING:
     VLLM_MUSE_SPARK_SM120_L2_PREFETCH_AFTER_EXPERTS_CTAS: int = 4
     VLLM_MUSE_SPARK_SM120_EXPERT_PREFETCH: bool = True
     VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY: bool = True
+    VLLM_MUSE_SPARK_SM120_FUSED_GEMV: bool = True
     VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP: bool = True
     VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_MIN_TOKENS: int = 2048
     VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_UBATCHES: int = 2
@@ -1483,6 +1484,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # constructed.
     "VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY": lambda: bool(
         int(os.getenv("VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY", "1"))
+    ),
+    # Muse Spark on SM120: with the fused boundaries (above), also let the TP
+    # device communicator run the sharded pooler / unpooler GEMV of a decode batch
+    # (up to 8 tokens) together with the all-gather that follows it, when it offers
+    # that (ops/fused_boundary.py: gemv_all_gather_rmsnorm /
+    # gemv_all_gather_residual_boundary). Every GEMV block sends its columns to the
+    # peers as soon as they are done, and the weights are loaded while the
+    # all-reduce in front of the GEMV is still running. The communicator owns the
+    # GEMV arithmetic (fp32 accumulation in a fixed order, one rounding), which is
+    # not the order of the cuBLAS GEMV: the outputs are deterministic and equal on
+    # every rank, but differ from the two-step path in the last bit of some
+    # elements. Set to 0 to get the cuBLAS GEMV plus the fused gather back. Read
+    # once, when the model is constructed.
+    "VLLM_MUSE_SPARK_SM120_FUSED_GEMV": lambda: bool(
+        int(os.getenv("VLLM_MUSE_SPARK_SM120_FUSED_GEMV", "1"))
     ),
     # Muse Spark on SM120: split every eager batch of at least
     # VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_MIN_TOKENS tokens into two microbatches

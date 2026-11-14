@@ -30,6 +30,7 @@ from vllm.models.muse_spark.common.ops.fused_rmsnorm import (
 from vllm.models.muse_spark.nvidia.model import (
     MuseSpark1xColumnShardedStream,
     MuseSpark1xPartialSumStream,
+    MuseSpark1xProjectedStream,
     MuseSpark1xResidualStream,
     MuseSpark1xRMSNorm,
     MuseSpark1xRMSNormWithInputScale,
@@ -91,6 +92,21 @@ class FakeCommunicator:
         if self.returns_none:
             return None
         return fused_rmsnorm_fwd(gather(shard), weight, eps, gain_center=gain_center)
+
+    # The GEMV the communicator runs itself: here the same bf16 product as the model's.
+    def gemv_all_gather_residual_boundary(self, x, weight, stream, *, out_fp32=None, **kw):
+        self.calls.append("gemv_all_gather_boundary")
+        if self.returns_none:
+            return None
+        return self._boundary(gather(x @ weight.t()), stream, out_fp32, **kw)
+
+    def gemv_all_gather_rmsnorm(self, x, weight, norm_weight, eps, gain_center):
+        self.calls.append("gemv_all_gather_rmsnorm")
+        if self.returns_none:
+            return None
+        return fused_rmsnorm_fwd(
+            gather(x @ weight.t()), norm_weight, eps, gain_center=gain_center
+        )
 
 
 def fp32_buffer(rows):
@@ -422,3 +438,212 @@ def test_unpooler_shard_stays_in_the_layer_without_fusion_across_layers(monkeypa
     # a FlashInfer workspace keeps its own gate (it is only created under fusion)
     layer.all_gather_dual_norm = object()
     assert layer._defers_column_gather(1)
+
+
+def make_projected(boundary, rows, k=64):
+    """A projected stream whose GEMV is `x @ w.T` (this rank's `HIDDEN // TP_SIZE` rows)."""
+    x = torch.randn(rows, k, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(HIDDEN // TP_SIZE, k, device="cuda", dtype=torch.bfloat16) * 0.1
+    projected = MuseSpark1xProjectedStream(
+        stream=boundary.stream,
+        branch=x,
+        post_norm=boundary.post_norm,
+        connection=boundary.connection,
+        all_gather=None,
+        weight=w,
+        project=lambda v: v @ w.t(),
+    )
+    return projected, x, w
+
+
+@requires_cuda
+@pytest.mark.parametrize("rows", [1, 3, 8])
+@pytest.mark.parametrize("post_input_scale", [False, True])
+def test_unpooler_gemv_and_column_gather_run_in_the_communicator(
+    monkeypatch, two_step, rows, post_input_scale
+):
+    torch.manual_seed(rows)
+    boundary, pre_norm = make_residual_boundary(rows, post_input_scale=post_input_scale)
+    projected, x, w = make_projected(boundary, rows)
+    full = MuseSpark1xResidualStream(
+        stream=boundary.stream,
+        branch=gather(x @ w.t()),
+        post_norm=boundary.post_norm,
+        connection=boundary.connection,
+    )
+    expected = norm_residual_then_norm(full, pre_norm, out_dtype=torch.bfloat16)
+    two_step.clear()
+
+    communicator = use_communicator(monkeypatch, FakeCommunicator())
+    out, new_stream = norm_residual_then_norm(
+        projected, pre_norm, out_dtype=torch.bfloat16
+    )
+    assert communicator.calls == ["gemv_all_gather_boundary"]
+    assert two_step == []
+    assert torch.equal(out, expected[0])
+    assert torch.equal(new_stream, expected[1])
+
+    # declined by the GEMV call: the layer's own GEMV, then the fused column gather
+    communicator = use_communicator(monkeypatch, FakeCommunicator(returns_none=True))
+    out, new_stream = norm_residual_then_norm(
+        projected, pre_norm, out_dtype=torch.bfloat16
+    )
+    assert communicator.calls == ["gemv_all_gather_boundary", "all_gather_boundary"]
+    assert two_step == ["gather_columns"]
+    assert torch.equal(out, expected[0])
+    assert torch.equal(new_stream, expected[1])
+
+    # no communicator: GEMV, gather and boundary by the model
+    two_step.clear()
+    use_communicator(monkeypatch, None)
+    out, new_stream = norm_residual_then_norm(
+        projected, pre_norm, out_dtype=torch.bfloat16
+    )
+    assert two_step == ["gather_columns"]
+    assert torch.equal(out, expected[0])
+    assert torch.equal(new_stream, expected[1])
+    # materialize (the speculative-decoding taps): the same branch
+    assert torch.equal(projected.materialize().branch, full.branch)
+
+
+@requires_cuda
+def test_unpooler_gemv_is_not_fused_for_a_router_input_or_a_fp32_copy(
+    monkeypatch, two_step
+):
+    boundary, pre_norm = make_residual_boundary(4)
+    projected, x, w = make_projected(boundary, 4)
+    communicator = use_communicator(monkeypatch, FakeCommunicator())
+    norm_residual_then_norm(
+        projected, pre_norm, out_dtype=torch.bfloat16, out_fp32=fp32_buffer(4)
+    )
+    assert communicator.calls == []
+    assert two_step == ["gather_columns"]
+
+
+@requires_cuda
+def test_unpooler_gemv_declines_for_what_the_communicator_cannot_serve(
+    monkeypatch, two_step
+):
+    boundary, pre_norm = make_residual_boundary(4)
+    projected, x, w = make_projected(boundary, 4)
+    communicator = use_communicator(monkeypatch, FakeCommunicator())
+    # an fp16 activation is not what the kernels read
+    projected.branch = x.half()
+    projected.project = lambda v: (v @ w.half().t()).bfloat16()
+    projected.weight = w.half()
+    out, new_stream = norm_residual_then_norm(
+        projected, pre_norm, out_dtype=torch.bfloat16
+    )
+    # the layer's own GEMV, then the communicator's column gather + boundary
+    assert communicator.calls == ["all_gather_boundary"]
+    assert two_step == []
+    assert out.dtype == torch.bfloat16 and new_stream.dtype == torch.float32
+
+
+def make_unpooler_moe_stub(rows, *, fuses=True):
+    moe = object.__new__(model_ops.MuseSpark1xMoE)
+    torch.nn.Module.__init__(moe)
+    k = 64
+    moe.unpooler = torch.nn.Module()
+    moe.unpooler.output_size = HIDDEN
+    moe.unpooler.weight = torch.nn.Parameter(
+        torch.randn(HIDDEN, k, device="cuda", dtype=torch.bfloat16) * 0.1
+    )
+    moe.tp_size = TP_SIZE
+    moe.tp_rank = 3
+    moe.fuses_gemv_gather = fuses
+    moe._projection_gemm = lambda layer, x, weight, bias: x @ weight.t()
+    return moe, torch.randn(rows, k, device="cuda", dtype=torch.bfloat16)
+
+
+@requires_cuda
+@pytest.mark.parametrize("rows", [1, 8])
+def test_deferred_unpooler_hands_its_input_to_the_boundary(monkeypatch, rows):
+    moe, x = make_unpooler_moe_stub(rows)
+    communicator = use_communicator(monkeypatch, FakeCommunicator())
+    deferred = moe._deferred_unpooler_columns(x)
+    assert isinstance(deferred, model_ops.MuseSpark1xUnpoolerInput)
+    assert deferred.x is x
+    shard_rows = HIDDEN // TP_SIZE
+    assert torch.equal(
+        deferred.weight, moe.unpooler.weight[3 * shard_rows : 4 * shard_rows]
+    )
+    assert torch.equal(deferred.project(x), x @ deferred.weight.t())
+    assert communicator.calls == []
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "case", ["flag off", "no communicator", "too many tokens", "fp32", "strided"]
+)
+def test_deferred_unpooler_computes_its_columns_where_nothing_fuses(
+    monkeypatch, case
+):
+    moe, x = make_unpooler_moe_stub(8, fuses=case != "flag off")
+    use_communicator(
+        monkeypatch,
+        None
+        if case == "no communicator"
+        else FakeCommunicator(max_tokens=4 if case == "too many tokens" else 64),
+    )
+    if case == "fp32":
+        x = x.float()
+        moe.unpooler.weight.data = moe.unpooler.weight.data.float()
+    if case == "strided":
+        x = torch.randn(8, 128, device="cuda", dtype=torch.bfloat16)[:, ::2]
+        assert not x.is_contiguous()
+    columns = moe._deferred_unpooler_columns(x)
+    assert isinstance(columns, torch.Tensor)
+    shard_rows = HIDDEN // TP_SIZE
+    assert columns.shape == (8, shard_rows)
+
+
+def make_pooler_gemv_stub(monkeypatch, *, k=64, fuses=True, **kwargs):
+    moe = make_pooler_stub(monkeypatch, **kwargs)
+    moe.fuses_gemv_gather = fuses
+    moe.pooler = torch.nn.Module()
+    moe.pooler.output_size = 4096
+    moe.pooler.weight = torch.nn.Parameter(
+        torch.randn(4096, k, device="cuda", dtype=torch.bfloat16) * 0.1
+    )
+    moe.tp_size = TP_SIZE
+    moe.tp_rank = 5
+    return moe
+
+
+@requires_cuda
+@pytest.mark.parametrize("rows", [1, 5, 8])
+def test_pooler_gemv_gather_and_norm_run_in_the_communicator(monkeypatch, rows):
+    moe = make_pooler_gemv_stub(monkeypatch)
+    x = torch.randn(rows, 64, device="cuda", dtype=torch.bfloat16)
+    shard_rows = 4096 // TP_SIZE
+    w = moe.pooler.weight[5 * shard_rows : 6 * shard_rows]
+    expected = moe.pre_expert_norm(gather(x @ w.t()))
+
+    communicator = use_communicator(monkeypatch, FakeCommunicator())
+    assert torch.equal(moe._fused_gemv_all_gather_rmsnorm(x), expected)
+    assert communicator.calls == ["gemv_all_gather_rmsnorm"]
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "case",
+    ["flag off", "no weight", "weight first", "too many tokens", "fp32", "returns None"],
+)
+def test_pooler_gemv_gather_and_norm_decline(monkeypatch, case):
+    moe = make_pooler_gemv_stub(
+        monkeypatch,
+        fuses=case != "flag off",
+        weight_first=case == "weight first",
+        has_weight=case != "no weight",
+    )
+    x = torch.randn(8, 64, device="cuda", dtype=torch.bfloat16)
+    if case == "fp32":
+        x = x.float()
+    communicator = FakeCommunicator(
+        max_tokens=4 if case == "too many tokens" else 64,
+        returns_none=case == "returns None",
+    )
+    use_communicator(monkeypatch, communicator)
+    assert moe._fused_gemv_all_gather_rmsnorm(x) is None
+    assert communicator.calls == (["gemv_all_gather_rmsnorm"] if case == "returns None" else [])

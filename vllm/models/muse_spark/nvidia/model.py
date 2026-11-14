@@ -193,6 +193,44 @@ class MuseSpark1xColumnShardedStream(MuseSpark1xResidualStream):
 
 
 @dataclass(slots=True)
+class MuseSpark1xUnpoolerInput:
+    """The input of this rank's unpooler columns, before the GEMV: the layer leaves the
+    GEMV to the next boundary, so that a TP communicator which fuses it with the column
+    gather (``ops/fused_boundary.py``) can run both as one call."""
+
+    x: torch.Tensor
+    # This rank's rows of the unpooler weight.
+    weight: torch.Tensor
+    # x -> this rank's columns, the layer's own (cuBLAS) GEMV.
+    project: Callable[[torch.Tensor], torch.Tensor]
+
+
+@dataclass(slots=True)
+class MuseSpark1xProjectedStream(MuseSpark1xColumnShardedStream):
+    """A column-sharded boundary whose columns are not computed yet.
+
+    ``branch`` is the input of this rank's unpooler GEMV, ``weight`` its rows of the
+    weight and ``project`` the layer's own GEMV, which the boundary runs when the
+    communicator does not fuse the two.
+    """
+
+    weight: torch.Tensor
+    project: Callable[[torch.Tensor], torch.Tensor]
+
+    def local_columns(self) -> MuseSpark1xColumnShardedStream:
+        return MuseSpark1xColumnShardedStream(
+            stream=self.stream,
+            branch=self.project(self.branch),
+            post_norm=self.post_norm,
+            connection=self.connection,
+            all_gather=self.all_gather,
+        )
+
+    def materialize(self) -> MuseSpark1xResidualStream:
+        return self.local_columns().materialize()
+
+
+@dataclass(slots=True)
 class MuseSpark1xPartialSumStream(MuseSpark1xResidualStream):
     """A deferred boundary whose branch is still this rank's partial sum.
 
@@ -336,6 +374,38 @@ def _communicator_all_gather_norm_residual_then_norm(
     )
 
 
+def _communicator_gemv_all_gather_norm_residual_then_norm(
+    x: MuseSpark1xProjectedStream,
+    pre_norm: MuseSpark1xRMSNorm,
+    out_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """The unpooler GEMV, the column gather and the boundary as one communicator call."""
+    num_tokens = x.branch.shape[0]
+    if not fused_boundary.supports_fused_boundary(
+        fused_boundary.KIND_GEMV_ALL_GATHER_BOUNDARY, num_tokens
+    ):
+        return None
+    kwargs = _triton_boundary_kwargs(
+        x.stream,
+        x.post_norm,
+        x.connection,
+        pre_norm,
+        (num_tokens, x.weight.shape[0] * get_tensor_model_parallel_world_size()),
+        out_dtype,
+        None,
+    )
+    if (
+        kwargs is None
+        or x.branch.dtype != torch.bfloat16
+        or not x.branch.is_contiguous()
+        or x.weight.dtype != torch.bfloat16
+    ):
+        return None
+    return fused_boundary.gemv_all_gather_residual_boundary(
+        x.branch, x.weight, x.stream, out_fp32=None, **kwargs
+    )
+
+
 def _uses_flashinfer_dual_norm(
     post_norm: MuseSpark1xRMSNorm,
     connection: MuseSpark1xResidualConnection,
@@ -429,6 +499,14 @@ def norm_residual_then_norm(
         ) is not None:
             return fused
         x = x.materialize()
+    if isinstance(x, MuseSpark1xProjectedStream):
+        if router_input is None and out_fp32 is None:
+            fused = _communicator_gemv_all_gather_norm_residual_then_norm(
+                x, pre_norm, out_dtype
+            )
+            if fused:
+                return fused
+        x = x.local_columns()
     if isinstance(x, MuseSpark1xColumnShardedStream):
         if router_input is None and out_fp32 is None:
             fused = (
@@ -981,6 +1059,11 @@ class MuseSpark1xMoE(nn.Module):
         self.fuses_boundary_collectives = (
             envs.VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY and _on_sm120()
         )
+        # Whether it may also run the sharded pooler / unpooler GEMV together with
+        # the gather (the GEMV arithmetic is then the communicator's own).
+        self.fuses_gemv_gather = (
+            self.fuses_boundary_collectives and envs.VLLM_MUSE_SPARK_SM120_FUSED_GEMV
+        )
         if self.use_mega_moe and self.tp_size > 1 and not self.is_sequence_parallel:
             raise NotImplementedError(
                 "MuseSpark1x MegaMoE needs the sequence-parallel stream when "
@@ -1086,13 +1169,16 @@ class MuseSpark1xMoE(nn.Module):
             <= _SHARDED_PROJECTION_MAX_TOKENS
         )
 
+    def _local_weight_rows(self, layer: ReplicatedLinear) -> torch.Tensor:
+        """This rank's rows of the projection weight: its block of the output columns."""
+        shard_size = layer.output_size // self.tp_size
+        return layer.weight.narrow(0, self.tp_rank * shard_size, shard_size)
+
     def _project_local_columns(
         self, layer: ReplicatedLinear, x: torch.Tensor
     ) -> torch.Tensor:
         """This rank's contiguous block of the projection's output columns."""
-        shard_size = layer.output_size // self.tp_size
-        weight = layer.weight.narrow(0, self.tp_rank * shard_size, shard_size)
-        return self._projection_gemm(layer, x, weight, None)
+        return self._projection_gemm(layer, x, self._local_weight_rows(layer), None)
 
     def sharded_weights(
         self, num_tokens: int, layer: ReplicatedLinear | None
@@ -1141,9 +1227,62 @@ class MuseSpark1xMoE(nn.Module):
             shard, norm.weight, norm.variance_epsilon, norm.fused_gain_center
         )
 
+    def _fused_gemv_all_gather_rmsnorm(
+        self, hidden_states: torch.Tensor
+    ) -> torch.Tensor | None:
+        """The pooler GEMV, the column gather and the pre-expert norm as one call."""
+        pooler, norm = self.pooler, self.pre_expert_norm
+        if not (
+            self.fuses_gemv_gather
+            and pooler is not None
+            and norm is not None
+            and norm.has_weight
+            and not norm.applies_weight_before_norm
+            and norm.variance_size_override is None
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.is_contiguous()
+            and pooler.weight.dtype == torch.bfloat16
+            and fused_boundary.supports_fused_boundary(
+                fused_boundary.KIND_GEMV_ALL_GATHER_RMSNORM, hidden_states.shape[0]
+            )
+        ):
+            return None
+        return fused_boundary.gemv_all_gather_rmsnorm(
+            hidden_states,
+            self._local_weight_rows(pooler),
+            norm.weight,
+            norm.variance_epsilon,
+            norm.fused_gain_center,
+        )
+
+    def _deferred_unpooler_columns(
+        self, experts_out: torch.Tensor
+    ) -> torch.Tensor | MuseSpark1xUnpoolerInput:
+        """This rank's unpooler columns for the boundary that gathers them, or their
+        GEMV input where the communicator runs the GEMV with the gather."""
+        unpooler = self.unpooler
+        assert unpooler is not None
+        if (
+            self.fuses_gemv_gather
+            and experts_out.dtype == torch.bfloat16
+            and experts_out.is_contiguous()
+            and unpooler.weight.dtype == torch.bfloat16
+            and fused_boundary.supports_fused_boundary(
+                fused_boundary.KIND_GEMV_ALL_GATHER_BOUNDARY, experts_out.shape[0]
+            )
+        ):
+            return MuseSpark1xUnpoolerInput(
+                x=experts_out,
+                weight=self._local_weight_rows(unpooler),
+                project=lambda x: self._project_local_columns(unpooler, x),
+            )
+        return self._project_local_columns(unpooler, experts_out)
+
     def _pool_and_norm(self, hidden_states: torch.Tensor) -> torch.Tensor:
         assert self.pooler is not None
         if self.shards_pooler(hidden_states.shape[0]):
+            if (fused := self._fused_gemv_all_gather_rmsnorm(hidden_states)) is not None:
+                return fused
             shard = self._project_local_columns(self.pooler, hidden_states)
             if (fused := self._fused_all_gather_rmsnorm(shard)) is not None:
                 return fused
@@ -1290,8 +1429,9 @@ class MuseSpark1xMoE(nn.Module):
         hidden_states: torch.Tensor,
         router_input: torch.Tensor | None = None,
         defer_column_gather: bool = False,
-    ) -> torch.Tensor:
-        """With ``defer_column_gather``, returns only this rank's unpooler columns."""
+    ) -> torch.Tensor | MuseSpark1xUnpoolerInput:
+        """With ``defer_column_gather``, returns only this rank's unpooler columns,
+        or their GEMV input where the communicator fuses the GEMV with the gather."""
         return self._routed_forward(hidden_states, router_input, defer_column_gather)
 
     def _can_fuse_megamoe_inputs(self, hidden_states: torch.Tensor) -> bool:
@@ -1488,7 +1628,7 @@ class MuseSpark1xMoE(nn.Module):
         hidden_states: torch.Tensor,
         router_input: torch.Tensor | None = None,
         defer_column_gather: bool = False,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | MuseSpark1xUnpoolerInput:
         num_tokens = hidden_states.shape[0]
         if self.use_sequence_parallel_moe:
             hidden_states = sequence_parallel_chunk(hidden_states)
@@ -1523,8 +1663,7 @@ class MuseSpark1xMoE(nn.Module):
             )
 
         if defer_column_gather:
-            assert self.unpooler is not None
-            return self._project_local_columns(self.unpooler, experts_out)
+            return self._deferred_unpooler_columns(experts_out)
         if self.unpooler is not None:
             experts_out = self._project(
                 self.unpooler, experts_out, self.shards_unpooler(num_tokens)
@@ -2261,11 +2400,22 @@ class MuseSpark1xDecoderLayer(nn.Module):
             # Non-megakernel experts need every token.
             branch = sp_shard(self.feed_forward(sp_all_gather(ffn_in)))
         elif self._defers_column_gather(ffn_in.shape[0]):
+            columns = self.feed_forward(
+                ffn_in, router_input=router_input, defer_column_gather=True
+            )
+            if isinstance(columns, MuseSpark1xUnpoolerInput):
+                return MuseSpark1xProjectedStream(
+                    stream=stream,
+                    branch=columns.x,
+                    post_norm=self.post_ffn_norm,
+                    connection=self.add_ffn,
+                    all_gather=self.all_gather_dual_norm,
+                    weight=columns.weight,
+                    project=columns.project,
+                )
             return MuseSpark1xColumnShardedStream(
                 stream=stream,
-                branch=self.feed_forward(
-                    ffn_in, router_input=router_input, defer_column_gather=True
-                ),
+                branch=columns,
                 post_norm=self.post_ffn_norm,
                 connection=self.add_ffn,
                 all_gather=self.all_gather_dual_norm,
