@@ -1182,10 +1182,28 @@ def test_large_kernel_shape_env_selects_the_build(monkeypatch) -> None:
     monkeypatch.setenv(stages_env, "4")
     with pytest.raises(ValueError, match="LARGE_STAGES"):
         muse_c._build_flags(version)
+    # 16 columns with 3 stages (the default columns included) do not fit the shared
+    # memory of a block: refused here, not by a failed compilation that would leave
+    # every layer on CUTLASS.
+    monkeypatch.setenv(stages_env, "3")
+    for cols in ("16", None):
+        if cols is None:
+            monkeypatch.delenv(cols_env)
+        else:
+            monkeypatch.setenv(cols_env, cols)
+        with pytest.raises(ValueError, match="do not fit the shared memory"):
+            muse_c._build_flags(version)
+    monkeypatch.setenv(cols_env, "8")
+    muse_c._build_flags(version)
+    monkeypatch.setenv(cols_env, "16")
+    monkeypatch.setenv(stages_env, "4")
     # The preflight reports it instead of raising.
     muse_c.preflight.cache_clear()
     try:
         assert "LARGE_STAGES" in muse_c.preflight()
+        muse_c.preflight.cache_clear()
+        monkeypatch.setenv(stages_env, "3")
+        assert "do not fit the shared memory" in muse_c.preflight()
     finally:
         monkeypatch.delenv(stages_env)
         muse_c.preflight.cache_clear()

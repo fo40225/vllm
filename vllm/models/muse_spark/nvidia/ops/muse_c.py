@@ -54,6 +54,10 @@ _SOURCES = (
 _CSRC_SUFFIXES = (".cpp", ".cu", ".cuh", ".h")
 # The NVFP4 e2m1 conversion instructions need an sm_120 capable nvcc.
 _MIN_NVCC_VERSION = (12, 8)
+# Columns per entry and ring stages of the large-batch decode kernel when the sources
+# are built without -DMUSE_LARGE_COLS / -DMUSE_LARGE_STAGES (see muse_nvfp4_decode_moe.cu).
+_LARGE_COLS_DEFAULT = 16
+_LARGE_STAGES_DEFAULT = 2
 
 # Written, with the library file name in it, after a build has succeeded: the
 # library file alone may be a half-written one of a killed builder.
@@ -155,17 +159,28 @@ def _build_flags(nvcc_version: tuple[int, int]) -> tuple[list[str], list[str]]:
         "-U__CUDA_NO_HALF2_OPERATORS__",
     ]
     # Compile-time shape of the large-batch decode kernel (A/B tests); unset keeps the
-    # defaults of the source, and with them the build of every other host.
-    for name, macro, allowed in (
-        ("VLLM_MUSE_SPARK_SM120_LARGE_COLS", "MUSE_LARGE_COLS", (8, 16)),
-        ("VLLM_MUSE_SPARK_SM120_LARGE_STAGES", "MUSE_LARGE_STAGES", (2, 3)),
+    # defaults of the source (16 columns, 2 stages), and with them the build of every
+    # other host.
+    shape = {"cols": _LARGE_COLS_DEFAULT, "stages": _LARGE_STAGES_DEFAULT}
+    for key, name, macro, allowed in (
+        ("cols", "VLLM_MUSE_SPARK_SM120_LARGE_COLS", "MUSE_LARGE_COLS", (8, 16)),
+        ("stages", "VLLM_MUSE_SPARK_SM120_LARGE_STAGES", "MUSE_LARGE_STAGES", (2, 3)),
     ):
         value = getattr(envs, name)
         if value is None:
             continue
         if value not in allowed:
             raise ValueError(f"{name} must be one of {allowed}, got {value}")
+        shape[key] = value
         cuda_cflags.append(f"-D{macro}={value}")
+    if (shape["cols"], shape["stages"]) == (16, 3):
+        # The ring and the B operand slots would need 129,280 B of shared memory, more
+        # than the 101,376 B of a block: nvcc fails on a static_assert and the muse
+        # decode engine would silently fall back to CUTLASS.
+        raise ValueError(
+            "VLLM_MUSE_SPARK_SM120_LARGE_STAGES=3 needs VLLM_MUSE_SPARK_SM120_LARGE_COLS=8:"
+            " 16 columns with 3 stages do not fit the shared memory of a block"
+        )
     return cflags, cuda_cflags
 
 
