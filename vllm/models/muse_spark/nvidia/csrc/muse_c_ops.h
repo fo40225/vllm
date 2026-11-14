@@ -151,8 +151,8 @@ void nvfp4_decode_moe(at::Tensor const& hidden, at::Tensor const& topk_ids,
 //   build, MUSE_LARGE_COLS=8, needs 4228 and 386). flags: 4 = zero the rows
 //   of non-local routes, 8 = no programmatic dependent launches, 16 = the loader
 //   warp fetches the B operand with bulk copies (the scratch above must be 16-byte
-//   aligned, as it is for every launch); bits 16.. override the grid size of the
-//   persistent kernel.
+//   aligned, as it is for every launch); the upper 16 bits (flags >> 16) override
+//   the grid size of the persistent kernel.
 void nvfp4_decode_moe_large(
     at::Tensor const& hidden, at::Tensor const& topk_ids,
     std::optional<at::Tensor> const& expert_map, at::Tensor const& w13,

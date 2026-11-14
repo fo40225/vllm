@@ -1362,7 +1362,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # of GEMM1, the intermediate of GEMM2) with one bulk copy per route column instead
     # of a cp.async per 16 bytes. For an expert with 9 or more routes in the batch the
     # loop of cp.asyncs keeps the warp busy and the weight ring waits for it: such an
-    # expert is 17-34% faster with the bulk copies (kernel, cold L2), a layer of the
+    # expert is 16-34% faster with the bulk copies (kernel, cold L2), a layer of the
     # real routing at 64 / 96 / 128 tokens 0.7 / 1.9 / 1.8%, a layer without one is
     # unchanged. The bytes in shared memory, and so the rows, are the same bit for
     # bit. Read once, when a layer's decode engine is prepared, so it must not change
@@ -1374,11 +1374,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # decode kernel (8 or 16; unset = the kernel's default, 16) and its weight ring
     # depth (2 or 3; unset = 2). They are compile-time constants of the _muse_C
     # extension, set when it is built (a different value builds into a directory of
-    # its own), for A/B tests: 8 columns with 3 stages (92,672 B of shared memory) is
-    # the one other combination that fits, and it is slower than the default in every
-    # routing measured (real routing at 64 / 128 tokens +2.7 / +6.5%, with the bulk
-    # loader +2.4 / +5.6%, each against the default build with the same loader). The
-    # rows do not change.
+    # its own), for A/B tests. The other combinations that fit the shared memory are
+    # 8 columns with 2 stages (64,512 B) and with 3 stages (92,672 B); 16 columns with
+    # 3 stages (129,280 B) do not, and are refused. Both 8-column builds are slower than
+    # the default in every routing measured (8 x 3: real routing at 64 / 128 tokens
+    # +2.7 / +6.5%, with the bulk loader +2.4 / +5.6%, each against the default build
+    # with the same loader; 8 x 2 is slower still). The rows do not change.
     "VLLM_MUSE_SPARK_SM120_LARGE_COLS": lambda: (
         int(v) if (v := os.getenv("VLLM_MUSE_SPARK_SM120_LARGE_COLS")) else None
     ),
