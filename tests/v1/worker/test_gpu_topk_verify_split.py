@@ -718,6 +718,10 @@ def real_rejection_sampler(sampler: Sampler) -> RejectionSampler:
     rs.enable_adaptive_verification = False
     rs.use_block_verification = True
     rs.num_speculative_steps = STEPS
+    # FLY stays off so the split and the full paths remain comparable.
+    rs.fly_window_size = 0
+    rs.fly_entropy_threshold = 0.3
+    rs.fly_entropy_top_k = 3
     return rs
 
 
