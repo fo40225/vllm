@@ -58,6 +58,9 @@ WORKSPACE_BYTES = 394 * 1024 * 1024  # the vLLM FlashInfer workspace
 SWA = 2047  # window_left of the 2048 token sliding window
 WINDOWS = {"swa": SWA, "full": -1}
 SENTINEL = 0.5
+# The first bytes of the workspace hold the semaphores of the multi-block merge (the
+# rest is scratch); a launch has to leave them all zero for the next launch.
+SEMAPHORE_BYTES = 8 * 1024 * 1024
 
 
 def _module(variant: str):
@@ -81,6 +84,10 @@ class Rig:
             v: torch.zeros(WORKSPACE_BYTES, dtype=torch.uint8, device=DEVICE)
             for v in ("stock", "shadow")
         }
+        # Attention sinks: one fp32 logit per query head, as the sink layers pass them.
+        self.sinks = 1.5 * torch.randn(
+            NUM_Q_HEADS, device=DEVICE, dtype=torch.float32, generator=gen
+        )
 
     def query(self, tokens: int) -> torch.Tensor:
         return torch.randn(
@@ -91,6 +98,14 @@ class Rig:
             dtype=torch.bfloat16,
             generator=self.gen,
         )
+
+    def sinks_for(self, sinks: bool) -> torch.Tensor | None:
+        return self.sinks if sinks else None
+
+    def assert_semaphores_idle(self, what: str) -> None:
+        """Every launch so far returned the semaphores of both modules to zero."""
+        for variant, workspace in self.workspace.items():
+            _assert_idle(workspace, f"{variant} {what}")
 
     def block_tables(self, batch: int) -> torch.Tensor:
         return torch.randint(
@@ -116,6 +131,7 @@ class Rig:
         q_cu_seq_lens=None,
         pdl=True,
         workspace=None,
+        sinks=None,
     ):
         with _module(variant):
             xqa_batch_decode_with_kv_cache(
@@ -131,7 +147,7 @@ class Rig:
                 bmm2_scale=1.0,
                 window_left=window_left,
                 out=out,
-                sinks=None,
+                sinks=sinks,
                 kv_layout="NHD",
                 enable_pdl=pdl,
                 q_len_per_req=q_len,
@@ -157,6 +173,16 @@ def _bits(t: torch.Tensor) -> torch.Tensor:
     return t.view(torch.int16)
 
 
+def _assert_idle(workspace: torch.Tensor, what: str) -> None:
+    """The semaphores are zero (they reset themselves when the last CTA merges)."""
+    stuck = workspace[:SEMAPHORE_BYTES].view(torch.int32).nonzero()
+    if len(stuck):
+        raise AssertionError(
+            f"{what}: {len(stuck)} semaphores are not zero after the launch, first "
+            f"at {stuck[0].item()}"
+        )
+
+
 def _assert_same(stock, shadow, what: str) -> None:
     """Bitwise equality, NaN payloads included."""
     a, b = _bits(stock), _bits(shadow)
@@ -169,7 +195,9 @@ def _assert_same(stock, shadow, what: str) -> None:
         )
 
 
-def _run_pair(rig, ctxs, *, window, q_len=1, pdl=True, tables=None, check_data=True):
+def _run_pair(
+    rig, ctxs, *, window, q_len=1, pdl=True, tables=None, check_data=True, sinks=False
+):
     """One launch of both modules on the contexts ``ctxs``; asserts equal bits."""
     batch = len(ctxs)
     seq_lens = torch.tensor(ctxs, device=DEVICE, dtype=torch.int32)
@@ -189,10 +217,13 @@ def _run_pair(rig, ctxs, *, window, q_len=1, pdl=True, tables=None, check_data=T
             q_len=q_len,
             mask=mask,
             pdl=pdl,
+            sinks=rig.sinks_for(sinks),
         )
         outs[variant] = out
     torch.cuda.synchronize()
-    _assert_same(outs["stock"], outs["shadow"], f"{window} q{q_len} ctx={ctxs}")
+    what = f"{window} q{q_len}{' sinks' if sinks else ''} ctx={ctxs}"
+    _assert_same(outs["stock"], outs["shadow"], what)
+    rig.assert_semaphores_idle(what)
     if check_data:
         assert torch.isfinite(outs["shadow"].float()).all()
         assert not (outs["shadow"] == SENTINEL).all()
@@ -212,24 +243,30 @@ def _sweep_contexts(q_len: int) -> list[int]:
     return sorted(c for c in ctxs if q_len <= c <= MAX_LEN)
 
 
+@pytest.mark.parametrize("sinks", [False, True])
 @pytest.mark.parametrize("q_len", [1, 8])
 @pytest.mark.parametrize("window", ["swa", "full"])
-def test_single_sequence_sweep(rig, window, q_len):
+def test_single_sequence_sweep(rig, window, q_len, sinks):
     """Batch 1 (94 CTAs per KV head): every length around the tile boundaries."""
     for ctx in _sweep_contexts(q_len):
-        _run_pair(rig, [ctx], window=window, q_len=q_len)
+        _run_pair(rig, [ctx], window=window, q_len=q_len, sinks=sinks)
 
 
+@pytest.mark.parametrize("sinks", [False, True])
 @pytest.mark.parametrize("q_len", [1, 8])
 @pytest.mark.parametrize("window", ["swa", "full"])
-def test_every_length_of_one_sequence(rig, window, q_len):
-    """Batch 1: each of the lengths 1 to 131072 (queued, compared per chunk)."""
+def test_every_length_of_one_sequence(rig, window, q_len, sinks):
+    """Batch 1: each of the lengths 1 to 131072 (queued, compared per chunk).
+
+    With sinks the lengths stop at 20480 (the whole range is covered without them).
+    """
     chunk = 4096
+    last = 20480 if sinks else MAX_LEN
     tables = rig.block_tables(1)
     query = rig.query(q_len)
     mask = _mask(q_len, 1)
-    for start in range(q_len, MAX_LEN + 1, chunk):
-        stop = min(start + chunk, MAX_LEN + 1)
+    for start in range(q_len, last + 1, chunk):
+        stop = min(start + chunk, last + 1)
         lens = torch.arange(start, stop, device=DEVICE, dtype=torch.int32)
         shape = (len(lens) * q_len, *query.shape[1:])
         outs = {
@@ -247,8 +284,10 @@ def test_every_length_of_one_sequence(rig, window, q_len):
                     window_left=WINDOWS[window],
                     q_len=q_len,
                     mask=mask,
+                    sinks=rig.sinks_for(sinks),
                 )
         torch.cuda.synchronize()
+        rig.assert_semaphores_idle(f"{window} q{q_len} ctx {start}..{stop - 1}")
         a, b = _bits(outs["stock"]), _bits(outs["shadow"])
         if not torch.equal(a, b):
             bad = (a != b).flatten(1).any(1).nonzero().flatten()[0].item() // q_len
@@ -257,7 +296,10 @@ def test_every_length_of_one_sequence(rig, window, q_len):
             )
 
 
-BATCH_SIZES = [2, 3, 4, 5, 7, 8, 16, 32, 64, 128]
+# The grid of a batch has 188 // (2 * batch) CTAs per KV head (94 at batch 1): 4 and 3
+# CTAs at the batches 23, 24 and 31 are where it holds fewer than the 4 warp groups
+# that share the merge, and 1 CTA from batch 48 on (no merge at all).
+BATCH_SIZES = [2, 3, 4, 5, 7, 8, 16, 23, 24, 31, 32, 64, 128]
 
 
 def _random_contexts(rnd: random.Random, batch: int, min_len: int) -> list[int]:
@@ -275,31 +317,37 @@ def _random_contexts(rnd: random.Random, batch: int, min_len: int) -> list[int]:
     return ctxs
 
 
-@pytest.mark.parametrize("pdl", [False, True])
+@pytest.mark.parametrize("pdl,sinks", [(False, False), (True, False), (True, True)])
 @pytest.mark.parametrize("q_len", [1, 8])
 @pytest.mark.parametrize("window", ["swa", "full"])
 @pytest.mark.parametrize("batch", BATCH_SIZES)
-def test_heterogeneous_batches(rig, batch, window, q_len, pdl):
+def test_heterogeneous_batches(rig, batch, window, q_len, pdl, sinks):
     """Every request of a batch has its own number of active CTAs."""
     rnd = random.Random(batch * 100 + q_len)
     for _ in range(6):
         ctxs = _random_contexts(rnd, batch, q_len)
-        _run_pair(rig, ctxs, window=window, q_len=q_len, pdl=pdl)
+        _run_pair(rig, ctxs, window=window, q_len=q_len, pdl=pdl, sinks=sinks)
 
 
+@pytest.mark.parametrize("sinks", [False, True])
 @pytest.mark.parametrize("q_len", [1, 8])
 @pytest.mark.parametrize("window", ["swa", "full"])
-def test_edge_batch(rig, window, q_len):
+def test_edge_batch(rig, window, q_len, sinks):
     ctxs = [8, 255, 256, 257, 2047, 2049, 4096, 131072]
-    _run_pair(rig, ctxs, window=window, q_len=q_len)
-    _run_pair(rig, ctxs[::-1], window=window, q_len=q_len)
-    _run_pair(rig, [MAX_LEN] * 16, window=window, q_len=q_len)
-    _run_pair(rig, [max(q_len, 1)] * 16, window=window, q_len=q_len)
+    _run_pair(rig, ctxs, window=window, q_len=q_len, sinks=sinks)
+    _run_pair(rig, ctxs[::-1], window=window, q_len=q_len, sinks=sinks)
+    _run_pair(rig, [MAX_LEN] * 16, window=window, q_len=q_len, sinks=sinks)
+    _run_pair(rig, [max(q_len, 1)] * 16, window=window, q_len=q_len, sinks=sinks)
 
 
+@pytest.mark.parametrize("sinks", [False, True])
 @pytest.mark.parametrize("window", ["swa", "full"])
-def test_empty_sequences(rig, window):
-    """Padded slots of a CUDA graph batch carry length 0 (NaN rows in both kernels)."""
+def test_empty_sequences(rig, window, sinks):
+    """Padded slots of a CUDA graph batch carry length 0 (NaN rows in both kernels).
+
+    With sinks an empty row is what the sink alone makes of it, and it has to be the
+    stock one too.
+    """
     for ctxs in ([0], [0, 0, 0, 0], [0, 1, 0, 300], [5000, 0, 70000, 0, 257, 0, 0, 1]):
         outs = {}
         seq_lens = torch.tensor(ctxs, device=DEVICE, dtype=torch.int32)
@@ -308,17 +356,24 @@ def test_empty_sequences(rig, window):
         for variant in ("stock", "shadow"):
             out = torch.full_like(query, SENTINEL)
             rig.call(
-                variant, query, out, tables, seq_lens, window_left=WINDOWS[window]
+                variant,
+                query,
+                out,
+                tables,
+                seq_lens,
+                window_left=WINDOWS[window],
+                sinks=rig.sinks_for(sinks),
             )
             outs[variant] = out
         torch.cuda.synchronize()
         _assert_same(outs["stock"], outs["shadow"], f"{window} ctx={ctxs}")
+        rig.assert_semaphores_idle(f"{window} empty ctx={ctxs}")
 
 
-@pytest.mark.parametrize("pdl", [False, True])
+@pytest.mark.parametrize("pdl,sinks", [(False, False), (True, False), (True, True)])
 @pytest.mark.parametrize("batch", [1, 2, 4, 8])
 @pytest.mark.parametrize("window", ["swa", "full"])
-def test_ragged_draft_batches(rig, batch, window, pdl):
+def test_ragged_draft_batches(rig, batch, window, pdl, sinks):
     """Spec-decode verify with a different draft length per request (0 included)."""
     rnd = random.Random(batch)
     max_q = 8
@@ -349,10 +404,12 @@ def test_ragged_draft_batches(rig, batch, window, pdl):
                 mask=mask,
                 q_cu_seq_lens=q_cu,
                 pdl=pdl,
+                sinks=rig.sinks_for(sinks),
             )
             outs[variant] = out
         torch.cuda.synchronize()
         _assert_same(outs["stock"], outs["shadow"], f"ragged {window} {q_lens} {ctxs}")
+        rig.assert_semaphores_idle(f"ragged {window} {q_lens} {ctxs}")
 
 
 @pytest.mark.parametrize(
@@ -420,12 +477,50 @@ def test_other_modules_of_the_process(
                 outs[variant] = out
             torch.cuda.synchronize()
             _assert_same(outs["stock"], outs["shadow"], f"hd{head_dim} ctx={ctxs}")
+            rig.assert_semaphores_idle(f"hd{head_dim} ctx={ctxs}")
+
+
+OTHER_DRAFT_LENGTHS = [2, 4, 5, 7]  # drafters with 1 to 6 tokens (q_len 8 is above)
+
+
+def _edge_contexts(q_len: int) -> list[int]:
+    """A reduced sweep: the tile, page and window edges and some random lengths."""
+    ctxs = set(range(q_len, q_len + 6))
+    for base in (255, 511, 2047, 2303, 4095, 24063, 24319, MAX_LEN - 256):
+        ctxs.update(base + d for d in (-1, 0, 1, 2))
+    ctxs.update({MAX_LEN - 1, MAX_LEN})
+    rnd = random.Random(q_len)
+    ctxs.update(rnd.randint(1, MAX_LEN) for _ in range(40))
+    return sorted(c for c in ctxs if q_len <= c <= MAX_LEN)
+
+
+@pytest.mark.parametrize("sinks", [False, True])
+@pytest.mark.parametrize("q_len", OTHER_DRAFT_LENGTHS)
+@pytest.mark.parametrize("window", ["swa", "full"])
+def test_other_draft_lengths_single_sequence(rig, window, q_len, sinks):
+    """Every XQA module of the process is a shadow, so a drafter with 1 to 6 tokens
+    (q_len 2 to 7, uniform) runs modules that no other test of this file builds. The
+    one with q_len 5 and 7 has an incomplete second block of query rows."""
+    for ctx in _edge_contexts(q_len):
+        _run_pair(rig, [ctx], window=window, q_len=q_len, sinks=sinks)
+
+
+@pytest.mark.parametrize("sinks", [False, True])
+@pytest.mark.parametrize("q_len", OTHER_DRAFT_LENGTHS)
+@pytest.mark.parametrize("window", ["swa", "full"])
+@pytest.mark.parametrize("batch", [2, 3, 8, 23, 24, 31, 64])
+def test_other_draft_lengths_batches(rig, batch, window, q_len, sinks):
+    rnd = random.Random(batch * 100 + q_len)
+    for _ in range(4):
+        ctxs = _random_contexts(rnd, batch, q_len)
+        _run_pair(rig, ctxs, window=window, q_len=q_len, sinks=sinks)
 
 
 class GraphInputs:
     """What the graphs of both variants read; the test rewrites it in place."""
 
-    def __init__(self, rig, batch, q_len, layers):
+    def __init__(self, rig, batch, q_len, layers, sinks=False):
+        self.sinks = rig.sinks_for(sinks)
         self.seq_lens = torch.full((batch,), MAX_LEN, device=DEVICE, dtype=torch.int32)
         self.tables = rig.block_tables(batch)
         self.mask = _mask(q_len, batch)
@@ -456,6 +551,7 @@ class GraphRun:
                     q_len=q_len,
                     mask=inputs.mask,
                     workspace=self.workspace,
+                    sinks=inputs.sinks,
                 )
 
         run()  # builds the modules outside the capture
@@ -470,9 +566,10 @@ class GraphRun:
             run()
 
 
+@pytest.mark.parametrize("sinks", [False, True])
 @pytest.mark.parametrize("q_len", [1, 8])
-@pytest.mark.parametrize("batch", [1, 3, 8])
-def test_graph_replay_with_changing_contexts(rig, batch, q_len):
+@pytest.mark.parametrize("batch", [1, 3, 8, 24])
+def test_graph_replay_with_changing_contexts(rig, batch, q_len, sinks):
     """Stale semaphores or scratch across replays and layers show up as a difference.
 
     The graphs are captured at the model length and replayed with other lengths and
@@ -481,7 +578,7 @@ def test_graph_replay_with_changing_contexts(rig, batch, q_len):
     and each replay is run twice.
     """
     layers = 3
-    inputs = GraphInputs(rig, batch, q_len, layers)
+    inputs = GraphInputs(rig, batch, q_len, layers, sinks)
     stock = GraphRun(rig, "stock", inputs, q_len)
     shadow = GraphRun(rig, "shadow", inputs, q_len)
     rnd = random.Random(batch * 10 + q_len)
@@ -501,6 +598,9 @@ def test_graph_replay_with_changing_contexts(rig, batch, q_len):
                     shadow.outs[layer],
                     f"q{q_len} step {step} rep {rep} layer {layer} ctx={ctxs}",
                 )
+            # A stale semaphore would corrupt the next replay (or the next layer).
+            _assert_idle(stock.workspace, f"stock q{q_len} step {step} rep {rep}")
+            _assert_idle(shadow.workspace, f"shadow q{q_len} step {step} rep {rep}")
     del stock, shadow
     torch.cuda.empty_cache()
 
