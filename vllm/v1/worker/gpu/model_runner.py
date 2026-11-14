@@ -154,6 +154,7 @@ from vllm.v1.worker.gpu.sample.logits_processor import build_custom_logits_proce
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
 from vllm.v1.worker.gpu.sample.sampler import Sampler
+from vllm.v1.worker.gpu.sample.topk_logits import RouteStats
 from vllm.v1.worker.gpu.shutdown import free_before_shutdown
 from vllm.v1.worker.gpu.spec_decode import init_speculator
 from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
@@ -348,6 +349,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # each rank (Sampler.sample_topk_logits), 0 when never.
         self.topk_logits_k = 0
         self.topk_logits_min_tokens = 1
+        self.topk_logits_stats: RouteStats | None = None
         self._topk_logits_logged = False
         self.prompt_logprobs_worker: PromptLogprobsWorker | None = None
         self.structured_outputs_worker: StructuredOutputsWorker | None = None
@@ -1090,31 +1092,48 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.topk_logits_min_tokens = max(
             1, envs.VLLM_MUSE_SPARK_SM120_TOPK_LOGITS_MIN_TOKENS
         )
+        self.topk_logits_stats = RouteStats(k)
         return k
+
+    def _topk_logits_fallback_reason(
+        self, input_batch: InputBatch, grammar_output: GrammarOutput | None
+    ) -> str | None:
+        """Why this step gathers the logits (None: it samples from the top-k logits).
+
+        Decided from the batch shape and the host copy of the request state, which
+        every TP rank holds alike: all ranks take the same path (the gather of
+        either path is a collective).
+        """
+        if grammar_output is not None:
+            return "grammar"
+        num_logits = input_batch.logits_indices.shape[0]
+        if self.pcp_manager is not None:
+            return "context-parallel"
+        if input_batch.num_draft_tokens != 0 or num_logits != input_batch.num_reqs:
+            return "draft-tokens"
+        if num_logits < self.topk_logits_min_tokens:
+            return "few-rows"
+        assert self.sampler is not None
+        return self.sampler.topk_logits_fallback_reason(
+            input_batch.idx_mapping_np, self.topk_logits_k
+        )
 
     def _sample_from_topk_logits(
         self, input_batch: InputBatch, grammar_output: GrammarOutput | None
     ) -> bool:
         """Whether this step samples from the top-k logits of each TP rank.
 
-        Decided from the batch shape and the host copy of the request state, which
-        every TP rank holds alike: all ranks take the same path (the gather of
-        either path is a collective).
+        Counts the step and logs the counts now and then (``RouteStats``): one single
+        request of a batch that needs the logits sends all its rows down the full path.
         """
-        if self.topk_logits_k == 0 or grammar_output is not None:
+        if self.topk_logits_k == 0:
             return False
-        num_logits = input_batch.logits_indices.shape[0]
-        if (
-            self.pcp_manager is not None
-            or input_batch.num_draft_tokens != 0
-            or num_logits != input_batch.num_reqs
-            or num_logits < self.topk_logits_min_tokens
-        ):
-            return False
-        assert self.sampler is not None
-        return self.sampler.topk_logits_supported(
-            input_batch.idx_mapping_np, self.topk_logits_k
-        )
+        reason = self._topk_logits_fallback_reason(input_batch, grammar_output)
+        assert self.topk_logits_stats is not None
+        line = self.topk_logits_stats.record(reason)
+        if line is not None:
+            logger.info("Sampling from the top-k logits: %s.", line)
+        return reason is None
 
     @torch.inference_mode()
     def _dummy_pooler_run(self, hidden_states: torch.Tensor) -> None:

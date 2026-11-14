@@ -26,7 +26,10 @@ if not torch.cuda.is_available():
 from vllm.models.muse_spark.common.layers import MulTanhSoftCap
 from vllm.models.muse_spark.nvidia import model as muse_model
 from vllm.models.muse_spark.nvidia.model import MuseSpark1xForCausalLM
-from vllm.v1.worker.gpu.sample.topk_logits import local_topk_candidates
+from vllm.v1.worker.gpu.sample.topk_logits import (
+    MAX_GATHER_SHARD_COLS,
+    local_topk_candidates,
+)
 
 FLAG = "VLLM_MUSE_SPARK_SM120_TOPK_LOGITS"
 FLAG_K = "VLLM_MUSE_SPARK_SM120_TOPK_LOGITS_K"
@@ -85,6 +88,46 @@ def test_the_soft_cap_is_elementwise_for_every_bf16_value(cap_module: bool):
     assert padded.data_ptr() % 16 != 0
     shifted = bits_of(model._scale_and_soft_cap(padded.view(1, -1)))
     assert torch.equal(shifted.view(-1), reference.view(-1))
+
+
+# The cap stops being strictly increasing on bf16 values at |logit| = 816 (816 and 820
+# get one capped value) and reaches exactly 20.0 at 1020, measured on the CUDA op of the
+# deployed build; documented in vllm/v1/worker/gpu/sample/topk_logits.py and envs.py.
+FIRST_EQUAL_PAIR = 816.0
+FIRST_SATURATED = 1020.0
+
+
+@pytest.mark.parametrize("cap_module", [True, False])
+def test_the_soft_cap_is_monotonic_and_strictly_so_below_the_documented_bound(
+    cap_module: bool,
+):
+    """The candidate order (bf16 logit, then token id) is the order of the capped fp32
+    values only where the cap is strictly increasing: the bound is a fact of the op,
+    not of the formula (the CUDA op uses tanhf)."""
+    model = fake_model(cap_module)
+    bits = torch.arange(0, 0x7F80, dtype=torch.int32, device="cuda").to(torch.int16)
+    values = bits.view(torch.bfloat16)  # every non-negative finite bf16, ascending
+    capped = model._scale_and_soft_cap(values.view(1, -1))[0]
+    step = capped[1:] - capped[:-1]
+    assert not (step < 0).any(), "the cap decreases somewhere"
+    equal = (step == 0).nonzero().flatten()
+    assert len(equal) > 0
+    first = float(values[int(equal[0])])
+    assert first >= FIRST_EQUAL_PAIR, first
+    saturated = (capped == SOFT_CAP).nonzero().flatten()
+    assert float(values[int(saturated[0])]) >= FIRST_SATURATED
+    # Odd: the negative half orders the other way, bit for bit.
+    negative = model._scale_and_soft_cap((-values).view(1, -1))[0]
+    assert torch.equal(bits_of(negative), bits_of(-capped))
+
+
+def test_the_index_words_of_a_gatherable_shard_are_finite_bf16():
+    """Every column index of a shard the gate admits is a finite bf16 pattern, and the
+    column after the last one is the first Inf pattern."""
+    idx = torch.arange(MAX_GATHER_SHARD_COLS + 1, dtype=torch.int32, device="cuda")
+    words = idx.to(torch.int16).view(torch.bfloat16)
+    assert torch.isfinite(words[:-1]).all()
+    assert torch.isinf(words[-1])
 
 
 def shard_candidates(logits: torch.Tensor, tp: int, k: int) -> torch.Tensor:
@@ -161,6 +204,9 @@ def test_the_gate_opens_for_the_deployed_layout(monkeypatch):
     assert resolve(monkeypatch) == 64
     assert resolve(monkeypatch, k=32) == 32
     assert resolve(monkeypatch, k=1) == 1
+    # The widest shard whose index words are all finite bf16.
+    widest = head(MAX_GATHER_SHARD_COLS)
+    assert resolve(monkeypatch, tp=4, k=64, lm_head=widest) == 64
 
 
 @pytest.mark.parametrize(
@@ -174,6 +220,8 @@ def test_the_gate_opens_for_the_deployed_layout(monkeypatch):
         "tp2": dict(tp=2, lm_head=head(101024)),
         "too-many-candidates": dict(tp=32, k=128, lm_head=head(6314)),
         "shard-narrower-than-k": dict(lm_head=head(40)),
+        "index-words-not-finite": dict(tp=4, lm_head=head(MAX_GATHER_SHARD_COLS + 1)),
+        "tp4-real-shard": dict(tp=4, lm_head=head(50512)),
         "added-embeddings": dict(lm_head=head(added=1)),
         "fp32-weight": dict(lm_head=head(dtype=torch.float32)),
         "fp32-head": dict(head_dtype=torch.float32),

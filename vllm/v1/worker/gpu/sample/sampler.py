@@ -137,10 +137,12 @@ class Sampler:
         num_logprobs = max_num_logprobs if max_num_logprobs != NO_LOGPROBS else 0
         return num_logprobs, max_token_ids
 
-    def topk_logits_supported(self, idx_mapping_np: np.ndarray, k: int) -> bool:
-        """Whether `sample_topk_logits` can sample these requests.
+    def topk_logits_fallback_reason(
+        self, idx_mapping_np: np.ndarray, k: int
+    ) -> str | None:
+        """Why `sample_topk_logits` cannot sample these requests (None: it can).
 
-        True when the sampling of every request is a greedy argmax, or a Gumbel-max
+        It can when the sampling of every request is a greedy argmax, or a Gumbel-max
         draw from at most the ``k`` largest logits (temperature, top_k <= k): nothing
         that needs more than the top ``k`` of the vocabulary, or the logits themselves.
         Reads host state only, which every TP rank holds alike, so all ranks decide
@@ -151,21 +153,28 @@ class Sampler:
             or self.return_sampling_mask
             or self.trace_replay_state is not None
         ):
-            return False
+            return "sampler-feature"
         if np.any(self.needs_full_logits[idx_mapping_np]):
-            return False
+            return "logits-processing"
         if self.get_logprobs_dims(idx_mapping_np) is not None:
-            return False
+            return "logprobs"
         states = self.sampling_states
         random = states.temperature.np[idx_mapping_np] != 0.0
         if not random.any():
             # A greedy row ignores top_k, top_p and min_p.
-            return True
-        return bool(
-            np.all(states.top_k.np[idx_mapping_np][random] <= k)
-            and np.all(states.top_p.np[idx_mapping_np][random] == 1.0)
+            return None
+        if not (
+            np.all(states.top_p.np[idx_mapping_np][random] == 1.0)
             and np.all(states.min_p.np[idx_mapping_np][random] == 0.0)
-        )
+        ):
+            return "top-p-or-min-p"
+        if not np.all(states.top_k.np[idx_mapping_np][random] <= k):
+            return "top-k-unset-or-above-k"
+        return None
+
+    def topk_logits_supported(self, idx_mapping_np: np.ndarray, k: int) -> bool:
+        """Whether `sample_topk_logits` can sample these requests."""
+        return self.topk_logits_fallback_reason(idx_mapping_np, k) is None
 
     def sample_topk_logits(
         self, topk: TopKLogits, input_batch: InputBatch
@@ -173,7 +182,9 @@ class Sampler:
         """`__call__` on the candidates of `topk` instead of the full logits.
 
         The caller has checked `topk_logits_supported`. Draws the token of the full
-        path: the argmax of the logits, or the Gumbel-max draw over their top_k.
+        path: the argmax of the logits, or the Gumbel-max draw over their top_k (exactly
+        top_k tokens, the lowest ids among ties at the boundary: the tokens and noise
+        of the Gumbel-max route; FlashInfer's route keeps every tie of the k-th logit).
         """
         states = self.sampling_states
         pos = input_batch.positions[input_batch.logits_indices]

@@ -160,7 +160,7 @@ from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 from vllm.utils.torch_utils import aux_stream
 from vllm.v1.worker.gpu.sample.topk_logits import (
     MAX_CANDIDATES,
-    MAX_SHARD_COLS,
+    MAX_GATHER_SHARD_COLS,
     TopKLogits,
     local_topk_candidates,
 )
@@ -3300,10 +3300,11 @@ class MuseSpark1xForCausalLM(LlamaForCausalLM, SupportsLoRA, MixtureOfExperts):
             reason = "there is no vocabulary to gather at TP 1"
         elif tp_size * k > MAX_CANDIDATES:
             reason = f"TP {tp_size} x K {k} candidates exceed {MAX_CANDIDATES}"
-        elif not k <= shard <= MAX_SHARD_COLS:
+        elif not k <= shard <= MAX_GATHER_SHARD_COLS:
+            # The gathered index words are bf16 bits: all finite below this width.
             reason = (
                 f"the lm_head shard has {shard} columns, outside {k} .. "
-                f"{MAX_SHARD_COLS}"
+                f"{MAX_GATHER_SHARD_COLS}"
             )
         elif head.num_added_embeddings:
             reason = "the lm_head has added (LoRA) embeddings"
@@ -3350,7 +3351,8 @@ class MuseSpark1xForCausalLM(LlamaForCausalLM, SupportsLoRA, MixtureOfExperts):
             local, k, num_valid=head.shard_indices.num_org_elements
         )
         # int16 words travel as bf16 bits: every communicator moves that dtype and
-        # an all-gather only copies.
+        # an all-gather only copies (the gate keeps the index words finite bf16, which
+        # no conversion or NaN quieting can change).
         words = tensor_model_parallel_all_gather(words.view(torch.bfloat16), dim=0)
         # The cap runs over the index words too (finite garbage, ignored): one launch
         # on a contiguous tensor, the way the fused op takes it.

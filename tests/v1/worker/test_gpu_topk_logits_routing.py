@@ -7,6 +7,7 @@ themselves, has to send the step down the full path, and every TP rank has to de
 alike: the decision reads host copies of the request state, nothing rank-specific.
 """
 
+import functools
 from collections.abc import Sequence
 from types import SimpleNamespace
 
@@ -25,6 +26,7 @@ from vllm.v1.worker.gpu.sample.logits_processor import (
     LogitsProcessor,
 )
 from vllm.v1.worker.gpu.sample.sampler import Sampler
+from vllm.v1.worker.gpu.sample.topk_logits import RouteStats
 from vllm.v1.worker.gpu.states import RequestState
 
 DEVICE = torch.device("cuda")
@@ -152,6 +154,37 @@ T1K64 = SamplingParams(temperature=1.0, top_k=64)
 )
 def test_single_request_predicate(params: SamplingParams, expected: bool):
     assert supported(sampler_with(params), [0]) == expected
+
+
+@pytest.mark.parametrize(
+    ("params", "reason"),
+    [
+        (GREEDY, None),
+        (T1K64, None),
+        (SamplingParams(temperature=1.0, top_k=65), "top-k-unset-or-above-k"),
+        (SamplingParams(temperature=1.0), "top-k-unset-or-above-k"),
+        (SamplingParams(temperature=1.0, top_k=64, top_p=0.9), "top-p-or-min-p"),
+        (SamplingParams(temperature=1.0, top_p=0.95), "top-p-or-min-p"),
+        (SamplingParams(temperature=1.0, top_k=64, min_p=0.1), "top-p-or-min-p"),
+        (SamplingParams(temperature=0.0, logprobs=1), "logprobs"),
+        (SamplingParams(temperature=0.0, repetition_penalty=1.1), "logits-processing"),
+        (SamplingParams(temperature=0.0, logit_bias={1: 1.0}), "logits-processing"),
+        (SamplingParams(temperature=0.0, thinking_token_budget=3), "logits-processing"),
+    ],
+    ids=lambda v: v if isinstance(v, str) else None,
+)
+def test_the_fallback_reason(params: SamplingParams, reason: str | None):
+    sampler = sampler_with(params)
+    assert sampler.topk_logits_fallback_reason(np.zeros(1, dtype=np.intp), K) == reason
+    assert supported(sampler, [0]) == (reason is None)
+
+
+def test_the_fallback_reason_of_a_sampler_feature():
+    sampler = sampler_with(T1K64, return_sampling_mask=True)
+    assert (
+        sampler.topk_logits_fallback_reason(np.zeros(1, dtype=np.intp), K)
+        == "sampler-feature"
+    )
 
 
 def test_a_batch_takes_the_path_only_if_every_request_can():
@@ -325,20 +358,25 @@ def fake_batch(rows: int, draft_tokens: int = 0, reqs: int | None = None):
     )
 
 
-def fake_runner(k: int = K, min_tokens: int = 1, supports: bool = True, **kwargs):
+def fake_runner(k: int = K, min_tokens: int = 1, reason: str | None = None, **kwargs):
     sampler = SimpleNamespace(
         calls=[],
-        topk_logits_supported=lambda idx, kk: (
-            sampler.calls.append((idx.tolist(), kk)) or supports
+        topk_logits_fallback_reason=lambda idx, kk: (
+            sampler.calls.append((idx.tolist(), kk)) or reason
         ),
     )
-    return SimpleNamespace(
+    runner = SimpleNamespace(
         topk_logits_k=k,
         topk_logits_min_tokens=min_tokens,
+        topk_logits_stats=RouteStats(k),
         pcp_manager=None,
         sampler=sampler,
         **kwargs,
     )
+    runner._topk_logits_fallback_reason = functools.partial(
+        GPUModelRunner._topk_logits_fallback_reason, runner
+    )
+    return runner
 
 
 def step_uses_topk(runner, batch, grammar_output=None) -> bool:
@@ -378,7 +416,7 @@ def test_the_step_predicate_falls_back(case: str):
     elif case == "prefill-context-parallel":
         runner.pcp_manager = object()
     elif case == "sampler-refuses":
-        runner.sampler.topk_logits_supported = lambda idx, k: False
+        runner.sampler.topk_logits_fallback_reason = lambda idx, k: "logprobs"
     assert not step_uses_topk(runner, batch, grammar)
 
 
@@ -392,6 +430,46 @@ def test_the_step_predicate_depends_on_the_row_count_alone():
         True,
         True,
     ]
+
+
+def test_the_runner_counts_the_steps_by_reason():
+    runner = fake_runner(min_tokens=2)
+    for rows in (1, 8, 8, 64):
+        step_uses_topk(runner, fake_batch(rows))
+    step_uses_topk(runner, fake_batch(8), grammar_output=object())
+    runner.sampler.topk_logits_fallback_reason = lambda idx, k: "logprobs"
+    step_uses_topk(runner, fake_batch(8))
+    stats = runner.topk_logits_stats
+    assert stats.taken == 3 and stats.steps == 6
+    assert stats.fallbacks == {"few-rows": 1, "grammar": 1, "logprobs": 1}
+
+
+def test_a_launch_without_the_path_counts_nothing():
+    runner = fake_runner(k=0)
+    assert not step_uses_topk(runner, fake_batch(8))
+    assert runner.topk_logits_stats.steps == 0 and runner.sampler.calls == []
+
+
+def test_route_stats_log_the_first_step_new_reasons_and_then_every_interval():
+    now = [100.0]
+    stats = RouteStats(64, interval_s=30.0, clock=lambda: now[0])
+    first = stats.record(None)
+    assert first is not None and "1 of 1 sampled steps (100.0%)" in first
+    assert "top-64" in first and "gathered" not in first
+    assert stats.record(None) is None
+    # A reason seen for the first time is logged at once, a repeat is not.
+    line = stats.record("logprobs")
+    assert line is not None and "logprobs: 1" in line and "2 of 3" in line
+    assert stats.record("logprobs") is None
+    now[0] += 29.0
+    assert stats.record(None) is None
+    now[0] += 1.0
+    line = stats.record("few-rows")  # new reason
+    assert line is not None
+    now[0] += 31.0
+    line = stats.record(None)
+    assert line is not None and "few-rows: 1, logprobs: 2" in line
+    assert "4 of 7 sampled steps" in line
 
 
 def resolve(model_k: int = K, **overrides):

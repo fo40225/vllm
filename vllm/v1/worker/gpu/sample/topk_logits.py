@@ -19,16 +19,30 @@ instead:
    ``gumbel_sample``, with the noise keyed by the token id exactly as there.
 
 Candidates are ordered by their bf16 logit, then by their token id, which is the order
-of the soft-capped fp32 values (the cap is strictly increasing on the bf16 range of the
-logits: for the cap of 20 and the multiplier of 0.177 of Muse Spark, up to |logit| of
-about 900) with the lowest id first among equal ones, as in the full path. So a greedy
-row returns the token ``gumbel_sample`` returns for the full logits, and a row with
-top_k <= K keeps the same ``top_k`` tokens as ``apply_top_k_top_p`` (the lowest ids win
-a tie at the boundary: every shard keeps the K lowest-indexed of its ties, and the
-top_k <= K that the merge needs are among them), draws the same noise for them and so
-returns the same token.
+of the soft-capped fp32 values with the lowest id first among equal ones, as in the full
+path: the cap is non-decreasing over the whole bf16 range and strictly increasing for
+|logit| < 816 (measured on the CUDA op of Muse Spark, cap 20 and multiplier 0.177: 816
+and 820 are the first bf16 values that share a capped value; the cap reaches exactly
+20.0 from 1020). So a greedy row returns the token ``gumbel_sample`` returns for the
+full logits, unless more than K tokens of one shard have |logit| >= 816 (their capped
+values can tie where their bf16 values do not): Muse logits are tens, not hundreds.
+
+Ties at the top_k boundary. A row with top_k <= K keeps exactly ``top_k`` tokens: the
+lowest token ids among the ones tied at the boundary. These are the tokens
+``apply_top_k_top_p`` (Qrita) keeps, with the same noise per (seed, position, token id),
+so the row returns the token of the full path whenever that path draws by Gumbel-max (a
+greedy row, a seeded row, or any step with one). The other route of the full path for
+top_k-only sampling, FlashInfer's sampler (a step with neither greedy rows nor explicit
+seeds), keeps every token tied with the k-th value. The two differ only on a row with a
+tie across the k-th place: the tokens tied beyond the k-th get weight 0 here and their
+share of the renormalised mass there, so the draw here favours the lower token ids by at
+most that mass in total variation. top_k does not define a tie rule; both are top-k
+samplers. Expect the difference on bf16 logits only where the k-th and (k+1)-th logit
+are equal.
 """
 
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
@@ -36,8 +50,13 @@ import torch
 from vllm.triton_utils import tl, triton
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_noised_argmax
 
-# The widest shard row (a column is a 16-bit index of the candidate word).
+# The widest shard row of the local kernel (a column is a 16-bit index of the candidate
+# word).
 MAX_SHARD_COLS = 65535
+# The widest shard the gathered carrier takes: the index words travel as bf16 bits, and
+# the indices 0 .. 0x7F7F are finite bf16 values (0x7F80 .. 0x7FFF and 0xFF80 .. 0xFFFF
+# are Inf / NaN patterns, which a backend that converts or quiets NaNs would corrupt).
+MAX_GATHER_SHARD_COLS = 0x7F80
 # The widest candidate list of a row (TP * K) the merge kernel holds in registers.
 MAX_CANDIDATES = 2048
 _INT32_MAX = tl.constexpr(0x7FFFFFFF)
@@ -353,3 +372,57 @@ def topk_merge_sample(
         num_warps=MERGE_NUM_WARPS,
     )
     return sampled
+
+
+class RouteStats:
+    """Host-side counts of the steps that sampled from the top-K logits, and of the
+    steps that gathered the logits instead, by the reason.
+
+    ``record`` counts one step and returns a line to log when one is due: for the first
+    step, for a reason seen for the first time, and then at most once per
+    ``interval_s``. Plain Python integers: no device sync, and every TP rank counts the
+    same steps.
+    """
+
+    def __init__(
+        self,
+        k: int,
+        interval_s: float = 30.0,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.k = k
+        self.taken = 0
+        self.fallbacks: dict[str, int] = {}
+        self._interval_s = interval_s
+        self._clock = clock
+        self._next_log = 0.0
+
+    @property
+    def steps(self) -> int:
+        return self.taken + sum(self.fallbacks.values())
+
+    def summary(self) -> str:
+        steps = self.steps
+        share = 100.0 * self.taken / steps
+        line = (
+            f"{self.taken} of {steps} sampled steps ({share:.1f}%) drew from the "
+            f"top-{self.k} logits of every TP rank"
+        )
+        if self.fallbacks:
+            reasons = ", ".join(f"{r}: {n}" for r, n in sorted(self.fallbacks.items()))
+            line += f"; the others gathered the logits ({reasons})"
+        return line
+
+    def record(self, reason: str | None) -> str | None:
+        """Count a step that gathered the logits for ``reason``, or (None) did not."""
+        new_reason = False
+        if reason is None:
+            self.taken += 1
+        else:
+            new_reason = reason not in self.fallbacks
+            self.fallbacks[reason] = self.fallbacks.get(reason, 0) + 1
+        now = self._clock()
+        if self.steps == 1 or new_reason or now >= self._next_log:
+            self._next_log = now + self._interval_s
+            return self.summary()
+        return None
