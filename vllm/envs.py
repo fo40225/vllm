@@ -153,8 +153,8 @@ if TYPE_CHECKING:
     VLLM_MUSE_SPARK_SM120_L2_PREFETCH_AFTER_EXPERTS_CTAS: int = 4
     VLLM_MUSE_SPARK_SM120_EXPERT_PREFETCH: bool = True
     VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY: bool = True
-    VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP: bool = False
-    VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_MIN_TOKENS: int = 4096
+    VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP: bool = True
+    VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_MIN_TOKENS: int = 2048
     VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_UBATCHES: int = 2
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
     VLLM_ROCM_USE_AITER_LINEAR_HIPBMM: bool = False
@@ -1469,22 +1469,30 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_MIN_TOKENS tokens into two microbatches
     # (the second one starts mid-request where a request straddles the split) and
     # run their tensor-parallel collectives on a side stream, so the collectives of
-    # one microbatch overlap the compute of the other. The model runs twice on half
-    # the rows: GEMM tilings and the attention split differ, so the outputs are
-    # run-to-run deterministic but not bitwise equal to the unsplit batch. Decode and
-    # CUDA-graph batches are untouched. Needs the V2 model runner, SM120, expert
-    # parallel, TP > 1, PP = DP = 1 and no speculative decoding, LoRA or multimodal
-    # inputs; with another layout the flag is ignored with a warning.
+    # one microbatch overlap the compute of the other. Real weights, 8 GPUs on PCIe:
+    # prefill +27 % .. +34 % (replicated stream), +11 % .. +14 % (sequence-parallel
+    # stream); decode and CUDA-graph batches are untouched. The model runs twice on
+    # half the rows, so GEMM tilings and the attention split differ: the outputs are
+    # run-to-run deterministic and identical on all ranks, but not bitwise equal to
+    # the unsplit batch (rounding-level differences, as with the sequence-parallel
+    # stream). Needs the V2 model runner, SM120, expert parallel, TP > 1, PP = DP = 1
+    # and no speculative decoding, LoRA or multimodal inputs; on another layout the
+    # flag has no effect (a warning if it was set explicitly). 0 turns it off. Two
+    # microbatches in flight hold about 1.4 GiB more per rank at 8192 tokens, and the
+    # memory profile runs the whole batch: a launch at the memory limit may need a
+    # --gpu-memory-utilization 0.01 lower.
     "VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP": lambda: bool(
-        int(os.getenv("VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP", "0"))
+        int(os.getenv("VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP", "1"))
     ),
     # Muse Spark on SM120: smallest eager batch (in tokens) that is split when
-    # VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP is on. Raised to at least four times the
-    # sequence-parallel threshold plus the CUDA-graph range, so that both halves
-    # take the same model path (the microbatches hand off at every collective and
-    # must issue the same number of them).
+    # VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP is on. Raised to the number of
+    # microbatches times (the sequence-parallel minimum, at least 1024, plus 1), 2050
+    # for two: both halves must take the same model path (the microbatches hand off
+    # at every collective and must issue the same number of them). A batch of 2100
+    # tokens prefills 25 % (replicated stream) / 9 % (sequence-parallel stream)
+    # faster split than whole.
     "VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_MIN_TOKENS": lambda: int(
-        os.getenv("VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_MIN_TOKENS", "4096")
+        os.getenv("VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_MIN_TOKENS", "2048")
     ),
     # Muse Spark on SM120: number of microbatches of
     # VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP.

@@ -54,20 +54,24 @@ def test_prefill_overlap_is_registered_for_both_muse_architectures() -> None:
     assert MODELS_CONFIG_MAP["MuseSparkForConditionalGeneration"] is MuseSparkConfig
 
 
-def test_prefill_overlap_is_opt_in(monkeypatch, sm120_platform) -> None:
+def test_prefill_overlap_is_on_by_default(monkeypatch, sm120_platform) -> None:
     monkeypatch.delenv(FLAG, raising=False)
+    config = _config()
+    MuseSparkConfig.verify_and_update_config(config)
+    pc = config.parallel_config
+    assert pc.ubatch_size == 2
+    # The default is the floor: both halves stay above the thresholds of the model.
+    assert pc.dbo_prefill_token_threshold == 2 * (1024 + 1)
+    # A decode batch is never split: its threshold cannot be reached.
+    assert pc.dbo_decode_token_threshold == 2**31 - 1
+
+
+def test_prefill_overlap_can_be_turned_off(monkeypatch, sm120_platform) -> None:
+    monkeypatch.setenv(FLAG, "0")
     config = _config()
     MuseSparkConfig.verify_and_update_config(config)
     assert config.parallel_config.ubatch_size == 0
     assert config.parallel_config.dbo_prefill_token_threshold == 512
-
-    monkeypatch.setenv(FLAG, "1")
-    MuseSparkConfig.verify_and_update_config(config)
-    pc = config.parallel_config
-    assert pc.ubatch_size == 2
-    assert pc.dbo_prefill_token_threshold == 4096
-    # A decode batch is never split: its threshold cannot be reached.
-    assert pc.dbo_decode_token_threshold == 2**31 - 1
 
 
 def test_prefill_overlap_threshold_cannot_undercut_the_model_thresholds(
@@ -138,6 +142,17 @@ def test_prefill_overlap_is_off_with_speculative_decoding_and_lora(
     config = _config()
     setattr(config, field, object())
     assert MuseSparkConfig._prefill_overlap_blocker(config) is not None
+
+
+def test_prefill_overlap_unsupported_layout_is_quiet_unless_asked(
+    monkeypatch, sm120_platform, caplog
+) -> None:
+    config = _config(tensor_parallel_size=1)
+    monkeypatch.delenv(FLAG, raising=False)
+    with caplog.at_level("WARNING"):
+        MuseSparkConfig.verify_and_update_config(config)
+    assert config.parallel_config.ubatch_size == 0
+    assert "PREFILL_OVERLAP" not in caplog.text
 
 
 def test_prefill_overlap_is_for_sm120_only(monkeypatch) -> None:

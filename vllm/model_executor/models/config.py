@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import json
+import os
 from typing import TYPE_CHECKING
 
 import vllm.envs as envs
@@ -117,8 +118,14 @@ class MuseSparkConfig(VerifyAndUpdateConfig):
             return
         blocker = MuseSparkConfig._prefill_overlap_blocker(vllm_config)
         if blocker is not None:
-            logger.warning(
-                "VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP is set but ignored: %s.",
+            # On by default: only a launch that asked for it is told it got nothing.
+            log = (
+                logger.warning
+                if "VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP" in os.environ
+                else logger.debug
+            )
+            log(
+                "VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP has no effect: %s.",
                 blocker,
             )
             return
