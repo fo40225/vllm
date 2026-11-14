@@ -1315,6 +1315,41 @@ def test_sm120_packed_input_scale_needs_one_scale_and_the_local_rows_path(
     assert differing.experts.packed_input_scale(K) is None
 
 
+def test_sm120_packed_input_is_private_to_the_microbatch_thread() -> None:
+    """The microbatches of a prefill step run on threads that share the layer. Each
+    sees the packed rows its own thread set and no other's, while both are inside
+    their block, and none is left behind when a thread leaves it (also by an
+    error)."""
+    rows = [torch.full((4, 8), i, dtype=torch.uint8) for i in range(2)]
+    both_inside = threading.Barrier(2, timeout=60)
+    seen: list[torch.Tensor | None] = [None, None]
+    failures: list[BaseException] = []
+
+    def microbatch(i: int) -> None:
+        try:
+            with packed_nvfp4_input(rows[i]):
+                both_inside.wait()
+                seen[i] = sm120_nvfp4_moe._PACKED_INPUT.get()
+                both_inside.wait()
+            assert sm120_nvfp4_moe._PACKED_INPUT.get() is None
+        except BaseException as e:
+            failures.append(e)
+            both_inside.abort()
+
+    threads = [threading.Thread(target=microbatch, args=(i,)) for i in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert not failures, failures
+    assert seen[0] is rows[0] and seen[1] is rows[1]
+    assert sm120_nvfp4_moe._PACKED_INPUT.get() is None
+    with pytest.raises(RuntimeError, match="experts failed"):
+        with packed_nvfp4_input(rows[0]):
+            raise RuntimeError("experts failed")
+    assert sm120_nvfp4_moe._PACKED_INPUT.get() is None
+
+
 @pytest.mark.parametrize("exact", [True, False], ids=["exact", "folded"])
 @pytest.mark.parametrize("up_gate", [True, False])
 @pytest.mark.parametrize("top_k", [4, 8])
@@ -2428,7 +2463,7 @@ def test_muse_c_quantization_is_bit_identical_to_the_stock_kernel(
     )
 
     def run(op, activations):
-        # Zero-filled, so that the padding no kernel writes compares equal too.
+        # Zero-filled: the padding no kernel writes stays zero on both sides.
         fp4 = torch.zeros(
             num_routes, intermediate // 2, dtype=torch.uint8, device="cuda"
         )
@@ -2651,8 +2686,10 @@ def test_muse_c_gather_packed_is_bit_identical_to_the_gather_quantization(
     """Quantizing the token rows before they are gathered, and only moving the
     packed rows into the permuted order afterwards, gives the bytes of the gather
     quantization of the unquantized rows when every expert has the one global scale:
-    the codes and the swizzled scale factors, padding included, with experts that
-    own no rows among them and the rows past the local routes left alone."""
+    the codes and the swizzled scale factors, with experts that own no rows among
+    them. Neither kernel writes the padding of the swizzled scale factors, nor the
+    rows past the local routes: the buffers start zero-filled (or filled with a
+    marker) and the test checks that those bytes are as they were."""
     muse_c.load()
     g = torch.Generator(device="cuda").manual_seed(num_tokens + hidden)
     routing = _rank_routing(num_tokens, num_local_experts, hidden, 1024, g)
@@ -2665,7 +2702,7 @@ def test_muse_c_gather_packed_is_bit_identical_to_the_gather_quantization(
     scale_rows = num_routes + 128 * num_local_experts
     sf_cols = hidden // 64
 
-    # Zero-filled, so that the padding no kernel writes compares equal too.
+    # Zero-filled: the padding no kernel writes stays zero on both sides.
     want_fp4 = torch.zeros(num_routes, hidden // 2, dtype=torch.uint8, device="cuda")
     want_sf = torch.zeros(scale_rows, sf_cols, dtype=torch.int32, device="cuda")
     torch.ops._muse_C.gather_scaled_fp4_experts_quant(
