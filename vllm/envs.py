@@ -1755,7 +1755,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the plan and of the map are the ones the preparation launch writes, so the output does
     # not change. Only where the routing already runs on the aux stream (CUDA graph
     # capture, ``_routes_on_aux_stream``). Default off. Read when a decode graph is
-    # captured, so it must not change between a capture and its replay.
+    # captured, so it must not change between a capture and its replay. It pays next to
+    # an external quantization only (a plan on the aux stream alone is 0 to 4 us per
+    # layer slower than the preparation launch), so it takes effect only where
+    # VLLM_MUSE_SPARK_SM120_FUSED_NORM_QUANT (or the communicator's quantizing gather)
+    # hands the kernel its quantized input: not at the sizes where the communicator's
+    # plain gather + norm kind serves (the host plugin up to 16 rows), and not without
+    # the flag.
     "VLLM_MUSE_SPARK_SM120_AUX_PLAN": lambda: bool(
         int(os.getenv("VLLM_MUSE_SPARK_SM120_AUX_PLAN", "0"))
     ),

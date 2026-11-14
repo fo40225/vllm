@@ -1327,7 +1327,15 @@ class MuseSpark1xMoE(nn.Module):
 
     def _fused_all_gather_rmsnorm_nvfp4(self, shard: torch.Tensor) -> torch.Tensor | None:
         """The pooler gather, the pre-expert norm and the NVFP4 quantization of its output
-        (for the muse large-batch kernel) as one communicator kernel."""
+        (for the muse large-batch kernel) as one communicator kernel.
+
+        The ``None`` returns that depend on this rank's muse engine
+        (``_quantizes_in_norm``, no scratch) do not split the TP group into two
+        collectives: the communicator's quantizing kind is the plain gather + norm kind
+        with one more epilogue output (same protocol, same dispatch rows), and a rank
+        that gets ``None`` here goes on to the plain kind
+        (``_fused_all_gather_rmsnorm``), whose other gates the two share.
+        """
         if not self._quantizes_in_norm(shard.shape[0]):
             return None
         norm = self.pre_expert_norm
@@ -1550,6 +1558,28 @@ class MuseSpark1xMoE(nn.Module):
             and cast(MuseMoERunner, self.experts).has_muse_decode_engine
         )
 
+    def _quantizes_before_experts(self, num_tokens: int) -> bool:
+        """Whether the large-batch kernel of a padded batch of this size gets its input
+        quantized by a launch in front of it (the communicator's gather + norm epilogue,
+        or the norm + quantization launch), so that it does not quantize it itself.
+
+        The same decision as ``_pool_and_norm`` makes, from the shapes and the
+        communicator's dispatch alone (rank-uniform); a performance gate only, never a
+        correctness one.
+        """
+        if not self._quantizes_in_norm(num_tokens):
+            return False
+        if not (self.shards_pooler(num_tokens) and self.fuses_boundary_collectives):
+            return True
+        # The plain gather + norm kind of the communicator comes first where it serves
+        # the size and the quantizing kind does not: the norm is hidden there and
+        # nothing quantizes.
+        return fused_boundary.supports_fused_boundary(
+            fused_boundary.KIND_ALL_GATHER_RMSNORM_NVFP4, num_tokens
+        ) or not fused_boundary.supports_fused_boundary(
+            fused_boundary.KIND_ALL_GATHER_RMSNORM, num_tokens
+        )
+
     def _builds_large_plan(self, num_tokens: int) -> bool:
         """Whether the routing on the aux stream also builds the plan of the muse
         large-batch kernel (``VLLM_MUSE_SPARK_SM120_AUX_PLAN``).
@@ -1558,6 +1588,10 @@ class MuseSpark1xMoE(nn.Module):
         ``VLLM_MUSE_SPARK_SM120_AUX_PLAN_MAX_TOKENS`` (at most ``MUSE_MAX_TOKENS``) tokens,
         where the routing runs on the aux stream and the layer's experts are on the muse
         decode kernel: that kernel builds the plan in its own preparation launch otherwise.
+        And only where the quantization of the kernel's input is made ahead of it
+        (``_quantizes_before_experts``): the plan on the aux stream alone is slower than
+        the preparation launch (+0 to +4 us per layer in the layer benchmark), it pays
+        next to an external quantization only.
         """
         return (
             envs.VLLM_MUSE_SPARK_SM120_AUX_PLAN
@@ -1567,6 +1601,7 @@ class MuseSpark1xMoE(nn.Module):
             <= min(MUSE_MAX_TOKENS, envs.VLLM_MUSE_SPARK_SM120_AUX_PLAN_MAX_TOKENS)
             and self._routes_on_aux_stream(num_tokens)
             and cast(MuseMoERunner, self.experts).has_muse_decode_engine
+            and self._quantizes_before_experts(num_tokens)
         )
 
     def _router_logits(self, router_input: torch.Tensor) -> torch.Tensor:

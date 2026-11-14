@@ -524,11 +524,15 @@ def capturing(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
 
 
-def _moe(aux=True, engine=True):
+def _moe(aux=True, engine=True, quantizes=True):
     moe = object.__new__(model_ops.MuseSpark1xMoE)
     torch.nn.Module.__init__(moe)
     moe.experts = SimpleNamespace(has_muse_decode_engine=engine)
     moe._routes_on_aux_stream = lambda n: aux
+    # The quantization is made in front of the kernel (see _quantizes_before_experts).
+    moe._quantizes_in_norm = lambda n: quantizes
+    moe.shards_pooler = lambda n: True
+    moe.fuses_boundary_collectives = False
     return moe
 
 
@@ -552,11 +556,70 @@ def test_the_plan_needs_the_flag_the_capture_the_aux_stream_and_the_engine(
     assert _moe()._builds_large_plan(64)
     assert not _moe(aux=False)._builds_large_plan(64)
     assert not _moe(engine=False)._builds_large_plan(64)
+    assert not _moe(quantizes=False)._builds_large_plan(64)  # the plan alone is a loss
     monkeypatch.setenv("VLLM_MUSE_SPARK_SM120_AUX_PLAN", "0")
     assert not _moe()._builds_large_plan(64)
     monkeypatch.setenv("VLLM_MUSE_SPARK_SM120_AUX_PLAN", "1")
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     assert not _moe()._builds_large_plan(64)
+
+
+def _dispatch(monkeypatch, plain=0, quant=0):
+    """The communicator's dispatch: the plain gather + norm kind up to ``plain`` rows,
+    the quantizing one up to ``quant`` rows (host plugin: 16 and 0 by default)."""
+    rows = {
+        fused_boundary.KIND_ALL_GATHER_RMSNORM: plain,
+        fused_boundary.KIND_ALL_GATHER_RMSNORM_NVFP4: quant,
+    }
+    monkeypatch.setattr(
+        model_ops.fused_boundary,
+        "supports_fused_boundary",
+        lambda kind, n: 1 <= n <= rows.get(kind, 0),
+    )
+
+
+@pytest.mark.parametrize("t", [9, 16, 17, 24, 25, 32, 64, MAX_LARGE_T])
+def test_the_quantization_is_ahead_of_the_kernel_unless_the_gather_hides_the_norm(
+    capturing, monkeypatch, t
+):
+    moe = _moe()
+    moe.fuses_boundary_collectives = True
+    # Host plugin defaults: the plain gather + norm up to 16 rows, no quantizing kind.
+    # The norm is hidden in the gather there, nothing quantizes ahead of the kernel.
+    _dispatch(monkeypatch, plain=16)
+    assert moe._quantizes_before_experts(t) is (t > 16)
+    # MUSE_TOPO_BND_RMS_MAX_ROWS=24 alone: the same up to 24 rows.
+    _dispatch(monkeypatch, plain=24)
+    assert moe._quantizes_before_experts(t) is (t > 24)
+    # MUSE_TOPO_BND_QUANT=1 as well: the gather's epilogue quantizes up to 24 rows, the
+    # norm + quantization launch behind it above.
+    _dispatch(monkeypatch, plain=24, quant=24)
+    assert moe._quantizes_before_experts(t)
+    # No communicator kinds at all (NCCL, or a model without the plugin).
+    _dispatch(monkeypatch)
+    assert moe._quantizes_before_experts(t)
+    moe.fuses_boundary_collectives = False
+    _dispatch(monkeypatch, plain=64)
+    assert moe._quantizes_before_experts(t)
+    moe.fuses_boundary_collectives = True
+    moe.shards_pooler = lambda n: False  # an unsharded pooler: no gather to fuse
+    assert moe._quantizes_before_experts(t)
+    moe.shards_pooler = lambda n: True
+    assert not _moe(quantizes=False)._quantizes_before_experts(t)
+
+
+@pytest.mark.parametrize("t", [9, 16, 24, 64])
+def test_the_aux_plan_follows_the_quantization_ahead_of_the_kernel(
+    capturing, monkeypatch, t
+):
+    monkeypatch.setenv("VLLM_MUSE_SPARK_SM120_AUX_PLAN", "1")
+    monkeypatch.delenv("VLLM_MUSE_SPARK_SM120_AUX_PLAN_MAX_TOKENS", raising=False)
+    moe = _moe()
+    moe.fuses_boundary_collectives = True
+    _dispatch(monkeypatch, plain=16)
+    assert moe._builds_large_plan(t) is (t > 16)  # c16 stays as it was
+    _dispatch(monkeypatch, plain=24, quant=24)
+    assert moe._builds_large_plan(t)
 
 
 def test_the_flag_is_off_by_default(monkeypatch):
@@ -761,6 +824,45 @@ def test_rmsnorm_quant_is_the_triton_norm_and_the_quantization_of_its_output(
                 q_ref, sf_ref = _stock_quant(ref, gscale)
                 assert torch.equal(data, q_ref), (t, kind, pdl)
                 assert torch.equal(sf, sf_ref), (t, kind, pdl)
+
+
+@pytest.mark.parametrize("t", [9, 33, MAX_LARGE_T])
+@torch.inference_mode()
+def test_rmsnorm_quant_on_non_finite_rows_is_the_triton_norm_and_act_quant(
+    layer: _Layer, t: int
+) -> None:
+    """Rows with an Inf or a NaN (a broken step, never a served one) take the same
+    arithmetic as in the Triton norm (same NaN positions, same bits elsewhere) and the
+    same quantization as the stock activation quantization of the output."""
+    g = torch.Generator(device="cuda").manual_seed(31)
+    w = (torch.randn(H, device="cuda", generator=g) * 0.3).to(torch.bfloat16)
+    for kind in ("inf", "nan", "mixed"):
+        x = _norm_inputs("normal", t, t + 5).clone()
+        if kind in ("inf", "mixed"):
+            x[1, 7] = float("inf")
+            x[t // 2, 100] = float("-inf")
+        if kind in ("nan", "mixed"):
+            x[2, 0] = float("nan")
+            x[t - 1, H - 1] = float("nan")
+        ref = fused_rmsnorm_fwd(
+            x, w, 1e-6, gain_center=1.0, input_scale=False, use_kahan_summation=True
+        )
+        out = torch.zeros_like(x)
+        data = torch.full((t, H // 2), 0xFF, dtype=torch.uint8, device="cuda")
+        sf = torch.full((t, H // 16), 0xFF, dtype=torch.uint8, device="cuda")
+        torch.ops._muse_C.rmsnorm_nvfp4_quant(
+            x, w, 1e-6, 1.0, layer.gs, out, data, sf, True
+        )
+        nan_ref, nan_out = torch.isnan(ref), torch.isnan(out)
+        assert torch.equal(nan_ref, nan_out), kind
+        assert torch.equal(
+            out.view(torch.int16)[~nan_ref], ref.view(torch.int16)[~nan_ref]
+        ), kind
+        q_data = torch.empty_like(data)
+        q_sf = torch.empty_like(sf)
+        torch.ops._muse_C.nvfp4_decode_act_quant(out, layer.gs, q_data, q_sf)
+        assert torch.equal(data, q_data), kind
+        assert torch.equal(sf, q_sf), kind
 
 
 @torch.inference_mode()
