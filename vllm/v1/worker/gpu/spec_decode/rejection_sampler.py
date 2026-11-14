@@ -208,6 +208,8 @@ class RejectionSampler:
         input_batch: InputBatch,
         draft_logits: torch.Tensor | None,
         has_sampled: bool,
+        use_min_p: bool = False,
+        use_top_p: bool = False,
     ) -> SamplerOutput:
         """`__call__` on the candidates of `topk` instead of the full logits.
 
@@ -218,11 +220,18 @@ class RejectionSampler:
         uniforms and Gumbel noise are keyed by seed, position and token id) for the
         others. A NaN logit is taken as absent (a candidate of no mass).
 
+        ``use_min_p`` and ``use_top_p`` (the plan: some request of the batch has min_p
+        or a top_p below 1) select the kernel that applies them; min_p is the threshold
+        of the full path, top_p the nucleus of its top-k + top-p kernel.
+
         Raises:
             ValueError: a request with temperature > 0 has a top_k above the candidates
                 per rank (``topk.k``): its target distribution would silently be
-                truncated to the candidates. Checked on the host copies of the request
-                state, which costs no device synchronisation.
+                truncated to the candidates; or it has a min_p or top_p that the call
+                does not apply; or a top_k of 1 / 200 of the vocabulary or more with
+                min_p (the emulation of the full path's top-k kernel). Checked on the
+                host copies of the request state, which costs no device
+                synchronisation.
 
         """
         states = self.sampler.sampling_states
@@ -233,6 +242,21 @@ class RejectionSampler:
                 raise ValueError(
                     f"A sampled request has a top_k above the {topk.k} candidates per "
                     "TP rank: the step has to take the full path."
+                )
+            if use_min_p and np.any(
+                200 * states.top_k.np[idx_np][random].astype(np.int64)
+                >= topk.tp_size * topk.shard_size
+            ):
+                # The min_p kernel emulates the outlier pivot of the full path's top-k
+                # kernel, whose sigma is the one for top_k / vocab * 200 < 1.
+                raise ValueError("A sampled request has a top_k too large for min_p.")
+            if not use_min_p and np.any(states.min_p.np[idx_np][random] != 0.0):
+                raise ValueError(
+                    "A sampled request has a min_p the call does not apply."
+                )
+            if not use_top_p and np.any(states.top_p.np[idx_np][random] != 1.0):
+                raise ValueError(
+                    "A sampled request has a top_p the call does not apply."
                 )
         draft_sampled, pos = gather_draft_sampled(
             input_batch.input_ids,
@@ -257,6 +281,8 @@ class RejectionSampler:
             draft_logits=draft_logits,
             has_sampled=has_sampled,
             use_fp64=self.sampler.use_fp64_gumbel,
+            min_p=states.min_p.gpu if use_min_p else None,
+            top_p=states.top_p.gpu if use_top_p else None,
         )
         num_sampled, num_rejected = get_num_sampled_and_rejected(
             num_sampled,

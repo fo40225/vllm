@@ -28,6 +28,7 @@ if not torch.cuda.is_available():
 
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.worker.gpu.sample.gumbel import apply_temperature
+from vllm.v1.worker.gpu.sample.min_p import apply_min_p
 from vllm.v1.worker.gpu.sample.topk_logits import TopKLogits, local_topk_candidates
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import rejection_sample
 from vllm.v1.worker.gpu.spec_decode.topk_rejection import topk_verify
@@ -110,6 +111,8 @@ class Batch:
         peaky: bool = True,
         share_drafts: bool = False,
         vocab: int = VOCAB,
+        min_p: list[float] | None = None,
+        top_p: list[float] | None = None,
     ):
         n = len(num_draft)
         self.num_reqs = n
@@ -145,6 +148,19 @@ class Batch:
             top_k, dtype=torch.int32, device=DEVICE
         )
         self.temperature, self.top_k = temp, tk
+        mp = torch.zeros(max_reqs, dtype=torch.float32, device=DEVICE)
+        tp = torch.ones(max_reqs, dtype=torch.float32, device=DEVICE)
+        if min_p is not None:
+            mp[self.idx_mapping.long()] = torch.tensor(
+                min_p, dtype=torch.float32, device=DEVICE
+            )
+        if top_p is not None:
+            tp[self.idx_mapping.long()] = torch.tensor(
+                top_p, dtype=torch.float32, device=DEVICE
+            )
+        self.min_p, self.top_p = mp, tp
+        self.use_min_p = min_p is not None and any(m != 0.0 for m in min_p)
+        self.use_top_p = top_p is not None and any(t != 1.0 for t in top_p)
         self.seeds = torch.randint(
             -(1 << 62), 1 << 62, (max_reqs,), generator=g, device=DEVICE
         )
@@ -214,9 +230,18 @@ class Batch:
         """The full path: `RejectionSampler._verify` on the gathered logits."""
         logits = soft_cap(self.logits).contiguous()
         apply_temperature(logits, self.expanded_idx_mapping, self.temperature)
+        if self.use_min_p:
+            apply_min_p(logits, self.expanded_idx_mapping, self.min_p)
+        # As `SamplingStates.get_top_k_top_p`: a tensor only when a request needs it.
         top_k_rows = self.top_k[self.expanded_idx_mapping.long()]
-        if bool((top_k_rows != self.vocab).any()):
-            logits = apply_top_k_top_p(logits, top_k_rows, None)
+        top_p_rows = self.top_p[self.expanded_idx_mapping.long()]
+        do_top_k = bool((top_k_rows != self.vocab).any())
+        if do_top_k or self.use_top_p:
+            logits = apply_top_k_top_p(
+                logits,
+                top_k_rows if do_top_k else None,
+                top_p_rows if self.use_top_p else None,
+            )
         return rejection_sample(
             logits,
             self.draft_logits,
@@ -251,6 +276,8 @@ class Batch:
             draft_logits=self.draft_logits,
             has_sampled=self.has_sampled,
             use_fp64=use_fp64,
+            min_p=self.min_p if self.use_min_p else None,
+            top_p=self.top_p if self.use_top_p else None,
         )
 
 

@@ -52,6 +52,7 @@ from vllm.v1.worker.gpu.sample.topk_logits import (
     _INT32_MAX,
     MAX_CANDIDATES,
     TopKLogits,
+    _kth_largest_key,
     _load_candidates,
     _select_top,
 )
@@ -126,6 +127,131 @@ def _draft_stats_kernel(
 
 
 @triton.jit
+def _nucleus_keep(value, key, keep, in_range, top_p):
+    """The tokens that top-p keeps of the ``keep`` set, as the top-k + top-p kernel of
+    the full path (``_topk_topp_kernel``, Qrita) keeps them.
+
+    The probabilities are ``exp(value - max) / sum`` with the sum over the ``keep`` set
+    (the kernel's own expressions). Its pivot search then runs over the logits of its
+    outlier buffer, which also holds the tokens tied with the lowest kept one beyond the
+    top-k set: those count in the mass above a pivot and in the tie group of the
+    boundary, but not in the sum. Tokens are ranked by the order key (ties together,
+    the lowest ids first): the nucleus is every token of the keys above the *boundary
+    key* ``t`` (the largest key whose mass at or above it reaches ``top_p``), and of the
+    group tied at ``t`` the ones that the kernel's duplicate rule leaves. That rule
+    keeps ``num_keep = n - trunc((mass_incl - top_p) / q)`` members (the lowest ids)
+    when the logit of the group equals ``log(q * sum) + max`` to within 1e-9, i.e. when
+    the kernel's own ``exp`` / ``log`` round trip returns the logit; otherwise the
+    kernel keeps *every* token of the group.
+    """
+    kth_key = tl.min(tl.where(keep, key, 65536), axis=0)
+    bucket = keep | (in_range & (key == kth_key))
+    peak = tl.max(tl.where(keep, value, float("-inf")), axis=0)
+    safe_peak = tl.where(peak > float("-inf"), peak, 0.0)
+    weight = tl.where(bucket, tl.exp(value - safe_peak), 0.0)
+    total = tl.sum(tl.where(keep, weight, 0.0), axis=0)
+    prob = weight / total
+    lo = 0
+    hi = 65536
+    for _ in tl.static_range(16):
+        mid = (lo + hi) >> 1
+        mass = tl.sum(tl.where(bucket & (key >= mid), prob, 0.0), axis=0)
+        enough = mass >= top_p
+        lo = tl.where(enough, mid, lo)
+        hi = tl.where(enough, hi, mid)
+    group = bucket & (key == lo)
+    group_size = tl.sum(group.to(tl.int32), axis=0)
+    group_prob = tl.max(tl.where(group, prob, 0.0), axis=0)
+    mass_incl = tl.sum(tl.where(bucket & (key >= lo), prob, 0.0), axis=0)
+    group_logit = tl.max(tl.where(group, value, float("-inf")), axis=0)
+    excess = tl.cast(
+        tl.minimum(
+            tl.maximum((mass_incl - top_p) / tl.maximum(group_prob, 1e-37), 0.0), 1e9
+        ),
+        tl.int32,
+    )
+    # num_keep is an unsigned difference in the kernel: an excess above the group size
+    # wraps around and leaves the group alone.
+    num_keep = group_size - excess
+    partial = (group_size > 0) & (num_keep >= 0) & (num_keep < group_size)
+    roundtrip = tl.log(group_prob * total) + safe_peak
+    trim = partial & (tl.abs(group_logit - roundtrip) < 1e-9)
+    rank = tl.cumsum(group.to(tl.int32), axis=0)
+    kept_group = tl.where(trim, group & (rank <= num_keep), group)
+    return (bucket & (key > lo)) | kept_group
+
+
+# The outlier pivot of the top-k kernel of the full path, avg + std * sigma, with the
+# sigma of its percentile table for top_k / vocab * 200 < 1 (index 0: 2.576), scaled by
+# 1 - 0.15 as the kernel does.
+_QRITA_SIGMA = tl.constexpr(2.576)
+# Columns of the block whose statistics the kernel takes the pivot from.
+_QRITA_STATS_COLUMNS = tl.constexpr(8192)
+
+
+@triton.jit
+def _qrita_lowest_group(
+    key,
+    value,
+    token_id,
+    j,
+    in_range,
+    survivor,
+    keep,
+    threshold,
+    top_k,
+    TP: tl.constexpr,
+    K: tl.constexpr,
+):
+    """What the top-k kernel of the full path (Qrita) keeps when min_p leaves more than
+    top_k tokens and the *lowest* of the surviving logits is tied across the top_k-th
+    place.
+
+    The kernel searches for its pivot between its outlier pivot (the mean of the finite
+    logits of the first 8192 columns plus 2.19 times their standard deviation) when more
+    than top_k logits lie above it, and between the lowest and the highest finite logit
+    otherwise. In the second case its pivots lie strictly above the lowest logit, so
+    there is no pivot below a tied lowest group: it gives up after its 18 iterations and
+    keeps only the tokens above the group (fewer than top_k of them). Everything else is
+    the exact top-k: ``keep`` as given.
+
+    A rank whose list holds no logit below the threshold may have survivors that it did
+    not list (a wide tie at the k-th place inside one shard): the lowest group is then
+    unknown and the exact top-k stands, which the full path may not reproduce. The
+    sigma of the outlier pivot is the one of its percentile table for
+    top_k / vocab * 200 < 1 (``RejectionSampler.verify_topk`` checks it).
+    """
+    count = tl.sum(survivor.to(tl.int32), axis=0)
+    survivor_key = tl.where(survivor, key, -1)
+    kth = _kth_largest_key(survivor_key, top_k)
+    lowest = tl.min(tl.where(survivor, key, 65536), axis=0)
+    first_block = survivor & (token_id < _QRITA_STATS_COLUMNS)
+    num_first = tl.sum(first_block.to(tl.int32), axis=0)
+    first_value = tl.where(first_block, value, 0.0)
+    avg = tl.where(num_first > 0, tl.sum(first_value, axis=0) / num_first, 0.0)
+    sq_avg = tl.where(
+        num_first > 0, tl.sum(first_value * first_value, axis=0) / num_first, 0.0
+    )
+    std = tl.sqrt(tl.maximum(sq_avg - avg * avg, 0.0))
+    sigma = tl.full((), _QRITA_SIGMA, tl.float32)
+    outlier_pivot = avg + std * (sigma + tl.abs(sigma) * -0.15)
+    num_outliers = tl.sum((survivor & (value > outlier_pivot)).to(tl.int32), axis=0)
+    ranks_with_a_logit_below = 0
+    for r in tl.static_range(TP):
+        below = in_range & (j // K == r) & (value < threshold)
+        ranks_with_a_logit_below += (tl.sum(below.to(tl.int32), axis=0) > 0).to(
+            tl.int32
+        )
+    gives_up = (
+        (count > top_k)
+        & (num_outliers <= top_k)
+        & (kth == lowest)
+        & (ranks_with_a_logit_below == TP)
+    )
+    return tl.where(gives_up, survivor & (key > kth), keep)
+
+
+@triton.jit
 def _target_row(
     words_ptr,
     capped_ptr,
@@ -135,20 +261,42 @@ def _target_row(
     shard_size,
     temp,
     top_k,
+    min_p,
+    top_p,
     TP: tl.constexpr,
     K: tl.constexpr,
     ROW_WORDS: tl.constexpr,
+    HAS_MIN_P: tl.constexpr,
+    HAS_TOP_P: tl.constexpr,
 ):
     """The target distribution of ``row`` on its candidates: the value of each
     candidate divided by the temperature (as ``apply_temperature``: not at all for 1.0),
-    its token id, and whether the top-k mask keeps it (exactly top_k candidates, the
-    lowest token ids among the ones tied with the top_k-th)."""
+    its token id, and whether the sampling parameters keep it, in the order of the full
+    path: min_p (a threshold on the scaled logits relative to the row maximum), the
+    top-k mask (exactly top_k candidates, the lowest token ids among the ones tied with
+    the top_k-th) and top-p over the top-k set."""
     value, token_id, in_range, key = _load_candidates(
         words_ptr, capped_ptr, j, row, num_rows, shard_size, TP, K, ROW_WORDS
     )
     value = tl.where(temp != 1.0, value / temp, value)
     keep, _ = _select_top(key, top_k)
-    return value, token_id, keep & in_range
+    keep = keep & in_range
+    if HAS_MIN_P:
+        # ``_min_p_kernel``: drops ``logits < max + log(min_p)``, tokens at the
+        # threshold stay. The row maximum is the best candidate (every rank lists its
+        # largest).
+        row_max = tl.max(tl.where(in_range, value, float("-inf")), axis=0)
+        threshold = row_max + tl.log(min_p)
+        survivor = in_range & ((min_p == 0.0) | (value >= threshold))
+        keep = keep & survivor
+        keep = _qrita_lowest_group(
+            key, value, token_id, j, in_range, survivor, keep, threshold, top_k, TP, K
+        )
+    # The outer test is a compile-time constant: Triton cannot fuse it with the other.
+    if HAS_TOP_P:  # noqa: SIM102
+        if top_p < 1.0:
+            keep = _nucleus_keep(value, key, keep, in_range, top_p)
+    return value, token_id, keep
 
 
 @triton.jit
@@ -190,6 +338,8 @@ def _topk_verify_kernel(
     # [max_num_reqs]
     temp_ptr,
     top_k_ptr,
+    min_p_ptr,
+    top_p_ptr,
     seed_ptr,
     # [max_num_reqs, num_speculative_steps, V]
     draft_logits_ptr,
@@ -210,6 +360,8 @@ def _topk_verify_kernel(
     NUM_CANDIDATES: tl.constexpr,
     USE_FP64: tl.constexpr,
     HAS_SAMPLED: tl.constexpr,
+    HAS_MIN_P: tl.constexpr,
+    HAS_TOP_P: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
     req_state_idx = tl.load(idx_mapping_ptr + req_idx).to(tl.int64)
@@ -262,6 +414,12 @@ def _topk_verify_kernel(
     elif HAS_SAMPLED:
         seed = tl.load(seed_ptr + req_state_idx)
         top_k = tl.minimum(tl.load(top_k_ptr + req_state_idx), TP * K)
+        min_p = 0.0
+        if HAS_MIN_P:
+            min_p = tl.load(min_p_ptr + req_state_idx).to(tl.float32)
+        top_p = 1.0
+        if HAS_TOP_P:
+            top_p = tl.load(top_p_ptr + req_state_idx).to(tl.float32)
         draft_row_ptr = draft_logits_ptr + req_state_idx * draft_logits_stride_0
 
         # Block verification (Sun et al., 2024) with draft logits, as
@@ -287,9 +445,13 @@ def _topk_verify_kernel(
                     shard_size,
                     temp,
                     top_k,
+                    min_p,
+                    top_p,
                     TP,
                     K,
                     ROW_WORDS,
+                    HAS_MIN_P,
+                    HAS_TOP_P,
                 )
                 target_lse = _masked_logsumexp(value, keep)
                 # The target logit of the draft token (-inf if the top-k mask drops it).
@@ -336,9 +498,13 @@ def _topk_verify_kernel(
                         shard_size,
                         temp,
                         top_k,
+                        min_p,
+                        top_p,
                         TP,
                         K,
                         ROW_WORDS,
+                        HAS_MIN_P,
+                        HAS_TOP_P,
                     )
                     next_target_lse = _masked_logsumexp(next_value, next_keep)
                     next_draft_lse = _compute_global_logsumexp(
@@ -394,9 +560,13 @@ def _topk_verify_kernel(
             shard_size,
             temp,
             top_k,
+            min_p,
+            top_p,
             TP,
             K,
             ROW_WORDS,
+            HAS_MIN_P,
+            HAS_TOP_P,
         )
         if is_bonus or rejected_draft_token < 0:
             # No rejection (or a placeholder): the target distribution.
@@ -471,6 +641,8 @@ def topk_verify(
     draft_logits: torch.Tensor | None = None,
     has_sampled: bool = True,
     use_fp64: bool = False,
+    min_p: torch.Tensor | None = None,
+    top_p: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Verify the draft tokens of a batch against the candidates of ``topk``.
 
@@ -498,6 +670,10 @@ def topk_verify(
         has_sampled: whether any request of the batch has temperature > 0. Host state:
             all-greedy batches skip the draft statistics and the sampled branch.
         use_fp64: the precision of the Gumbel noise (as ``rejection_sample``).
+        min_p: per request state, fp32; None when no request of the batch uses it (host
+            state: the kernel is then the one without the threshold).
+        top_p: per request state, fp32; None when no request of the batch has a top_p
+            below 1.
 
     Returns:
         ``sampled`` ``[num_reqs, num_speculative_steps + 1]`` int64 and ``num_sampled``
@@ -563,6 +739,8 @@ def topk_verify(
         idx_mapping,
         temperature,
         top_k,
+        top_k if min_p is None else min_p,
+        top_k if top_p is None else top_p,
         seed,
         draft_logits,
         *draft_strides,
@@ -580,6 +758,8 @@ def topk_verify(
         NUM_CANDIDATES=num_candidates,
         USE_FP64=use_fp64,
         HAS_SAMPLED=has_sampled,
+        HAS_MIN_P=min_p is not None,
+        HAS_TOP_P=top_p is not None,
         num_warps=min(VERIFY_NUM_WARPS, max(1, num_candidates // 128)),
     )
     return sampled, num_sampled
