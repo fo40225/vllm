@@ -1325,6 +1325,40 @@ class MuseSpark1xMoE(nn.Module):
             shard, norm.weight, norm.variance_epsilon, norm.fused_gain_center
         )
 
+    def _fused_all_gather_rmsnorm_nvfp4(self, shard: torch.Tensor) -> torch.Tensor | None:
+        """The pooler gather, the pre-expert norm and the NVFP4 quantization of its output
+        (for the muse large-batch kernel) as one communicator kernel."""
+        if not self._quantizes_in_norm(shard.shape[0]):
+            return None
+        norm = self.pre_expert_norm
+        if not (
+            self.fuses_boundary_collectives
+            and norm is not None
+            and shard.dtype == torch.bfloat16
+            and shard.is_contiguous()
+            and fused_boundary.supports_fused_boundary(
+                fused_boundary.KIND_ALL_GATHER_RMSNORM_NVFP4, shard.shape[0]
+            )
+        ):
+            return None
+        runner = cast(MuseMoERunner, self.experts)
+        scratch = runner.quant_decode_scratch(shard.shape[0])
+        if scratch is None:
+            return None
+        codes, scales, global_scale = scratch
+        out = fused_boundary.all_gather_rmsnorm_nvfp4(
+            shard,
+            norm.weight,
+            norm.variance_epsilon,
+            norm.fused_gain_center,
+            global_scale,
+            codes,
+            scales,
+        )
+        if out is not None:
+            runner.mark_quantized_decode_input(out)
+        return out
+
     def _fused_gemv_all_gather_rmsnorm(
         self, hidden_states: torch.Tensor
     ) -> torch.Tensor | None:
@@ -1395,7 +1429,10 @@ class MuseSpark1xMoE(nn.Module):
             shard = self._project_local_columns(self.pooler, hidden_states)
             # Where the communicator fuses the gather with the norm (up to 16 rows on the
             # host plugin) the norm costs nothing in the step: that stays as it was, and the
-            # quantizing launch below serves the sizes it does not.
+            # quantizing launch below serves the sizes it does not. A communicator that
+            # also quantizes in that epilogue saves the quantization of the kernel as well.
+            if (fused := self._fused_all_gather_rmsnorm_nvfp4(shard)) is not None:
+                return fused
             if (fused := self._fused_all_gather_rmsnorm(shard)) is not None:
                 return fused
             hidden_states = gather_columns(shard)

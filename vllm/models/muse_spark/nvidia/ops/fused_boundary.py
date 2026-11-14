@@ -22,7 +22,8 @@ Interface (all optional; the model calls a method only after
 result by running the two steps itself)::
 
     supports_fused_residual_boundary(kind, num_tokens) -> bool
-        kind: "all_reduce_boundary" | "all_gather_boundary" | "all_gather_rmsnorm".
+        kind: "all_reduce_boundary" | "all_gather_boundary" | "all_gather_rmsnorm" |
+        "all_gather_rmsnorm_nvfp4".
         Depends on the batch size only, identically on every rank of the group.
     all_reduce_residual_boundary(branch, stream, *, alpha, beta, pre_weight,
             post_weight, post_eps, pre_eps, post_gain_center, pre_gain_center,
@@ -36,6 +37,14 @@ result by running the two steps itself)::
         concatenation of the shards.
     all_gather_rmsnorm(shard, weight, eps, gain_center) -> Tensor | None
         ``fused_rmsnorm_fwd(all_gather(shard, -1), weight, eps, gain_center=...)``.
+    all_gather_rmsnorm_nvfp4(shard, weight, eps, gain_center, global_scale, codes, scales)
+            -> Tensor | None
+        ``all_gather_rmsnorm`` that also fills ``codes`` (uint8 [T, 2048]) and ``scales``
+        (uint8 [T, 256]) with the NVFP4 quantization of the rows it returns that the muse
+        large-batch decode kernel makes of its input (``_muse_C::nvfp4_decode_act_quant``
+        with ``global_scale[0]``: 16-element blocks, e4m3 linear scales, e2m1 codes), so
+        that the kernel can skip its own quantization. Kind ``"all_gather_rmsnorm_nvfp4"``
+        of ``supports_fused_residual_boundary``.
 
 The two all-gathers follow a GEMV: the sharded pooler / unpooler of the MoE layer
 computes this rank's columns of ``x @ W.T`` (``W`` = the rank's rows of the replicated
@@ -72,6 +81,7 @@ from vllm.distributed import get_tp_group
 KIND_ALL_REDUCE_BOUNDARY = "all_reduce_boundary"
 KIND_ALL_GATHER_BOUNDARY = "all_gather_boundary"
 KIND_ALL_GATHER_RMSNORM = "all_gather_rmsnorm"
+KIND_ALL_GATHER_RMSNORM_NVFP4 = "all_gather_rmsnorm_nvfp4"
 KIND_GEMV_ALL_GATHER_BOUNDARY = "gemv_all_gather_boundary"
 KIND_GEMV_ALL_GATHER_RMSNORM = "gemv_all_gather_rmsnorm"
 
@@ -118,6 +128,23 @@ def all_gather_rmsnorm(
     if communicator is None:
         return None
     return communicator.all_gather_rmsnorm(shard, weight, eps, gain_center)
+
+
+def all_gather_rmsnorm_nvfp4(
+    shard: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    gain_center: float,
+    global_scale: torch.Tensor,
+    codes: torch.Tensor,
+    scales: torch.Tensor,
+) -> torch.Tensor | None:
+    communicator = _communicator()
+    if communicator is None or not hasattr(communicator, "all_gather_rmsnorm_nvfp4"):
+        return None
+    return communicator.all_gather_rmsnorm_nvfp4(
+        shard, weight, eps, gain_center, global_scale, codes, scales
+    )
 
 
 def gemv_all_gather_rmsnorm(

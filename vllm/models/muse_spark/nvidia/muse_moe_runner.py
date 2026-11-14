@@ -1131,6 +1131,21 @@ class MuseMoERunner(MoERunner):
         if experts is not None:
             experts.discard_prepared_plan()
 
+    def quant_decode_scratch(
+        self, num_tokens: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """The scratch a producer of the pre-expert norm's output fills with its NVFP4
+        quantization (``MuseSparkSm120NvFp4Experts.quant_scratch``), or None."""
+        experts = self._sm120_native_experts()
+        return None if experts is None else experts.quant_scratch(num_tokens)
+
+    def mark_quantized_decode_input(self, x: torch.Tensor) -> None:
+        """Say that the scratch of ``quant_decode_scratch`` holds the quantization of the
+        rows ``x``, which the experts are about to run on."""
+        experts = self._sm120_native_experts()
+        assert experts is not None
+        experts.mark_quantized_input(x)
+
     def norm_quant_decode_input(
         self,
         x: torch.Tensor,

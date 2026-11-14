@@ -45,7 +45,7 @@ from vllm.models.muse_spark.nvidia import sm120_nvfp4_moe
 from vllm.models.muse_spark.nvidia.muse_moe_runner import (
     MuseSparkModelOptNvFp4FusedMoE,
 )
-from vllm.models.muse_spark.nvidia.ops import muse_c, muse_decode_moe
+from vllm.models.muse_spark.nvidia.ops import fused_boundary, muse_c, muse_decode_moe
 from vllm.models.muse_spark.nvidia.ops.muse_decode_moe import (
     MUSE_SMALL_MAX_TOKENS,
     MuseDecodeMoE,
@@ -913,6 +913,7 @@ def test_pool_and_norm_keeps_the_fused_gather_and_takes_the_norm_quant_launch_af
     moe.shards_pooler = lambda n: True
     moe._fused_gemv_all_gather_rmsnorm = lambda x: None
     moe._project_local_columns = lambda layer, x: x[:, :512].contiguous()
+    moe._fused_all_gather_rmsnorm_nvfp4 = lambda shard: None  # (no quantizing gather)
     fuses = [True]
     moe._fused_all_gather_rmsnorm = lambda shard: (
         calls.append("fused_gather") or shard if fuses[0] else None
@@ -967,3 +968,160 @@ def test_the_experts_quantize_in_the_norm_in_a_capture_for_the_large_batch_only(
     assert call(64, x=transposed) is None
     experts.use_muse_decode = False
     assert call(64) is None
+
+
+# ------------------------------------------------------------------------------
+# The communicator's gather + norm that also quantizes (the host plugin's
+# all_gather_rmsnorm_nvfp4): the optional interface, and the model's use of it
+# ------------------------------------------------------------------------------
+def test_the_nvfp4_gather_norm_is_an_optional_communicator_method(monkeypatch):
+    shard = torch.zeros(16, 512, dtype=torch.bfloat16, device=DEVICE)
+    w = torch.ones(H, dtype=torch.bfloat16, device=DEVICE)
+    gs = torch.ones(2, device=DEVICE)
+    codes = torch.empty(16, H // 2, dtype=torch.uint8, device=DEVICE)
+    scales = torch.empty(16, H // 16, dtype=torch.uint8, device=DEVICE)
+    args = (shard, w, 1e-6, 1.0, gs, codes, scales)
+    monkeypatch.setattr(fused_boundary, "_communicator", lambda: None)
+    assert fused_boundary.all_gather_rmsnorm_nvfp4(*args) is None
+    monkeypatch.setattr(fused_boundary, "_communicator", lambda: SimpleNamespace())
+    assert fused_boundary.all_gather_rmsnorm_nvfp4(*args) is None
+    seen = []
+
+    def method(*a):
+        seen.append(a)
+        return "rows"
+
+    communicator = SimpleNamespace(all_gather_rmsnorm_nvfp4=method)
+    monkeypatch.setattr(fused_boundary, "_communicator", lambda: communicator)
+    assert fused_boundary.all_gather_rmsnorm_nvfp4(*args) == "rows"
+    assert seen == [args]
+    assert fused_boundary.KIND_ALL_GATHER_RMSNORM_NVFP4 == "all_gather_rmsnorm_nvfp4"
+
+
+class _QuantRunner:
+    def __init__(self, scratch=True):
+        self.scratch = scratch
+        self.marked = []
+        self.codes = torch.empty(16, H // 2, dtype=torch.uint8, device=DEVICE)
+        self.sf = torch.empty(16, H // 16, dtype=torch.uint8, device=DEVICE)
+        self.gs = torch.ones(2, device=DEVICE)
+
+    def quant_decode_scratch(self, n):
+        return (self.codes, self.sf, self.gs) if self.scratch else None
+
+    def mark_quantized_decode_input(self, x):
+        self.marked.append(x)
+
+
+def _gather_moe(runner, quantizes=True):
+    moe = object.__new__(model_ops.MuseSpark1xMoE)
+    torch.nn.Module.__init__(moe)
+    moe.experts = runner
+    moe.fuses_boundary_collectives = True
+    moe.pre_expert_norm = SimpleNamespace(
+        weight=torch.ones(H, dtype=torch.bfloat16, device=DEVICE),
+        variance_epsilon=1e-6,
+        fused_gain_center=1.0,
+    )
+    moe._quantizes_in_norm = lambda n: quantizes
+    return moe
+
+
+def test_the_model_asks_the_communicator_for_the_quantizing_gather_norm(monkeypatch):
+    shard = torch.zeros(16, 512, dtype=torch.bfloat16, device=DEVICE)
+    calls = []
+    supported = [True]
+    monkeypatch.setattr(
+        fused_boundary,
+        "supports_fused_boundary",
+        lambda kind, n: calls.append(("supports", kind, n)) or supported[0],
+    )
+    result = [torch.ones(16, H, dtype=torch.bfloat16, device=DEVICE)]
+
+    def gather(*args):
+        calls.append(("gather", args[4].shape, args[5].shape, args[6].shape))
+        return result[0]
+
+    monkeypatch.setattr(fused_boundary, "all_gather_rmsnorm_nvfp4", gather)
+    runner = _QuantRunner()
+    moe = _gather_moe(runner)
+    out = moe._fused_all_gather_rmsnorm_nvfp4(shard)
+    assert out is result[0] and runner.marked == [out]
+    assert calls[0] == ("supports", "all_gather_rmsnorm_nvfp4", 16)
+    assert calls[1][0] == "gather"
+    # Each way to decline leaves nothing marked and launches nothing.
+    for name, moe_, kw in (
+        ("not quantizing", _gather_moe(_QuantRunner(), quantizes=False), {}),
+        ("no scratch", _gather_moe(_QuantRunner(scratch=False)), {}),
+    ):
+        calls.clear()
+        assert moe_._fused_all_gather_rmsnorm_nvfp4(shard) is None, name
+        assert not any(c[0] == "gather" for c in calls), name
+    supported[0] = False
+    calls.clear()
+    runner = _QuantRunner()
+    assert _gather_moe(runner)._fused_all_gather_rmsnorm_nvfp4(shard) is None
+    assert not any(c[0] == "gather" for c in calls)
+    supported[0] = True
+    result[0] = None  # the communicator declines: nothing to mark
+    assert _gather_moe(runner)._fused_all_gather_rmsnorm_nvfp4(shard) is None
+    assert runner.marked == []
+    moe = _gather_moe(_QuantRunner())
+    moe.fuses_boundary_collectives = False
+    assert moe._fused_all_gather_rmsnorm_nvfp4(shard) is None
+    bad = shard.float()
+    assert _gather_moe(_QuantRunner())._fused_all_gather_rmsnorm_nvfp4(bad) is None
+
+
+def test_pool_and_norm_prefers_the_quantizing_gather_norm(capturing, monkeypatch):
+    calls = []
+    moe = object.__new__(model_ops.MuseSpark1xMoE)
+    torch.nn.Module.__init__(moe)
+    moe.pooler = object()
+    moe.shards_pooler = lambda n: True
+    moe._fused_gemv_all_gather_rmsnorm = lambda x: None
+    moe._project_local_columns = lambda layer, x: x[:, :512].contiguous()
+    quantizing = [True]
+    moe._fused_all_gather_rmsnorm_nvfp4 = lambda shard: (
+        calls.append("nvfp4_gather") or shard if quantizing[0] else None
+    )
+    moe._fused_all_gather_rmsnorm = lambda shard: calls.append("fused_gather") or shard
+    x = torch.zeros(16, 8192, dtype=torch.bfloat16, device=DEVICE)
+    moe._pool_and_norm(x)
+    assert calls == ["nvfp4_gather"]
+    calls.clear()
+    quantizing[0] = False
+    moe._pool_and_norm(x)
+    assert calls == ["fused_gather"]
+
+
+def test_the_experts_hand_out_the_quantization_scratch_in_a_capture_only(monkeypatch):
+    marked = []
+    experts = object.__new__(MuseSparkSm120NvFp4Experts)
+    experts.use_muse_decode = True
+    gs = torch.ones(2, device=DEVICE)
+    experts.muse = SimpleNamespace(
+        max_tokens=MAX_LARGE_T,
+        input_scratch=lambda n: (
+            torch.empty(n, H // 2, dtype=torch.uint8, device=DEVICE),
+            torch.empty(n, H // 16, dtype=torch.uint8, device=DEVICE),
+        ),
+        input_scale=gs,
+        mark_input_quantized=lambda x: marked.append(x),
+    )
+
+    def scratch(n, capturing_now=True):
+        monkeypatch.setattr(sm120_nvfp4_moe, "_capturing", lambda: capturing_now)
+        return experts.quant_scratch(n)
+
+    got = scratch(24)
+    assert got is not None and got[0].shape == (24, H // 2) and got[2] is gs
+    assert got[1].shape == (24, H // 16)
+    for n in (1, 8, MAX_LARGE_T + 1):
+        assert scratch(n) is None
+    assert scratch(24, capturing_now=False) is None
+    x = torch.zeros(24, H, dtype=torch.bfloat16, device=DEVICE)
+    experts.mark_quantized_input(x)
+    assert marked == [x]
+    experts.use_muse_decode = False
+    assert scratch(24) is None

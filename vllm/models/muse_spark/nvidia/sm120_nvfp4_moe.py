@@ -887,6 +887,24 @@ class MuseSparkSm120NvFp4Experts(mk.FusedMoEExpertsModular):
             self.muse.discard_plan()
             self.muse.discard_input()
 
+    def quant_scratch(
+        self, num_tokens: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """``(codes [T, 2048], scales [T, 256], gs)``: where a producer of the pre-expert
+        norm's output (the TP communicator's gather + norm) writes the quantization the
+        large-batch muse kernel makes of it (``gs[0]`` is the global scale); None where the
+        kernel would not take it (see ``prepare_normed_input``).
+        ``mark_quantized_input`` then says which rows they belong to."""
+        if not (self.use_muse_decode and self.muse is not None and _capturing()):
+            return None
+        if not MUSE_SMALL_MAX_TOKENS < num_tokens <= self.muse.max_tokens:
+            return None
+        return (*self.muse.input_scratch(num_tokens), self.muse.input_scale)
+
+    def mark_quantized_input(self, x: torch.Tensor) -> None:
+        assert self.muse is not None
+        self.muse.mark_input_quantized(x)
+
     def prepare_normed_input(
         self,
         x: torch.Tensor,
