@@ -170,6 +170,7 @@ if TYPE_CHECKING:
     VLLM_MUSE_SPARK_SM120_TOPK_LOGITS_MIN_TOKENS: int = 2
     VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT: bool = True
     VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT_TABLE: str | None = None
+    VLLM_MUSE_SPARK_SM120_DENSE_Q: bool = False
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
     VLLM_ROCM_USE_AITER_LINEAR_HIPBMM: bool = False
     VLLM_ROCM_USE_AITER_MOE: bool = True
@@ -1721,6 +1722,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # whatever it is named; a snapshot that cannot be read from the model is trusted.
     "VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT_TABLE": lambda: (
         os.getenv("VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT_TABLE") or None
+    ),
+    # Muse Spark on SM120: the fused QK-norm / RoPE / KV-insert kernel writes Q into a
+    # dense [tokens, heads * head_dim] buffer instead of in place into the QKV
+    # projection output, where it is a strided view (the row also holds K, V and the
+    # output gate). FlashInfer's XQA decode takes a dense bf16 Q (the SM12x XQA runs on
+    # bf16 Q with an fp8 KV cache) and copies the view first (aten direct_copy, 3.4 us
+    # per layer at 64 rows, 62 layers: 0.21 ms of a c64 decode step; a single row is
+    # dense already, hence no copy at batch 1). The values are the ones of the in-place
+    # store, bit for bit, so the output does not change. Needs the _muse_C fused op
+    # (the stock torch.ops._C op has no dense Q output; the layer keeps the in-place
+    # store there) and the FlashInfer attention backend. Default off. Read once, when
+    # the model is constructed.
+    "VLLM_MUSE_SPARK_SM120_DENSE_Q": lambda: bool(
+        int(os.getenv("VLLM_MUSE_SPARK_SM120_DENSE_Q", "0"))
     ),
     # use aiter linear op if aiter ops are enabled
     # The following list of related ops

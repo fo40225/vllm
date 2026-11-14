@@ -7,6 +7,8 @@ stock ``torch.ops._C`` ops (when the build has them) and the JIT-built
 ``torch.ops._muse_C`` ops (SM12x with nvcc and ninja, or a finished build).
 """
 
+import types
+
 import pytest
 import torch
 
@@ -22,6 +24,10 @@ pytestmark = pytest.mark.skipif(
     not current_platform.is_cuda_alike() or not torch.cuda.is_available(),
     reason="Muse Spark kernels require a CUDA or ROCm GPU",
 )
+
+
+def cdiv(a, b):
+    return (a + b - 1) // b
 
 
 def _load_namespace(namespace):
@@ -69,7 +75,14 @@ def fused_insert(namespace):
         v_scale=None,
         q_fp8_out=None,
         q_scale=None,
+        q_out=None,
     ):
+        extra = ()
+        if q_out is not None:
+            # Only the _muse_C op has the dense Q output.
+            if not any(a.name == "q_out" for a in op.default._schema.arguments):
+                pytest.skip("this op has no q_out")
+            extra = (q_out,)
         op(
             qkv,
             positions,
@@ -87,6 +100,7 @@ def fused_insert(namespace):
             v_scale,
             q_fp8_out,
             q_scale,
+            *extra,
         )
 
     return call
@@ -590,6 +604,231 @@ def test_fused_query_quant_matches_separate_quant(
     torch.testing.assert_close(cache, expected_cache, rtol=0, atol=0)
     torch.testing.assert_close(qkv[:, :qsz], original[:, :qsz], rtol=0, atol=0)
     torch.testing.assert_close(qkv[:, qsz:], reference[:, qsz:], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "num_tokens,nq,nkv,head_dim,rotary_dim,kv_cache_dtype",
+    [
+        pytest.param(1, 16, 2, 64, 64, "fp8", id="tp8-1"),
+        pytest.param(7, 16, 2, 64, 64, "fp8", id="tp8-7"),
+        pytest.param(9, 16, 2, 64, 64, "fp8", id="tp8-9"),
+        pytest.param(64, 16, 2, 64, 64, "fp8", id="tp8-64"),
+        pytest.param(128, 16, 2, 64, 64, "fp8", id="tp8-128"),
+        pytest.param(64, 16, 2, 64, 0, "fp8", id="tp8-64-nope"),
+        pytest.param(64, 16, 2, 64, 64, "auto", id="tp8-64-bf16-cache"),
+        pytest.param(77, 32, 4, 64, 64, "fp8", id="tp4-77"),
+        pytest.param(33, 16, 2, 128, 64, "fp8", id="head128-33"),
+        pytest.param(3073, 16, 2, 64, 64, "fp8", id="prefill-3073"),
+    ],
+)
+@pytest.mark.parametrize("use_cuda_graph", [False, True])
+def test_dense_q_output_is_bitwise_the_in_place_q(
+    fused_insert,
+    dtype,
+    num_tokens,
+    nq,
+    nkv,
+    head_dim,
+    rotary_dim,
+    kv_cache_dtype,
+    use_cuda_graph,
+):
+    """q_out holds the bits of the in-place Q; qkv keeps its Q columns."""
+    device, eps, block_size, max_pos = "cuda", 1e-5, 16, 4096
+    torch.manual_seed(7)
+    qsz, kvsz = nq * head_dim, nkv * head_dim
+    qkv = torch.randn(num_tokens, 2 * (qsz + kvsz), dtype=dtype, device=device)
+    original = qkv.clone()
+    reference = qkv.clone()
+    positions = torch.randint(
+        0, max_pos, (num_tokens,), dtype=torch.int64, device=device
+    )
+    cos_sin = (
+        make_cos_sin_cache(max_pos, rotary_dim, 500_000.0, device)
+        if rotary_dim
+        else None
+    )
+    is_fp8 = kv_cache_dtype != "auto"
+    num_blocks = (num_tokens + block_size - 1) // block_size + 1
+    cache_dtype = torch.uint8 if is_fp8 else dtype
+    cache = torch.zeros(
+        num_blocks, nkv, block_size, 2 * head_dim, dtype=cache_dtype, device=device
+    )
+    expected_cache = torch.zeros_like(cache)
+    slots = torch.randperm(num_blocks * block_size, dtype=torch.int64, device=device)[
+        :num_tokens
+    ]
+    if num_tokens > 1:
+        slots[::3] = -1  # a token the scheduler did not place
+    kwargs = dict(
+        cos_sin_cache=cos_sin,
+        rotary_dim=rotary_dim,
+        slot_mapping=slots,
+        block_size=block_size,
+        kv_cache_dtype=kv_cache_dtype,
+        k_scale=torch.tensor(0.37, device=device) if is_fp8 else None,
+        v_scale=torch.tensor(1.83, device=device) if is_fp8 else None,
+    )
+    fused_insert(
+        reference, positions, nq, nkv, head_dim, eps, kv_cache=expected_cache, **kwargs
+    )
+
+    q_out = torch.full((num_tokens, qsz), float("nan"), dtype=dtype, device=device)
+
+    def run():
+        qkv.copy_(original)
+        fused_insert(
+            qkv,
+            positions,
+            nq,
+            nkv,
+            head_dim,
+            eps,
+            kv_cache=cache,
+            q_out=q_out,
+            **kwargs,
+        )
+
+    run()
+    if use_cuda_graph:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        qkv.zero_()
+        cache.zero_()
+        q_out.fill_(float("nan"))
+        graph.replay()
+    assert torch.equal(q_out.view(torch.int16), reference[:, :qsz].view(torch.int16))
+    # The view of qkv is untouched where Q was; K, V, the gate and the cache are the
+    # ones of the in-place run.
+    assert torch.equal(qkv[:, :qsz], original[:, :qsz])
+    assert torch.equal(qkv[:, qsz:], reference[:, qsz:])
+    assert torch.equal(cache, expected_cache)
+
+
+def test_dense_q_output_is_what_flashinfer_needs(fused_insert):
+    """The in-place Q is a strided view for more than one row; q_out is dense."""
+    num_tokens, nq, nkv = 64, 16, 2
+    qkv, qsz, _, _ = make_case(num_tokens, nq, nkv, torch.bfloat16, "cuda")
+    assert not qkv[:, :qsz].view(-1, nq, HEAD_DIM).is_contiguous()
+    assert qkv[:1, :qsz].view(-1, nq, HEAD_DIM).is_contiguous()
+    q_out = torch.empty(num_tokens, qsz, dtype=torch.bfloat16, device="cuda")
+    positions = torch.arange(num_tokens, device="cuda", dtype=torch.int64)
+    fused_insert(qkv, positions, nq, nkv, HEAD_DIM, 1e-5, q_out=q_out)
+    assert q_out.view(-1, nq, HEAD_DIM).is_contiguous()
+    assert q_out.data_ptr() % 16 == 0
+
+
+def test_dense_q_output_rejects_bad_arguments(fused_insert):
+    num_tokens, nq, nkv = 8, 16, 2
+    qkv, qsz, _, _ = make_case(num_tokens, nq, nkv, torch.bfloat16, "cuda")
+    positions = torch.arange(num_tokens, device="cuda", dtype=torch.int64)
+
+    def call(q_out, **kwargs):
+        fused_insert(qkv, positions, nq, nkv, HEAD_DIM, 1e-5, q_out=q_out, **kwargs)
+
+    with pytest.raises(RuntimeError, match="q_out"):
+        call(torch.empty(num_tokens, qsz - 64, dtype=torch.bfloat16, device="cuda"))
+    with pytest.raises(RuntimeError, match="q_out"):
+        call(torch.empty(num_tokens + 1, qsz, dtype=torch.bfloat16, device="cuda"))
+    with pytest.raises(RuntimeError, match="q_out"):
+        call(torch.empty(num_tokens, qsz, dtype=torch.float16, device="cuda"))
+    with pytest.raises(RuntimeError, match="q_out"):
+        # Not dense.
+        wide = torch.empty(num_tokens, 2 * qsz, dtype=torch.bfloat16, device="cuda")
+        call(wide[:, :qsz])
+    with pytest.raises(RuntimeError, match="q_out"):
+        call(
+            torch.empty(num_tokens, qsz, dtype=torch.bfloat16, device="cuda"),
+            q_fp8_out=torch.empty(
+                num_tokens, qsz, dtype=torch.float8_e4m3fn, device="cuda"
+            ),
+            q_scale=torch.ones(1, device="cuda"),
+        )
+
+
+def _wrapper_layer(backend_name):
+    """The parts of an attention layer that the python wrapper of the insert reads."""
+    return types.SimpleNamespace(
+        attn_backend=types.SimpleNamespace(get_name=lambda: backend_name),
+        kv_cache_dtype="fp8",
+        _k_scale=torch.tensor(0.37, device="cuda"),
+        _v_scale=torch.tensor(1.83, device="cuda"),
+        _q_scale=torch.ones(1, device="cuda"),
+    )
+
+
+@pytest.mark.parametrize("num_tokens", [1, 64, 3073])
+def test_wrapper_returns_the_dense_q_of_the_in_place_run(
+    monkeypatch, namespace, num_tokens
+):
+    from vllm.models.muse_spark.common.ops import fused_qk_norm_rope_kv as wrapper
+
+    op = getattr(namespace, FUSED_OP)
+    if not wrapper._op_has_dense_q_output(op):
+        pytest.skip("this op has no q_out")
+    nq, nkv, block_size = 16, 2, 16
+    qkv, qsz, _, _ = make_case(num_tokens, nq, nkv, torch.bfloat16, "cuda", seed=3)
+    positions = torch.arange(num_tokens, device="cuda", dtype=torch.int64)
+    slots = positions.clone()
+    slots[::3] = -1
+    cache = torch.zeros(
+        cdiv(num_tokens, block_size),
+        nkv,
+        block_size,
+        2 * HEAD_DIM,
+        device="cuda",
+        dtype=torch.uint8,
+    )
+    layer = _wrapper_layer("FLASHINFER")
+    monkeypatch.setattr(
+        wrapper, "get_attention_context", lambda name: (None, layer, cache, slots)
+    )
+    monkeypatch.setattr(wrapper, "resolve_compiled_op", lambda name: op)
+    cos_sin = make_cos_sin_cache(num_tokens, HEAD_DIM, 500_000.0, "cuda")
+
+    def run(dense_q):
+        x, c = qkv.clone(), torch.zeros_like(cache)
+        monkeypatch.setattr(
+            wrapper, "get_attention_context", lambda name: (None, layer, c, slots)
+        )
+        q = wrapper.fused_qk_norm_rope_kv_insert(
+            x, positions, cos_sin, "layer", nq, nkv, HEAD_DIM, HEAD_DIM, 1e-5, dense_q
+        )
+        return x, c, q
+
+    x_ref, cache_ref, q_ref = run(False)
+    assert q_ref is None
+    x_dense, cache_dense, q_dense = run(True)
+    assert q_dense is not None and q_dense.shape == (num_tokens, qsz)
+    assert q_dense.view(-1, nq, HEAD_DIM).is_contiguous()
+    assert torch.equal(q_dense.view(torch.int16), x_ref[:, :qsz].view(torch.int16))
+    assert torch.equal(x_dense[:, :qsz], qkv[:, :qsz])
+    assert torch.equal(x_dense[:, qsz:], x_ref[:, qsz:])
+    assert torch.equal(cache_dense, cache_ref)
+
+
+def test_supports_dense_q_needs_flashinfer_and_the_muse_op(monkeypatch, namespace):
+    from vllm.models.muse_spark.common.ops import fused_qk_norm_rope_kv as wrapper
+
+    op = getattr(namespace, FUSED_OP)
+    monkeypatch.setattr(wrapper, "resolve_compiled_op", lambda name: op)
+    has_q_out = wrapper._op_has_dense_q_output(op)
+    assert wrapper.supports_dense_q(_wrapper_layer("FLASHINFER")) is has_q_out
+    assert not wrapper.supports_dense_q(_wrapper_layer("FLASH_ATTN"))
+
+    stock = types.SimpleNamespace(
+        default=types.SimpleNamespace(
+            _schema=types.SimpleNamespace(
+                arguments=[types.SimpleNamespace(name="qkv")]
+            )
+        )
+    )
+    monkeypatch.setattr(wrapper, "resolve_compiled_op", lambda name: stock)
+    assert not wrapper.supports_dense_q(_wrapper_layer("FLASHINFER"))
+    monkeypatch.setattr(wrapper, "resolve_compiled_op", lambda name: None)
+    assert not wrapper.supports_dense_q(_wrapper_layer("FLASHINFER"))
 
 
 def test_fused_insert_rejects_a_misshaped_cache(fused_insert):

@@ -375,6 +375,7 @@ def _register_fakes() -> None:
             v_scale: torch.Tensor | None = None,
             q_fp8_out: torch.Tensor | None = None,
             q_scale: torch.Tensor | None = None,
+            q_out: torch.Tensor | None = None,
         ) -> None:
             return None
 

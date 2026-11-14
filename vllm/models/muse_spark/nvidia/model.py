@@ -105,6 +105,7 @@ from vllm.models.muse_spark.common.layers import (  # noqa: F401 re-exported
 )
 from vllm.models.muse_spark.common.ops.fused_qk_norm_rope_kv import (
     fused_qk_norm_rope_kv_insert,
+    supports_dense_q,
     supports_fused_kv_insert,
 )
 from vllm.models.muse_spark.common.ops.fused_rmsnorm import (
@@ -2152,6 +2153,12 @@ class MuseSpark1xAttention(nn.Module):
             and self.default_dtype in (torch.bfloat16, torch.float16)
             and supports_fused_kv_insert(self.attn)
         )
+        # The fused kernel writes Q densely, so that FlashInfer does not copy it.
+        self.dense_q = (
+            envs.VLLM_MUSE_SPARK_SM120_DENSE_Q
+            and self.fused_qk_norm_rope_kv_insert
+            and supports_dense_q(self.attn)
+        )
 
     @staticmethod
     def compute_attn_temperature_scale(
@@ -2184,7 +2191,7 @@ class MuseSpark1xAttention(nn.Module):
             rotary_dim = self.rotary_emb.rotary_dim
 
         if self.fused_qk_norm_rope_kv_insert:
-            q_fp8 = fused_qk_norm_rope_kv_insert(
+            q_dense = fused_qk_norm_rope_kv_insert(
                 qkv,
                 positions,
                 cos_sin_cache,
@@ -2194,6 +2201,7 @@ class MuseSpark1xAttention(nn.Module):
                 self.head_dim,
                 rotary_dim,
                 self.rms_norm_eps,
+                self.dense_q,
             )
 
         if self.use_o_gate:
@@ -2204,7 +2212,7 @@ class MuseSpark1xAttention(nn.Module):
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             og = None
         if self.fused_qk_norm_rope_kv_insert:
-            return q if q_fp8 is None else q_fp8, k, v, og
+            return q if q_dense is None else q_dense, k, v, og
 
         if self.qk_norm is not None:
             eps = self.qk_norm.variance_epsilon

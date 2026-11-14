@@ -84,7 +84,8 @@ TORCH_LIBRARY(_muse_C, m) {
   m.def("router_gemv(Tensor x, Tensor w, Tensor! out, bool pdl) -> ()");
 
   // Muse Spark attention ops of vllm-project/vllm#62132; the schemas are those
-  // of the stock torch.ops._C ops.
+  // of the stock torch.ops._C ops, except for the trailing q_out of the fused
+  // insert (callers check the schema before they pass it).
   m.def(
       "muse_spark_mul_tanh_soft_cap(Tensor! out, Tensor input, "
       "float multiplier, float soft_cap_temp) -> ()");
@@ -94,7 +95,7 @@ TORCH_LIBRARY(_muse_C, m) {
       "int head_dim, float eps, Tensor? cos_sin_cache, int rotary_dim, "
       "Tensor? slot_mapping, Tensor!? kv_cache, int block_size, "
       "str kv_cache_dtype, Tensor? k_scale=None, Tensor? v_scale=None, "
-      "Tensor!? q_fp8_out=None, Tensor? q_scale=None) "
+      "Tensor!? q_fp8_out=None, Tensor? q_scale=None, Tensor!? q_out=None) "
       "-> ()");
 }
 

@@ -20,8 +20,8 @@
  * pair (2i, 2i+1) is lane-local, and the norm reduction is 3 shuffles.
  *
  * Slot enumeration per token:
- *     [0, nq)                 Q heads  -> norm (+RoPE), in place or to
- *                                         ``q_fp8_out``
+ *     [0, nq)                 Q heads  -> norm (+RoPE), in place, or to
+ *                                         ``q_fp8_out`` / ``q_out``
  *     [nq, nq+nkv)            K heads  -> norm (+RoPE), in place and into
  *                                         the K cache
  *     [nq+nkv, nq+2*nkv)      V heads  -> copied into the V cache (no norm)
@@ -353,6 +353,7 @@ fusedMuseSparkQKNormRopeKVInsertKernel(
     float const* __restrict__ v_scale,         // [1] or nullptr
     uint8_t* __restrict__ q_fp8_out,           // [N, nq * HEAD_DIM] or nullptr
     float const* __restrict__ q_scale,         // [1] or nullptr
+    scalar_t* __restrict__ q_out,              // [N, nq * HEAD_DIM] or nullptr
     float const eps, int const rotary_dim, int const num_tokens, int const nq,
     int const nkv, FastDiv const chunks_div, int64_t const qkv_stride,
     FastDiv const block_div, int64_t const kv_s_block, int64_t const kv_s_head,
@@ -489,6 +490,12 @@ fusedMuseSparkQKNormRopeKVInsertKernel(
             (static_cast<int64_t>(tokenIdx) * nq + slot) * HEAD_DIM + dimBase;
         storeCache<scalar_t, uint8_t, KVCacheDtype::kFp8E4M3, kElems>(
             q_fp8_out + q_off, packed, q_inv);
+      } else if (q_out && slot < nq) {
+        // The same rounded vector as the in-place store, into the dense
+        // [N, nq * HEAD_DIM] buffer that the attention kernel reads as is.
+        int64_t const q_off =
+            (static_cast<int64_t>(tokenIdx) * nq + slot) * HEAD_DIM + dimBase;
+        *reinterpret_cast<uint4*>(q_out + q_off) = packed;
       } else {
         *reinterpret_cast<uint4*>(base + h * HEAD_DIM) = packed;
       }
@@ -519,10 +526,11 @@ void launchFusedMuseSparkTyped(
     scalar_t* qkv, rope_t const* cos_sin_cache, int64_t const* positions,
     int64_t const* slot_mapping, cache_t* kv_cache, float const* k_scale,
     float const* v_scale, uint8_t* q_fp8_out, float const* q_scale,
-    float const eps, int const rotary_dim, int const num_tokens, int const nq,
-    int const nkv, int64_t const qkv_stride, int const block_size,
-    int64_t const kv_s_block, int64_t const kv_s_head, int64_t const kv_s_token,
-    bool const do_rope, bool const insert_kv, cudaStream_t stream) {
+    scalar_t* q_out, float const eps, int const rotary_dim,
+    int const num_tokens, int const nq, int const nkv,
+    int64_t const qkv_stride, int const block_size, int64_t const kv_s_block,
+    int64_t const kv_s_head, int64_t const kv_s_token, bool const do_rope,
+    bool const insert_kv, cudaStream_t stream) {
   FastDiv const block_div = makeFastDiv(block_size);
   constexpr int kElems = kBytesPerLane / sizeof(scalar_t);
   constexpr int kLanes = HEAD_DIM / kElems;
@@ -559,9 +567,9 @@ void launchFusedMuseSparkTyped(
                                              HEADS_PER_GROUP, DO_ROPE,       \
                                              INSERT>,                        \
       qkv, cos_sin_cache, positions, slot_mapping, kv_cache, k_scale,        \
-      v_scale, q_fp8_out, q_scale, eps, rotary_dim, num_tokens, nq, nkv,     \
-      chunks_div, qkv_stride, block_div, kv_s_block, kv_s_head, kv_s_token,  \
-      early_trigger))
+      v_scale, q_fp8_out, q_scale, q_out, eps, rotary_dim, num_tokens, nq,   \
+      nkv, chunks_div, qkv_stride, block_div, kv_s_block, kv_s_head,         \
+      kv_s_token, early_trigger))
 
   if (do_rope) {
     if (insert_kv) {
@@ -584,8 +592,9 @@ void launchFusedMuseSpark(
     scalar_t* qkv, void const* cos_sin_cache, bool const rope_is_fp32,
     int64_t const* positions, int64_t const* slot_mapping, cache_t* kv_cache,
     float const* k_scale, float const* v_scale, uint8_t* q_fp8_out,
-    float const* q_scale, float const eps, int const rotary_dim,
-    int const num_tokens, int const nq, int const nkv, int const head_dim,
+    float const* q_scale, scalar_t* q_out, float const eps,
+    int const rotary_dim, int const num_tokens, int const nq, int const nkv,
+    int const head_dim,
     int64_t const qkv_stride, int const block_size, int64_t const kv_s_block,
     int64_t const kv_s_head, int64_t const kv_s_token, bool const do_rope,
     bool const insert_kv, cudaStream_t stream) {
@@ -619,9 +628,9 @@ void launchFusedMuseSpark(
 #define DISPATCH_ARGS(RT, HD, HPG)                                         \
   launchFusedMuseSparkTyped<scalar_t, cache_t, kv_dt, RT, HD, HPG>(        \
       qkv, reinterpret_cast<RT const*>(cos_sin_cache), positions,          \
-      slot_mapping, kv_cache, k_scale, v_scale, q_fp8_out, q_scale, eps,   \
-      rotary_dim, num_tokens, nq, nkv, qkv_stride, block_size, kv_s_block, \
-      kv_s_head, kv_s_token, do_rope, insert_kv, stream)
+      slot_mapping, kv_cache, k_scale, v_scale, q_fp8_out, q_scale, q_out, \
+      eps, rotary_dim, num_tokens, nq, nkv, qkv_stride, block_size,        \
+      kv_s_block, kv_s_head, kv_s_token, do_rope, insert_kv, stream)
 
 #define DISPATCH_HPG(RT, HD)    \
   switch (heads_per_group) {    \
@@ -676,6 +685,7 @@ void launchFusedMuseSpark(
                    : nullptr,                                                  \
       q_fp8_out ? reinterpret_cast<uint8_t*>(q_fp8_out->data_ptr()) : nullptr, \
       q_scale ? reinterpret_cast<float const*>(q_scale->data_ptr()) : nullptr, \
+      q_out ? reinterpret_cast<st*>(q_out->data_ptr()) : nullptr,              \
       static_cast<float>(eps), static_cast<int>(rotary_dim), num_tokens, nq,   \
       nkv, hd, qkv_stride, static_cast<int>(block_size), kv_s_block,           \
       kv_s_head, kv_s_token, do_rope, insert_kv, stream)
@@ -693,7 +703,8 @@ void fused_muse_spark_qknorm_rope_kv_insert(
     std::optional<at::Tensor> const& k_scale,  // [1] fp32, fp8 cache only
     std::optional<at::Tensor> const& v_scale,
     std::optional<at::Tensor> const& q_fp8_out,
-    std::optional<at::Tensor> const& q_scale) {
+    std::optional<at::Tensor> const& q_scale,
+    std::optional<at::Tensor> const& q_out) {
   using fused_attn_ops::KVCacheDtype;
 
   TORCH_CHECK(qkv.is_cuda() && qkv.dim() == 2 && qkv.stride(1) == 1,
@@ -731,6 +742,19 @@ void fused_muse_spark_qknorm_rope_kv_insert(
             q_scale->scalar_type() == at::ScalarType::Float &&
             q_scale->numel() == 1,
         "q_scale must be a single fp32 value on the qkv device");
+  }
+
+  if (q_out) {
+    TORCH_CHECK(!q_fp8_out, "q_out and q_fp8_out are mutually exclusive");
+    TORCH_CHECK(
+        q_out->is_cuda() && q_out->get_device() == qkv.get_device() &&
+            q_out->scalar_type() == qkv.scalar_type() && q_out->dim() == 2 &&
+            q_out->is_contiguous() && q_out->size(0) == num_tokens &&
+            q_out->size(1) == static_cast<int64_t>(nq) * hd,
+        "q_out must be a contiguous [num_tokens, num_heads * head_dim] tensor "
+        "of the qkv dtype on the qkv device");
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(q_out->data_ptr()) % 16 == 0,
+                "q_out must be 16-byte aligned");
   }
 
   TORCH_CHECK(hd == 64 || hd == 128 || hd == 256,

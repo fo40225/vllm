@@ -179,7 +179,10 @@ void muse_spark_mul_tanh_soft_cap(at::Tensor& out, at::Tensor const& input,
 // In-place weightless QK RMSNorm + GPT-J RoPE over [q | k | v | o_gate] rows,
 // optionally writing k/v into a paged [nb, nkv, bs, 2*head_dim] KV cache
 // (bf16/fp16, or fp8 with k_scale/v_scale) and Q as scaled E4M3 into
-// q_fp8_out.
+// q_fp8_out. With q_out (a dense [N, num_heads * head_dim] tensor of the qkv
+// dtype) Q goes there, bit for bit what the in-place store would have written,
+// and the Q columns of qkv stay untouched: the attention kernel reads a dense
+// Q, which a strided view of qkv is not (a copy in front of it otherwise).
 void fused_muse_spark_qknorm_rope_kv_insert(
     at::Tensor& qkv, at::Tensor const& positions, int64_t num_heads,
     int64_t num_kv_heads, int64_t head_dim, double eps,
@@ -190,7 +193,8 @@ void fused_muse_spark_qknorm_rope_kv_insert(
     std::optional<at::Tensor> const& k_scale,
     std::optional<at::Tensor> const& v_scale,
     std::optional<at::Tensor> const& q_fp8_out,
-    std::optional<at::Tensor> const& q_scale);
+    std::optional<at::Tensor> const& q_scale,
+    std::optional<at::Tensor> const& q_out);
 
 // Asynchronous L2 prefetch of up to 4 contiguous 16 B aligned tensors
 // (muse_spark_l2_prefetch.cu): each CTA issues cp.async.bulk.prefetch.L2 for its
