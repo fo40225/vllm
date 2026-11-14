@@ -154,6 +154,7 @@ from vllm.v1.worker.gpu.sample.logits_processor import build_custom_logits_proce
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
 from vllm.v1.worker.gpu.sample.sampler import Sampler
+from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
 from vllm.v1.worker.gpu.sample.topk_logits import RouteStats, VerifyPlan
 from vllm.v1.worker.gpu.shutdown import free_before_shutdown
 from vllm.v1.worker.gpu.spec_decode import init_speculator
@@ -1190,6 +1191,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     shapes.append((k, True, False, True))
                     shapes.append((k, True, True, True))
             for k, has_sampled, use_min_p, use_top_p in shapes:
+                self._set_dummy_verify_states(num_reqs, use_min_p, use_top_p)
                 topk = self.model.compute_topk_logits(hidden_states[:num_logits], k=k)
                 rejection_sampler.verify_topk(
                     topk,
@@ -1201,6 +1203,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
             if self.topk_verify_level >= 3 and num_reqs > SPLIT_MIN_CANDIDATE_REQS:
                 self._dummy_split_verify(hidden_states[:num_logits], batch)
+
+    def _set_dummy_verify_states(
+        self, num_reqs: int, use_min_p: bool, use_top_p: bool
+    ) -> None:
+        """Make the host sampler states of the dummy requests match a verification
+        variant. Since v0.33.0 `_dummy_sampler_run` adds the requests with
+        `SamplingParams.for_sampler_warmup()` (min_p 0.1, top_p 0.9, logprobs 5):
+        `verify_topk` refuses a sampled request whose min_p or top_p the call does not
+        apply, and the split verification never carries logprobs (`merge_outputs`).
+        The dummy requests are overwritten by `add_request` before any real request
+        uses their slots."""
+        assert self.rejection_sampler is not None
+        states = self.rejection_sampler.sampler.sampling_states
+        states.min_p.np[:num_reqs] = 0.1 if use_min_p else 0.0
+        states.top_p.np[:num_reqs] = 0.9 if use_top_p else 1.0
+        states.num_logprobs[:num_reqs] = NO_LOGPROBS
 
     def _dummy_split_verify(
         self, hidden_states: torch.Tensor, batch: InputBatch
@@ -1214,6 +1232,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         the full path's (the full subset is never larger than the whole step) and
         measured by the stress of the exact-bytes procedure, not by this run."""
         assert self.rejection_sampler is not None and self.speculator is not None
+        self._set_dummy_verify_states(batch.num_reqs, False, False)
         reqs = np.arange(batch.num_reqs)
         cand = SplitIndices(
             batch, reqs[:SPLIT_MIN_CANDIDATE_REQS], hidden_states.device
