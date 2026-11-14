@@ -1068,9 +1068,14 @@ def _poison_scratch(engine: _Engine, t: int) -> None:
     engine.plan.fill_(0x7FFFFFFF)
 
 
-def _run_poisoned(engine: _Engine, u, ids, **kwargs):
+def _run_poisoned(engine: _Engine, u, ids, capfd, **kwargs):
+    """One launch on poisoned scratch, copied out. A wrong byte count of the loader's
+    transaction barrier or a wrong arrival count hangs the consumers for good (the
+    typical failure of the barrier protocol): ``synchronize_or_exit`` ends the process
+    then, instead of the test holding the GPU."""
     _poison_scratch(engine, u.shape[0])
     rows, perm = engine.run(u, ids, **kwargs)
+    synchronize_or_exit(f"a launch of {kwargs}", capfd)
     return rows.clone(), perm.clone()
 
 
@@ -1079,7 +1084,7 @@ def _run_poisoned(engine: _Engine, u, ids, **kwargs):
 @pytest.mark.parametrize("t", [9, 10, 12, 16, 17, 24, 33, 48, 64, 96, MAX_LARGE_T])
 @torch.inference_mode()
 def test_large_batch_bulk_loader_rows_equal_the_cp_async_loader(
-    layer: _Layer, t: int, up_first: bool, pdl: bool
+    layer: _Layer, t: int, up_first: bool, pdl: bool, capfd
 ) -> None:
     """The loader warp's bulk copies put the same bytes in shared memory as its
     cp.async loop, so every route's row is the same bit for bit: uniform and skewed
@@ -1097,16 +1102,18 @@ def test_large_batch_bulk_loader_rows_equal_the_cp_async_loader(
     cases["zipf"] = _zipf_ids(t, 253, layer.e_local, 1.0)
     cases["zipf_steep"] = _zipf_ids(t, 254, layer.e_local, 2.0, n_local=4)
     for name, ids in cases.items():
-        want = _run_poisoned(engine, u, ids, flags=flags, loader=0)
+        want = _run_poisoned(engine, u, ids, capfd, flags=flags, loader=0)
         for rep in range(3):
-            got = _run_poisoned(engine, u, ids, flags=flags, loader=FLAG_LARGE_BULK)
+            got = _run_poisoned(
+                engine, u, ids, capfd, flags=flags, loader=FLAG_LARGE_BULK
+            )
             _assert_rows_equal(got, want, (name, t, rep))
             assert engine.counters_are_zero(), (name, t, rep)
 
 
 @torch.inference_mode()
 def test_large_batch_bulk_loader_is_race_free_over_many_launches(
-    layer: _Layer,
+    layer: _Layer, capfd
 ) -> None:
     """Hot experts at 64 and 128 tokens, 150 launches each with the scratch poisoned
     in front: the rows never differ from those of the cp.async loader."""
@@ -1114,10 +1121,10 @@ def test_large_batch_bulk_loader_is_race_free_over_many_launches(
     for t, exponent in ((64, 1.0), (MAX_LARGE_T, 1.4)):
         u, _, _ = _routing(t, 255)
         ids = _zipf_ids(t, 256, layer.e_local, exponent)
-        want = _run_poisoned(engine, u, ids, loader=0)
+        want = _run_poisoned(engine, u, ids, capfd, loader=0)
         bad = 0
         for _ in range(150):
-            got = _run_poisoned(engine, u, ids, loader=FLAG_LARGE_BULK)
+            got = _run_poisoned(engine, u, ids, capfd, loader=FLAG_LARGE_BULK)
             bad += not (
                 torch.equal(got[1], want[1])
                 and torch.equal(
