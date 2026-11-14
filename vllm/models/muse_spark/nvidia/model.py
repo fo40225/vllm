@@ -2869,6 +2869,14 @@ class MuseSpark1xModel(LlamaModel):
         self.default_dtype = torch.get_default_dtype()
         self.residual_dtype = torch.float32
 
+        # The residual stream is FP32, and so were the aux taps a drafter takes. Every
+        # consumer casts them to the model dtype before the first matmul, so they are
+        # cast where they are made: held (and gathered) at half the width, and no cast
+        # copies of all taps at once at the draft step. With pipeline stages the taps
+        # keep the stream dtype (the relay slots are sized for it).
+        self.aux_hidden_state_dtype: torch.dtype | None = (
+            self.default_dtype if get_pp_group().world_size == 1 else None
+        )
         self.fuse_across_layers = get_pp_group().world_size == 1
         sm120_sp = is_sm120_sequence_parallel_enabled(vllm_config)
         self.is_sequence_parallel = (
@@ -3329,6 +3337,11 @@ class MuseSpark1xModel(LlamaModel):
         hidden_states = self.embed_tokens(input_ids)
         return self.tok_embeddings_norm(hidden_states, out_dtype=self.residual_dtype)
 
+    def _as_aux_tap(self, state: torch.Tensor) -> torch.Tensor:
+        """A hidden state as a drafter takes it (the model dtype, see ``__init__``)."""
+        dtype = self.aux_hidden_state_dtype
+        return state if dtype is None else state.to(dtype)
+
     def forward(  # type: ignore[override]
         self,
         input_ids: torch.Tensor | None,
@@ -3366,7 +3379,10 @@ class MuseSpark1xModel(LlamaModel):
                 sp_shard(x) if sp_active and not self.is_sequence_parallel_input else x
             )
             self._maybe_add_hidden_state(
-                aux_hidden_states, self.start_layer, initial_state, None
+                aux_hidden_states,
+                self.start_layer,
+                self._as_aux_tap(initial_state),
+                None,
             )
         for idx, layer in enumerate(
             self.layers[self.start_layer : self.end_layer], start=self.start_layer
@@ -3388,7 +3404,7 @@ class MuseSpark1xModel(LlamaModel):
                 )
                 if sp_active and not layer.is_sequence_parallel:
                     state = sp_shard(state)
-                aux_hidden_states.append(state)
+                aux_hidden_states.append(self._as_aux_tap(state))
 
         if self._l2_prefetcher is not None:
             self._l2_prefetcher.join()
