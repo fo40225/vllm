@@ -158,6 +158,12 @@ from vllm.transformers_utils.configs.muse_spark import (
 from vllm.utils.math_utils import cdiv
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 from vllm.utils.torch_utils import aux_stream
+from vllm.v1.worker.gpu.sample.topk_logits import (
+    MAX_CANDIDATES,
+    MAX_SHARD_COLS,
+    TopKLogits,
+    local_topk_candidates,
+)
 
 logger = init_logger(__name__)
 
@@ -3167,6 +3173,9 @@ class MuseSpark1xForCausalLM(LlamaForCausalLM, SupportsLoRA, MixtureOfExperts):
         if get_pp_group().is_last_rank:
             self.logits_processor.scale = 1.0
 
+        # Candidates per TP rank of the top-K logits path, 0 when it is off.
+        self.topk_logits_k = self._resolve_topk_logits_k()
+
         self.set_moe_parameters()
 
     def _init_model(
@@ -3242,14 +3251,11 @@ class MuseSpark1xForCausalLM(LlamaForCausalLM, SupportsLoRA, MixtureOfExperts):
                 moe.n_redundant_experts = self.num_redundant_experts
                 moe.experts.update_expert_map()
 
-    def compute_logits(
-        self,
-        hidden_states: torch.Tensor,
-    ) -> torch.Tensor | None:
-        hidden_states = hidden_states.to(self.lm_head.weight.dtype)
-        logits = self.logits_processor(self.lm_head, hidden_states)
-        if logits is None:
-            return None
+    def _scale_and_soft_cap(self, logits: torch.Tensor) -> torch.Tensor:
+        """The output multiplier and soft cap of raw lm_head logits, in fp32.
+
+        Elementwise: every element gets the same bits wherever it sits in the tensor.
+        """
         if self.mul_tanh_soft_cap is not None:
             return self.mul_tanh_soft_cap(logits)
         if logits.dtype != torch.float32:
@@ -3261,6 +3267,102 @@ class MuseSpark1xForCausalLM(LlamaForCausalLM, SupportsLoRA, MixtureOfExperts):
                 logits / self.output_soft_cap_temp
             )
         return logits
+
+    def compute_logits(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor | None:
+        hidden_states = hidden_states.to(self.lm_head.weight.dtype)
+        logits = self.logits_processor(self.lm_head, hidden_states)
+        if logits is None:
+            return None
+        return self._scale_and_soft_cap(logits)
+
+    def _resolve_topk_logits_k(self) -> int:
+        """Candidates per TP rank of ``compute_topk_logits``, 0 when it is not used.
+
+        VLLM_MUSE_SPARK_SM120_TOPK_LOGITS asks for the path; the model serves it when
+        the lm_head shard layout is the one the kernels expect.
+        """
+        if (
+            not envs.VLLM_MUSE_SPARK_SM120_TOPK_LOGITS
+            or not get_pp_group().is_last_rank
+        ):
+            return 0
+        k = envs.VLLM_MUSE_SPARK_SM120_TOPK_LOGITS_K
+        head = self.lm_head
+        tp_size = get_tensor_model_parallel_world_size()
+        shard = head.num_embeddings_per_partition
+        reason = None
+        if not 1 <= k <= 128:
+            reason = f"VLLM_MUSE_SPARK_SM120_TOPK_LOGITS_K={k} is outside 1 .. 128"
+        elif tp_size == 1:
+            reason = "there is no vocabulary to gather at TP 1"
+        elif tp_size * k > MAX_CANDIDATES:
+            reason = f"TP {tp_size} x K {k} candidates exceed {MAX_CANDIDATES}"
+        elif not k <= shard <= MAX_SHARD_COLS:
+            reason = (
+                f"the lm_head shard has {shard} columns, outside {k} .. "
+                f"{MAX_SHARD_COLS}"
+            )
+        elif head.num_added_embeddings:
+            reason = "the lm_head has added (LoRA) embeddings"
+        elif head.weight.dtype != torch.bfloat16 or (
+            self.logits_processor.head_dtype not in (None, torch.bfloat16)
+        ):
+            reason = "the lm_head projection is not bf16"
+        elif self.logits_processor.scale != 1.0 or self.logits_processor.soft_cap:
+            reason = "the logits processor scales or caps the logits itself"
+        if reason is not None:
+            logger.warning(
+                "MuseSpark: sampling from the top-%d logits of every TP rank is "
+                "off: %s.",
+                k,
+                reason,
+            )
+            return 0
+        logger.info(
+            "MuseSpark: sampling from the top-%d logits of each of the %d TP ranks "
+            "(lm_head shard of %d columns).",
+            k,
+            tp_size,
+            shard,
+        )
+        return k
+
+    def compute_topk_logits(self, hidden_states: torch.Tensor) -> TopKLogits:
+        """The top-``topk_logits_k`` logits of every TP rank, gathered, for sampling.
+
+        What ``compute_logits`` does up to the gather, with the gather and everything
+        after it on 2 * k 16-bit words per row and rank rather than a vocabulary shard:
+        each rank keeps the k largest of its shard, the ranks exchange them (one
+        all-gather, rank-major), and the soft cap is applied to the gathered words
+        by the very op of ``compute_logits``. The sampler turns the candidates into
+        tokens (``Sampler.sample_topk_logits``).
+        """
+        k = self.topk_logits_k
+        assert k > 0
+        head = self.lm_head
+        hidden_states = hidden_states.to(head.weight.dtype)
+        # Plain shard logits: the head takes no scale or soft cap of its own here.
+        local = self.logits_processor(head, hidden_states, skip_gather=True)
+        words = local_topk_candidates(
+            local, k, num_valid=head.shard_indices.num_org_elements
+        )
+        # int16 words travel as bf16 bits: every communicator moves that dtype and
+        # an all-gather only copies.
+        words = tensor_model_parallel_all_gather(words.view(torch.bfloat16), dim=0)
+        # The cap runs over the index words too (finite garbage, ignored): one launch
+        # on a contiguous tensor, the way the fused op takes it.
+        capped = self._scale_and_soft_cap(words.contiguous())
+        return TopKLogits(
+            words=words,
+            capped=capped,
+            num_rows=hidden_states.shape[0],
+            k=k,
+            tp_size=head.tp_size,
+            shard_size=head.num_embeddings_per_partition,
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         def interleaved_weights() -> Iterable[tuple[str, torch.Tensor]]:

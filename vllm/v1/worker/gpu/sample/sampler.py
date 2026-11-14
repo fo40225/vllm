@@ -35,6 +35,7 @@ from vllm.v1.worker.gpu.sample.output import SamplerOutput, SamplingMaskTensors
 from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
 from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS, SamplingStates
 from vllm.v1.worker.gpu.sample.thinking_budget import ThinkingBudgetState
+from vllm.v1.worker.gpu.sample.topk_logits import TopKLogits, topk_merge_sample
 from vllm.v1.worker.gpu.sample.trace_replay import TraceReplayState
 from vllm.v1.worker.gpu.states import RequestState
 
@@ -83,6 +84,10 @@ class Sampler:
             TraceReplayState(req_states) if enable_trace_replay else None
         )
         self.needs_logits_processing = np.zeros(max_num_reqs, dtype=bool)
+        # The part of needs_logits_processing that is not a plain sampling parameter
+        # (temperature, top_k, top_p, min_p): bias, penalties, bad words, thinking
+        # budget, custom processors. Such a request needs the full logits.
+        self.needs_full_logits = np.zeros(max_num_reqs, dtype=bool)
         self.num_speculative_tokens = num_speculative_tokens
         self.return_sampling_mask = return_sampling_mask
         self.use_flashinfer = (
@@ -95,12 +100,13 @@ class Sampler:
 
     def add_request(self, req_idx: int, sampling_params: SamplingParams) -> None:
         needs_processing = self.sampling_states.add_request(req_idx, sampling_params)
-        needs_processing |= self.thinking_budget_state.add_request(
+        needs_full_logits = self.thinking_budget_state.add_request(
             req_idx, sampling_params
         )
         for processor in self.logits_processors:
-            needs_processing |= processor.add_request(req_idx, sampling_params)
-        self.needs_logits_processing[req_idx] = needs_processing
+            needs_full_logits |= processor.add_request(req_idx, sampling_params)
+        self.needs_logits_processing[req_idx] = needs_processing | needs_full_logits
+        self.needs_full_logits[req_idx] = needs_full_logits
 
         self.logprob_token_ids_state.add_request(req_idx, sampling_params)
         if self.trace_replay_state is not None:
@@ -130,6 +136,71 @@ class Sampler:
             return None
         num_logprobs = max_num_logprobs if max_num_logprobs != NO_LOGPROBS else 0
         return num_logprobs, max_token_ids
+
+    def topk_logits_supported(self, idx_mapping_np: np.ndarray, k: int) -> bool:
+        """Whether `sample_topk_logits` can sample these requests.
+
+        True when the sampling of every request is a greedy argmax, or a Gumbel-max
+        draw from at most the ``k`` largest logits (temperature, top_k <= k): nothing
+        that needs more than the top ``k`` of the vocabulary, or the logits themselves.
+        Reads host state only, which every TP rank holds alike, so all ranks decide
+        alike.
+        """
+        if (
+            self.compute_nans
+            or self.return_sampling_mask
+            or self.trace_replay_state is not None
+        ):
+            return False
+        if np.any(self.needs_full_logits[idx_mapping_np]):
+            return False
+        if self.get_logprobs_dims(idx_mapping_np) is not None:
+            return False
+        states = self.sampling_states
+        random = states.temperature.np[idx_mapping_np] != 0.0
+        if not random.any():
+            # A greedy row ignores top_k, top_p and min_p.
+            return True
+        return bool(
+            np.all(states.top_k.np[idx_mapping_np][random] <= k)
+            and np.all(states.top_p.np[idx_mapping_np][random] == 1.0)
+            and np.all(states.min_p.np[idx_mapping_np][random] == 0.0)
+        )
+
+    def sample_topk_logits(
+        self, topk: TopKLogits, input_batch: InputBatch
+    ) -> SamplerOutput:
+        """`__call__` on the candidates of `topk` instead of the full logits.
+
+        The caller has checked `topk_logits_supported`. Draws the token of the full
+        path: the argmax of the logits, or the Gumbel-max draw over their top_k.
+        """
+        states = self.sampling_states
+        pos = input_batch.positions[input_batch.logits_indices]
+        sampled = topk_merge_sample(
+            topk,
+            input_batch.expanded_idx_mapping,
+            states.temperature.gpu,
+            states.top_k.gpu,
+            states.seeds.gpu,
+            pos,
+            use_fp64=self.use_fp64_gumbel,
+        )
+        num_sampled, num_rejected = get_num_sampled_and_rejected(
+            input_batch.seq_lens.new_ones(input_batch.num_reqs),
+            input_batch.seq_lens,
+            input_batch.cu_num_logits,
+            input_batch.idx_mapping,
+            self.req_states.prefill_len.gpu,
+        )
+        return SamplerOutput(
+            sampled_token_ids=sampled.view(-1, 1),
+            logprobs_tensors=None,
+            num_nans=None,
+            num_sampled=num_sampled,
+            num_rejected=num_rejected,
+            sampling_mask_tensors=None,
+        )
 
     def __call__(
         self,

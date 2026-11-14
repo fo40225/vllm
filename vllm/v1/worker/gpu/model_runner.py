@@ -344,6 +344,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.sampler: Sampler | None = None
         self.rejection_sampler: RejectionSampler | None = None
         self.batch_sharder: BatchSharder | None = None
+        # Candidates per TP rank when the batch can be sampled from the top-k logits of
+        # each rank (Sampler.sample_topk_logits), 0 when never.
+        self.topk_logits_k = 0
+        self.topk_logits_min_tokens = 1
+        self._topk_logits_logged = False
         self.prompt_logprobs_worker: PromptLogprobsWorker | None = None
         self.structured_outputs_worker: StructuredOutputsWorker | None = None
         self.cudagraph_manager: ModelCudaGraphManager | None = None
@@ -522,6 +527,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         self.vllm_config.watermark_config
                     ),
                 )
+            self.topk_logits_k = self._resolve_topk_logits_k()
             self.prompt_logprobs_worker = PromptLogprobsWorker(
                 self.max_num_reqs,
                 self.device,
@@ -1048,6 +1054,67 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.sampler.add_request(req_idx, warmup_params)
         self.sampler.apply_staged_writes()
         self.sampler(logits, dummy_input_batch)
+        if self.topk_logits_k:
+            # Compile the kernels of the top-k logits path before the first request.
+            topk = self.model.compute_topk_logits(hidden_states)
+            self.sampler.sample_topk_logits(topk, dummy_input_batch)
+
+    def _resolve_topk_logits_k(self) -> int:
+        """Candidates per TP rank of the top-k logits sampling, 0 when it is off.
+
+        The model offers it (``compute_topk_logits``, ``topk_logits_k``); this is
+        the part of the launch it cannot see: a rejection sampler needs the full
+        probabilities of the target, LoRA may add vocabulary, and a sampler that is
+        not the plain ``Sampler`` (watermark, custom) or batch-sharded sampling work
+        on the gathered logits.
+        """
+        k = getattr(self.model, "topk_logits_k", 0)
+        if not k:
+            return 0
+        reason = None
+        if self.speculative_config is not None:
+            reason = "speculative decoding is on"
+        elif self.lora_config:
+            reason = "LoRA is on"
+        elif self.batch_sharder is not None:
+            reason = "batch-sharded sampling is on"
+        elif type(self.sampler) is not Sampler:
+            reason = "the sampler is not the plain Sampler"
+        if reason is not None:
+            logger.warning(
+                "Sampling from the top-%d logits of every TP rank is off: %s.",
+                k,
+                reason,
+            )
+            return 0
+        self.topk_logits_min_tokens = max(
+            1, envs.VLLM_MUSE_SPARK_SM120_TOPK_LOGITS_MIN_TOKENS
+        )
+        return k
+
+    def _sample_from_topk_logits(
+        self, input_batch: InputBatch, grammar_output: GrammarOutput | None
+    ) -> bool:
+        """Whether this step samples from the top-k logits of each TP rank.
+
+        Decided from the batch shape and the host copy of the request state, which
+        every TP rank holds alike: all ranks take the same path (the gather of
+        either path is a collective).
+        """
+        if self.topk_logits_k == 0 or grammar_output is not None:
+            return False
+        num_logits = input_batch.logits_indices.shape[0]
+        if (
+            self.pcp_manager is not None
+            or input_batch.num_draft_tokens != 0
+            or num_logits != input_batch.num_reqs
+            or num_logits < self.topk_logits_min_tokens
+        ):
+            return False
+        assert self.sampler is not None
+        return self.sampler.topk_logits_supported(
+            input_batch.idx_mapping_np, self.topk_logits_k
+        )
 
     @torch.inference_mode()
     def _dummy_pooler_run(self, hidden_states: torch.Tensor) -> None:
@@ -1734,6 +1801,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             logits = logits[:, : self.vocab_size]
         else:
             sample_hidden_states = hidden_states[input_batch.logits_indices]
+            if self._sample_from_topk_logits(input_batch, grammar_output):
+                # Gather the top-k logits of every rank, not the logits.
+                if not self._topk_logits_logged:
+                    self._topk_logits_logged = True
+                    logger.info(
+                        "The first step sampled from the top-%d logits of every TP "
+                        "rank (%d rows).",
+                        self.topk_logits_k,
+                        input_batch.logits_indices.shape[0],
+                    )
+                topk = self.model.compute_topk_logits(sample_hidden_states)
+                assert self.sampler is not None
+                sampler_output = self.sampler.sample_topk_logits(topk, input_batch)
+                return (
+                    sampler_output,
+                    sampler_output.num_sampled,
+                    sampler_output.num_rejected,
+                )
             logits = self.model.compute_logits(sample_hidden_states)
 
         invalid_drafts = None

@@ -165,6 +165,9 @@ if TYPE_CHECKING:
     VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_MIN_TOKENS: int = 2048
     VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_UBATCHES: int = 2
     VLLM_MUSE_SPARK_SM120_XQA_ACTIVE_MERGE: bool = True
+    VLLM_MUSE_SPARK_SM120_TOPK_LOGITS: bool = False
+    VLLM_MUSE_SPARK_SM120_TOPK_LOGITS_K: int = 64
+    VLLM_MUSE_SPARK_SM120_TOPK_LOGITS_MIN_TOKENS: int = 2
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
     VLLM_ROCM_USE_AITER_LINEAR_HIPBMM: bool = False
     VLLM_ROCM_USE_AITER_MOE: bool = True
@@ -1644,6 +1647,44 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # FlashInfer is not 0.7.0.post1. Read once, when the model is constructed.
     "VLLM_MUSE_SPARK_SM120_XQA_ACTIVE_MERGE": lambda: bool(
         int(os.getenv("VLLM_MUSE_SPARK_SM120_XQA_ACTIVE_MERGE", "1"))
+    ),
+    # Muse Spark on SM120: sample a decode batch from the top-K logits of every tensor-
+    # parallel rank instead of gathering the whole vocabulary. Every rank keeps the K
+    # largest of its [rows, vocab / TP] logit shard (the lowest indices among equal
+    # values) and the ranks exchange only those 2 * K 16-bit words per row (the logits
+    # as bf16 and their shard indices), 256 B per row at K = 64 instead of 50 KB; the
+    # soft cap, the temperature, the top-k mask and the Gumbel-max draw then run on the
+    # TP * K candidates of a row in one kernel. Greedy sampling returns exactly the
+    # tokens of the full path (the lowest index among equal logits). A request with
+    # temperature > 0 needs top_k <= K, and its draw is the Gumbel-max draw of the
+    # full path (same noise per seed, position and token id; the same top_k tokens):
+    # bitwise the token of the full path wherever that path draws by Gumbel-max, and
+    # the same distribution where it takes FlashInfer's sampler (a step without greedy
+    # requests and explicit seeds). A step takes the full path (all ranks decide alike,
+    # from the request state) when any request of it asks for logprobs, penalties,
+    # logit bias / allowed token ids / bad words, a thinking budget, a grammar bitmask,
+    # or, at temperature > 0, min_p, top_p, or a top_k above K (no top_k included); when
+    # speculative decoding, LoRA, batch-sharded sampling, a watermark, trace replay, a
+    # sampling mask or the NaN counter is on; and when the step has fewer rows than
+    # VLLM_MUSE_SPARK_SM120_TOPK_LOGITS_MIN_TOKENS. Read once, when the model is
+    # constructed. Off by default until measured.
+    "VLLM_MUSE_SPARK_SM120_TOPK_LOGITS": lambda: bool(
+        int(os.getenv("VLLM_MUSE_SPARK_SM120_TOPK_LOGITS", "0"))
+    ),
+    # Muse Spark on SM120: candidates every TP rank contributes per row to
+    # VLLM_MUSE_SPARK_SM120_TOPK_LOGITS, 1 .. 128 (TP * K at most 2048). A request with
+    # top_k above this takes the full path.
+    "VLLM_MUSE_SPARK_SM120_TOPK_LOGITS_K": lambda: int(
+        os.getenv("VLLM_MUSE_SPARK_SM120_TOPK_LOGITS_K", "64")
+    ),
+    # Muse Spark on SM120: fewest rows (sampled tokens) of a step that take the
+    # VLLM_MUSE_SPARK_SM120_TOPK_LOGITS path; a smaller step gathers the logits. A
+    # step has the same number of rows on every TP rank. One row gathers 50 KB per
+    # rank in 23 us (host plugin) against 21 us for the candidates, which cost 6 us
+    # more compute than the sampler of the full path: the paths break even at about
+    # two rows, so the default keeps batch 1 on the full path.
+    "VLLM_MUSE_SPARK_SM120_TOPK_LOGITS_MIN_TOKENS": lambda: int(
+        os.getenv("VLLM_MUSE_SPARK_SM120_TOPK_LOGITS_MIN_TOKENS", "2")
     ),
     # use aiter linear op if aiter ops are enabled
     # The following list of related ops
