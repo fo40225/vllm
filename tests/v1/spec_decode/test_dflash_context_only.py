@@ -79,7 +79,8 @@ def _setup(
     spec = object.__new__(cls)
     spec.num_speculative_steps = NUM_STEPS
     spec.num_query_per_req = NUM_STEPS + 1
-    spec.max_model_len = 4096
+    # max_model_len is a read-only property over the model config since v0.33.0.
+    spec.vllm_config = SimpleNamespace(model_config=SimpleNamespace(max_model_len=4096))
     spec.max_num_reqs = 8
     spec.max_num_tokens = MAX_TOKENS
     spec.dp_size = dp_size
