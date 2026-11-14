@@ -333,7 +333,7 @@ class UBatchRunner:
         # run on the comm stream (see UBatchContext.run_collective). That stream
         # has a high priority: a collective is a few CTAs that spin on their
         # peers, and they must get an SM as soon as a compute CTA retires.
-        self.overlap_collectives = self.parallel_config.data_parallel_size == 1
+        self.overlap_collectives = self.parallel_config.ubatch_overlap_tp_collectives
         self.comm_stream = torch.cuda.Stream(
             device=device, priority=-1 if self.overlap_collectives else 0
         )
@@ -579,12 +579,19 @@ def maybe_build_ubatch_runner(
     """Build the microbatch runner, or None when DBO is not in use.
 
     With more than one DP rank, the ranks agree on microbatching in the DP
-    handshake. With one, every rank of the tensor-parallel group sees the same batch
-    and decides alike, so there is nothing to agree on; the microbatches then
-    overlap the tensor-parallel collectives (eager batches only).
+    handshake. Without data parallelism it is only available to a model that asks
+    for it (``ubatch_overlap_tp_collectives``): every rank of the tensor-parallel
+    group sees the same batch and decides alike, so there is nothing to agree on,
+    and the microbatches overlap the tensor-parallel collectives (eager batches
+    only).
     """
     parallel_config = vllm_config.parallel_config
     if not parallel_config.use_ubatching:
+        return None
+    if (
+        parallel_config.data_parallel_size <= 1
+        and not parallel_config.ubatch_overlap_tp_collectives
+    ):
         return None
 
     logger.info_once("Dual batch overlap is enabled.")

@@ -293,6 +293,7 @@ def dispatch_cg_and_sync_dp(
         if (
             allow_ubatching
             and parallel_config is not None
+            and parallel_config.ubatch_overlap_tp_collectives
             and batch_desc.cg_mode == CUDAGraphMode.NONE
             and check_ubatch_thresholds(
                 parallel_config, batch_desc.num_tokens, uniform_decode=uniform_decode

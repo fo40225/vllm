@@ -2177,11 +2177,13 @@ class VllmConfig:
                 f"cudagraph_mode={self.compilation_config.cudagraph_mode}"
             )
 
-        # Microbatches of a data-parallel-free launch only overlap the tensor-parallel
-        # collectives; there is no expert all-to-all for the backend check to guard.
+        self._verify_tp_collective_overlap()
+
+        # Microbatches that only overlap the tensor-parallel collectives have no
+        # expert all-to-all for the backend check to guard.
         if (
             self.parallel_config.use_ubatching
-            and self.parallel_config.data_parallel_size > 1
+            and not self.parallel_config.ubatch_overlap_tp_collectives
         ):
             a2a_backend = self.parallel_config.all2all_backend
             if current_platform.is_rocm():
@@ -3226,32 +3228,72 @@ class VllmConfig:
 
     @staticmethod
     def _mm_inputs_disabled(model_config: ModelConfig) -> bool:
-        """Whether every modality is capped at zero items per prompt, so that a
-        multimodal model only ever sees token ids."""
+        """Whether every modality of the model is capped at zero items per prompt,
+        so that a multimodal model only ever sees token ids.
+
+        A modality the user did not mention is not capped (999 per prompt), so the
+        modalities to look at are those the model supports, not the keys given.
+        """
         mm_config = model_config.multimodal_config
         if mm_config is None or mm_config.language_model_only:
             return True
-        limits = mm_config.limit_per_prompt
-        return bool(limits) and all(
-            mm_config.get_limit_per_prompt(modality) == 0 for modality in limits
-        )
+        try:
+            from vllm.multimodal import MULTIMODAL_REGISTRY
 
-    def _get_dbo_unsupported_features(self) -> list[str]:
+            info = MULTIMODAL_REGISTRY.get_processing_info(model_config)
+            modalities = set(info.supported_mm_limits)
+        except Exception:
+            # Unknown: any of the usual modalities may be live.
+            modalities = {"image", "video", "audio"}
+        modalities.update(mm_config.limit_per_prompt)
+        return all(mm_config.get_limit_per_prompt(m) == 0 for m in modalities)
+
+    def _verify_tp_collective_overlap(self) -> None:
+        """Drop the microbatching of tensor-parallel collectives where it cannot run.
+
+        A model's config hook turns it on (ParallelConfig.ubatch_overlap_tp_collectives)
+        before the rest of the configuration is resolved. It is a V2 model runner
+        feature: where that runner is not used (or cannot microbatch this launch,
+        e.g. after the CUDA graph mode or the runner was settled later), the launch
+        must run as if it had never been asked for, not fall back to another runner
+        because of it.
+        """
+        pc = self.parallel_config
+        if not pc.ubatch_overlap_tp_collectives:
+            return
+        unsupported = self._get_dbo_unsupported_features()
+        if unsupported:
+            reason = "the V2 model runner does not support " + ", ".join(unsupported)
+        elif not self.use_v2_model_runner:
+            reason = "the V2 model runner is not used"
+        else:
+            return
+        logger.info(
+            "Microbatching of the tensor-parallel collectives is turned off: %s.",
+            reason,
+        )
+        pc.ubatch_overlap_tp_collectives = False
+        pc.ubatch_size = 0
+
+    def _get_dbo_unsupported_features(
+        self, tp_collective_overlap: bool | None = None
+    ) -> list[str]:
         """Collect what the V2 model runner cannot combine with DBO.
 
         The V2 runner microbatches a plain decoder forward pass. Anything that
         slices or replays the batch differently (drafting, adapters, pipeline
         stages, context parallelism, encoders) is not handled yet.
+
+        ``tp_collective_overlap`` asks about microbatches that only overlap the
+        tensor-parallel collectives (default: whether the config says so).
         """
+        if tp_collective_overlap is None:
+            tp_collective_overlap = self.parallel_config.ubatch_overlap_tp_collectives
         # TODO: DBO with model runner V2 is under development.
         # It should be enabled with explicit VLLM_USE_V2_MODEL_RUNNER environ.
-        # Remove it when stable. Without data parallelism (the microbatches only
-        # overlap the tensor-parallel collectives of eager batches) the runner
-        # needs no environ.
-        if (
-            envs.VLLM_USE_V2_MODEL_RUNNER is None
-            and self.parallel_config.data_parallel_size > 1
-        ):
+        # Remove it when stable. Microbatches that only overlap the tensor-parallel
+        # collectives of eager batches are a model's own opt-in and need no environ.
+        if envs.VLLM_USE_V2_MODEL_RUNNER is None and not tp_collective_overlap:
             return ["dual batch overlap"]
 
         unsupported: list[str] = []

@@ -103,6 +103,16 @@ class MuseSparkConfig(VerifyAndUpdateConfig):
             return "it does not support LoRA"
         if envs.VLLM_USE_V2_MODEL_RUNNER is False:
             return "it needs the V2 model runner"
+        if envs.VLLM_BATCH_INVARIANT:
+            # The rounding of a request would depend on where its step is split.
+            return "batch-invariant mode is on"
+        # The V2 runner must be able to microbatch this launch: otherwise the launch
+        # would end up on the V1 runner (or run unsupported inputs) because of this.
+        unsupported = vllm_config._get_dbo_unsupported_features(
+            tp_collective_overlap=True
+        )
+        if unsupported:
+            return "the V2 model runner does not support " + ", ".join(unsupported)
         return None
 
     @staticmethod
@@ -139,6 +149,7 @@ class MuseSparkConfig(VerifyAndUpdateConfig):
             max(envs.VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_MIN_TOKENS, 1024) + 1
         )
         pc.ubatch_size = num_ubatches
+        pc.ubatch_overlap_tp_collectives = True
         pc.dbo_prefill_token_threshold = max(
             envs.VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_MIN_TOKENS, floor
         )

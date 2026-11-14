@@ -271,6 +271,14 @@ class ParallelConfig:
     threshold, microbatching will be used. Otherwise, the request will be
     processed in a single batch."""
 
+    ubatch_overlap_tp_collectives: bool = False
+    """Microbatch the eager batches of a launch without data parallelism so that the
+    tensor-parallel collectives of one microbatch overlap the compute of another
+    (the V2 model runner only; the microbatches hand off at the collectives, there
+    is no expert all-to-all). Not a command-line option: a model's config hook sets
+    it together with ``ubatch_size`` and the thresholds, and the config drops it
+    again when the V2 runner cannot run it."""
+
     disable_nccl_for_dp_synchronization: bool | None = None
     """Forces the dp synchronization logic in vllm/v1/worker/dp_utils.py 
     to use Gloo instead of NCCL for its all reduce.

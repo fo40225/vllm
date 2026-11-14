@@ -1016,6 +1016,7 @@ def test_microbatched_graph_needs_every_rank_to_reach_the_split():
 def _tp_only_parallel_config() -> ParallelConfig:
     return ParallelConfig(
         ubatch_size=2,
+        ubatch_overlap_tp_collectives=True,
         dbo_decode_token_threshold=2**31 - 1,
         dbo_prefill_token_threshold=PREFILL_THRESHOLD,
     )
@@ -1113,11 +1114,17 @@ def test_tp_only_launch_needs_no_runner_environ(monkeypatch):
     )
     assert VllmConfig._get_dbo_unsupported_features(support) == []
 
-    # Data parallel DBO is still gated behind the explicit environ.
+    # Data parallel DBO is still gated behind the explicit environ, and so is
+    # --enable-dbo at DP=1: only a model that asks for the collective overlap
+    # (ubatch_overlap_tp_collectives) runs microbatches without data parallelism.
     dp_support = _dbo_support_stub(
         ParallelConfig(enable_dbo=True, data_parallel_size=2), None
     )
     assert VllmConfig._get_dbo_unsupported_features(dp_support) == [
+        "dual batch overlap"
+    ]
+    plain_support = _dbo_support_stub(ParallelConfig(enable_dbo=True), None)
+    assert VllmConfig._get_dbo_unsupported_features(plain_support) == [
         "dual batch overlap"
     ]
 
