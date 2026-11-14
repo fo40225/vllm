@@ -89,6 +89,7 @@ from vllm.models.muse_spark.nvidia.sm120_nvfp4_moe import (
     swap_gate_up_halves_,
 )
 from vllm.platforms import current_platform
+from vllm.utils.torch_utils import _USE_LAYERNAME
 
 logger = init_logger(__name__)
 
@@ -1061,6 +1062,61 @@ class MuseMoERunner(MoERunner):
                 e_score_correction_bias=layer.e_score_correction_bias,
                 routed_scaling_factor=layer.routed_scaling_factor,
             )
+        return self._maybe_reduce_final_output(
+            output, None, self._fused_output_is_reduced
+        )
+
+    @property
+    def supports_routed_forward(self) -> bool:
+        """Whether ``forward_routed`` is ``forward`` for routing done by the caller.
+
+        That holds when the runner's only steps around the modular experts are
+        the routing and the late all-reduce. It also needs the custom op to find
+        its layer by name: otherwise it counts the layers of a pass, and a layer
+        that skips the op would shift the count.
+        """
+        return (
+            _USE_LAYERNAME
+            and not self.is_monolithic
+            and self.gate is None
+            and self._shared_experts is None
+            and self.routed_input_transform is None
+            and self.routed_output_transform is None
+            and self.routed_scaling_factor == 1.0
+            and not self.do_naive_dispatch_combine
+            and self.moe_config.pcp_size == 1
+            and not self._quant_method.has_unpadded_output
+        )
+
+    def select_experts(
+        self, hidden_states: torch.Tensor, router_logits: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The ``(topk_weights, topk_ids)`` that ``forward`` would route to."""
+        return self.router.select_experts(
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+            topk_indices_dtype=self._quant_method.topk_indices_dtype,
+        )
+
+    def forward_routed(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """``forward`` on the output of ``select_experts``, which may have run on
+        another stream."""
+        assert self.supports_routed_forward
+        assert (
+            hidden_states.shape[-1] == self.moe_config.hidden_dim
+            or self._quant_method.skip_forward_padding
+        ), "forward_routed does not pad the expert input"
+        self.routed_experts._ensure_moe_quant_config_init()
+        with self._sequence_parallel_context():
+            output = self.routed_experts.forward_modular(
+                x=hidden_states, topk_weights=topk_weights, topk_ids=topk_ids
+            )
+        assert isinstance(output, torch.Tensor)
         return self._maybe_reduce_final_output(
             output, None, self._fused_output_is_reduced
         )

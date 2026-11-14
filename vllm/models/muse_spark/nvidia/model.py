@@ -742,7 +742,13 @@ class MuseSpark1xMoE(nn.Module):
 
         def route() -> tuple[torch.Tensor, torch.Tensor]:
             logits, _ = self.router(router_input)
-            return self.moe_router._compute_routing(hidden_states, logits, torch.int32)
+            if self.use_mega_moe:
+                return self.moe_router._compute_routing(
+                    hidden_states, logits, torch.int32
+                )
+            return cast(MuseMoERunner, self.experts).select_experts(
+                hidden_states, logits
+            )
 
         if self.pooler is None:
             weights, ids = route()
@@ -828,6 +834,30 @@ class MuseSpark1xMoE(nn.Module):
             pool_and_quantize, route, *self._router_events, self._router_aux_stream
         )
         return self.experts.forward_prepared(pooled, buffer)
+
+    def _routes_on_aux_stream(self, num_tokens: int) -> bool:
+        """Whether the experts take routing finished beside the pooler.
+
+        The router GEMM and the top-k then run on the aux stream while the
+        pooler, its all-gather and the norm run on the main one, and the experts
+        start with both ready (``_prepared_nvfp4_forward`` does the same for
+        experts that take prepared inputs).
+        """
+        if not (
+            self.aux_stream_routing
+            and not self.use_mega_moe
+            and not self.use_sequence_parallel_moe
+            and self.router_overlaps_pooler(num_tokens)
+            and isinstance(self.experts, MuseMoERunner)
+            and self.experts.supports_routed_forward
+        ):
+            return False
+        logger.info_once(
+            "MuseSpark MoE: the router GEMM and top-k run on the aux stream beside "
+            "the pooler for up to %d tokens.",
+            _ROUTER_MULTI_STREAM_TOKEN_THRESHOLD,
+        )
+        return True
 
     def _prepares_nvfp4_inputs(self, num_tokens: int) -> bool:
         return (
@@ -955,6 +985,13 @@ class MuseSpark1xMoE(nn.Module):
                 hidden_states, router_input
             )
             experts_out = self.experts(hidden_states, topk_weights, topk_ids)
+        elif self._routes_on_aux_stream(num_tokens):
+            hidden_states, topk_weights, topk_ids = self._route_topk_and_pool(
+                hidden_states, router_input
+            )
+            experts_out = cast(MuseMoERunner, self.experts).forward_routed(
+                hidden_states, topk_weights, topk_ids
+            )
         else:
             router_logits, hidden_states = self._route_and_pool(
                 hidden_states, router_input

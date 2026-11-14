@@ -22,7 +22,8 @@ from tests.kernels.moe.muse_spark_utils import (
     run_moe,
 )
 from vllm import _custom_ops as ops
-from vllm.config import CUDAGraphMode
+from vllm.config import CUDAGraphMode, set_current_vllm_config
+from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
@@ -51,6 +52,7 @@ from vllm.models.muse_spark.nvidia.sm120_nvfp4_moe import (
     swap_gate_up_halves_,
 )
 from vllm.platforms import current_platform
+from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 
 if not current_platform.is_device_capability_family(120):
     pytest.skip("Requires an SM120 GPU", allow_module_level=True)
@@ -776,6 +778,93 @@ def test_sm120_layer_matches_the_references(
     )
     assert engine_calls.count("b12x") == int(uses_b12x_in_graphs)
     assert engine_calls[0] == "cutlass"
+
+
+def _routed_sm120_runner(moe_backend: str, top_k: int = 4):
+    problem = _Problem()
+    expert_bias = torch.linspace(-0.5, 0.5, E, dtype=torch.float32, device="cuda")
+    _, runner, vllm_config = make_runner(
+        _make_norm(),
+        expert_bias,
+        problem.checkpoint(),
+        nvfp4_quant_config(),
+        hidden_size=K,
+        intermediate_size=N,
+        top_k=top_k,
+        moe_backend=moe_backend,
+    )
+    assert runner.supports_routed_forward
+    return runner, vllm_config
+
+
+def _random_batch(num_tokens: int, seed: int):
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    x = torch.randn(num_tokens, K, device="cuda", generator=g).to(torch.bfloat16)
+    logits = torch.randn(num_tokens, E, dtype=torch.float32, device="cuda", generator=g)
+    return x, logits
+
+
+@pytest.mark.parametrize("moe_backend", ["auto", "cutlass"])
+@pytest.mark.parametrize("num_tokens", [1, 3, 16, 37])
+@pytest.mark.parametrize("top_k", [4, 8])
+@torch.inference_mode()
+def test_sm120_forward_routed_is_forward(
+    dist_init, workspace_init, moe_backend, num_tokens, top_k
+) -> None:
+    """Routing finished by the caller gives the bits of the runner's own."""
+    runner, vllm_config = _routed_sm120_runner(moe_backend, top_k)
+    x, logits = _random_batch(num_tokens, seed=num_tokens)
+    expected = run_moe(runner, vllm_config, x, logits)
+
+    with set_current_vllm_config(vllm_config), set_forward_context(None, vllm_config):
+        weights, ids = runner.select_experts(x, logits)
+        out = runner.forward_routed(x, weights, ids)
+
+    assert out.dtype == expected.dtype and out.shape == expected.shape
+    assert torch.equal(out, expected)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 3, 16])
+@torch.inference_mode()
+def test_sm120_aux_stream_routing_graph_replays_like_the_runner(
+    dist_init, workspace_init, num_tokens
+) -> None:
+    """The router branch on the aux stream, joined before the experts, in a graph."""
+    runner, vllm_config = _routed_sm120_runner("cutlass")
+    aux = torch.cuda.Stream()
+    events = (torch.cuda.Event(), torch.cuda.Event())
+    x, logits = _random_batch(num_tokens, seed=1)
+    next_x, next_logits = _random_batch(num_tokens, seed=2)
+
+    def capture(forward):
+        x_static, logits_static = x.clone(), logits.clone()
+        for _ in range(3):
+            forward(x_static, logits_static)
+        torch.accelerator.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out = forward(x_static, logits_static)
+        x_static.copy_(next_x)
+        logits_static.copy_(next_logits)
+        graph.replay()
+        torch.accelerator.synchronize()
+        return out.clone()
+
+    def on_aux_stream(x_in, logits_in):
+        _, (weights, ids) = maybe_execute_in_parallel(
+            lambda: x_in.clone(),
+            lambda: runner.select_experts(x_in, logits_in),
+            *events,
+            aux,
+        )
+        return runner.forward_routed(x_in, weights, ids)
+
+    with set_current_vllm_config(vllm_config), set_forward_context(None, vllm_config):
+        expected = capture(
+            lambda a, b: runner.forward(hidden_states=a, router_logits=b)
+        )
+        out = capture(on_aux_stream)
+    assert torch.equal(out, expected)
 
 
 @torch.inference_mode()
