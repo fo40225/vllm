@@ -17,8 +17,24 @@
 
 // Muse Spark shadow of FlashInfer v0.7.0.post1 csrc/xqa/mha.cu (md5
 // b6dca30aa3afe606723e75f3d97ae8ae).
-// The only changes are the "Active merge" block in front of the Q load of kernel_mha_impl and
-// the nbActiveSubSeq uses in its multi-block merge; mha_active_merge.patch has the diff.
+// The changes are the "Active merge" block in front of the Q load of kernel_mha_impl, the
+// nbActiveSubSeq uses in its multi-block merge, and (MUSE_XQA_SPEC_ONE_WAVE, off unless the module
+// is built with it) the split count of the spec-dec launch in launchMHAFlashInfer;
+// mha_active_merge.patch has the diff.
+
+// Spec-dec launch (SPEC_DEC) with more than one block of query rows per KV head (q_len 5..8 of a
+// head group of 8: 2 blocks of 32 rows). The stock launcher sizes the split count by
+// SMs / (batch x KV heads) and leaves the blocks out, so that the grid has twice as many CTAs as
+// SMs (1 CTA per SM: two waves, each paying the CTA start-up and the merge of twice as many
+// partial results as a one-wave grid). When MUSE_XQA_SPEC_ONE_WAVE is 1 the launcher sizes it by
+// SMs / (batch x KV heads x blocks) instead, one wave, where that grid fills at least
+// kOneWaveMinFillPercent of the SMs (the rounding down of the division leaves SMs idle at larger
+// batches, and a layer that streams many tiles per CTA then loses more than the wave saves), and
+// always for a layer that reads few tiles per sequence (a sliding window). The kernel is not
+// changed; the number of splits changes the order in which the partial results are merged.
+#ifndef MUSE_XQA_SPEC_ONE_WAVE
+#define MUSE_XQA_SPEC_ONE_WAVE 0
+#endif
 
 #include "cuda_hint.cuh"
 #include "defines.h"
@@ -3125,6 +3141,16 @@ static uint32_t configureKernel() {
 
 static uint32_t const hostSmemSize = configureKernel();
 
+#if SPEC_DEC && MUSE_XQA_SPEC_ONE_WAVE
+// The one-wave split count of launchMHAFlashInfer is used for a layer that streams many tiles
+// per sequence only where the grid fills at least this share of the SMs (batch 1 to 5 of q_len
+// 5..8 on 188 SMs; the rounding down of SMs / CTAs leaves 11% idle at batch 6 and 15% at batch 8,
+// where the stock two waves are faster at 118k tokens), and for a layer that reads at most this
+// many tiles per sequence (a sliding window of 2048 tokens reads 9 to 10).
+constexpr uint32_t kOneWaveMinFillPercent = 90;
+constexpr uint32_t kOneWaveFewTiles = 16;
+#endif
+
 void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32_t slidingWinSize,
                          float qScale, float const* qScalePtr, OutputHead* output,
 #if LOW_PREC_OUTPUT
@@ -3147,15 +3173,39 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
                          uint64_t sf_stride_page, uint64_t sf_stride_token, uint64_t sf_stride_head,
 #endif
                          cudaStream_t stream) {
+#if SPEC_DEC
+  const uint32_t nbTokenBlocksPerGrp = divUp(qSeqLen * headGrpSize, rowsPerBlock);
+#endif
   uint32_t const nbSubSeqPerSeq = [&]() -> uint32_t {
     if (!allowMultiBlockMode) {
       return 1;
     }
-    return std::min<uint32_t>(std::max<uint32_t>(1U, multiProcessorCount / (batchSize * nbKHeads)),
-                              divUp(maxSeqLen, ctaTile.x));
+    uint32_t nbSubSeq = std::max<uint32_t>(1U, multiProcessorCount / (batchSize * nbKHeads));
+#if SPEC_DEC && MUSE_XQA_SPEC_ONE_WAVE
+    if (nbTokenBlocksPerGrp > 1) {
+      // The division above leaves the token blocks out: the grid has nbTokenBlocksPerGrp x as
+      // many CTAs as SMs. Divide by them too for one wave.
+      uint32_t const nbCtasPerSubSeq = batchSize * nbKHeads * nbTokenBlocksPerGrp;
+      uint32_t const oneWave = std::max<uint32_t>(1U, multiProcessorCount / nbCtasPerSubSeq);
+#if SLIDING_WINDOW
+      // A sliding window layer reads at most the tiles of the window and one more per sequence,
+      // so a CTA of the one-wave grid reads few tiles whatever the split count is: what the
+      // layer saves is the second wave, and an SM that is idle costs little.
+      bool const fewTilesPerSeq =
+          divUp(uint64_t(slidingWinSize) + qSeqLen, uint64_t(ctaTile.x)) + 1 <= kOneWaveFewTiles;
+#else
+      constexpr bool fewTilesPerSeq = false;
+#endif
+      bool const fillsSms = uint64_t(oneWave) * nbCtasPerSubSeq * 100 >=
+                            uint64_t(multiProcessorCount) * kOneWaveMinFillPercent;
+      if (fewTilesPerSeq || fillsSms) {
+        nbSubSeq = oneWave;
+      }
+    }
+#endif
+    return std::min<uint32_t>(nbSubSeq, divUp(maxSeqLen, ctaTile.x));
   }();
 #if SPEC_DEC
-  const uint32_t nbTokenBlocksPerGrp = divUp(qSeqLen * headGrpSize, rowsPerBlock);
   dim3 const dimGrid{nbSubSeqPerSeq, nbKHeads * nbTokenBlocksPerGrp, batchSize};
 #else
   dim3 const dimGrid{nbSubSeqPerSeq, nbKHeads, batchSize};

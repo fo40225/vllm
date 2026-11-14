@@ -165,6 +165,7 @@ if TYPE_CHECKING:
     VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_MIN_TOKENS: int = 2048
     VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_UBATCHES: int = 2
     VLLM_MUSE_SPARK_SM120_XQA_ACTIVE_MERGE: bool = True
+    VLLM_MUSE_SPARK_SM120_XQA_SPEC_ONE_WAVE: bool = False
     VLLM_MUSE_SPARK_SM120_TOPK_LOGITS: bool = True
     VLLM_MUSE_SPARK_SM120_TOPK_LOGITS_K: int = 64
     VLLM_MUSE_SPARK_SM120_TOPK_LOGITS_MIN_TOKENS: int = 2
@@ -1654,6 +1655,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # FlashInfer is not 0.7.0.post1. Read once, when the model is constructed.
     "VLLM_MUSE_SPARK_SM120_XQA_ACTIVE_MERGE": lambda: bool(
         int(os.getenv("VLLM_MUSE_SPARK_SM120_XQA_ACTIVE_MERGE", "1"))
+    ),
+    # Muse Spark on SM120: size the XQA spec-dec verify launch of 5 to 8 query tokens per
+    # request (2 blocks of 32 query rows per KV head at 8 query heads per KV head) to one
+    # wave of CTAs. FlashInfer's launcher divides the SMs by batch x KV heads and leaves
+    # the 2 blocks out, so it launches twice as many CTAs as SMs (376 at a batch of 1, and
+    # the kernel runs 1 CTA per SM): two waves. On, the shadow launcher divides by batch x
+    # KV heads x blocks too (47 splits instead of 94 at a batch of 1) where that grid
+    # fills at least 90% of the SMs (batch 1 to 5), and for the sliding-window layers at
+    # every batch; the other launches keep the stock split count (a global layer at 118k
+    # tokens and batch 8 is 14% slower on the 85% grid). XQA of a global layer at batch 1
+    # takes 54 -> 36 us at 118k, 40 -> 27 us at 64k, 32 -> 21 us at 32k and 23 -> 19 us
+    # at 16k (16 layers per step), see benchmarks/kernels/
+    # benchmark_muse_spark_xqa_wave_fit.py. The number of splits sets the order in which
+    # the partial results are merged, so the output is rounding-level different from the
+    # stock kernel's (deterministic, identical on every tensor-parallel rank, no bias); a
+    # sequence with no more tiles than the new split count is bitwise unchanged. Needs
+    # VLLM_MUSE_SPARK_SM120_XQA_ACTIVE_MERGE=1 (the shadow kernel) and builds its own
+    # module per spec-dec shape at the first XQA call. Read once, when the model is
+    # constructed.
+    "VLLM_MUSE_SPARK_SM120_XQA_SPEC_ONE_WAVE": lambda: bool(
+        int(os.getenv("VLLM_MUSE_SPARK_SM120_XQA_SPEC_ONE_WAVE", "0"))
     ),
     # Muse Spark on SM120: sample a decode batch from the top-K logits of every tensor-
     # parallel rank instead of gathering the whole vocabulary. Every rank keeps the K

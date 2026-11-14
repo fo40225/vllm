@@ -3170,13 +3170,19 @@ class MuseSpark1xModel(LlamaModel):
         the stock output (see ``flashinfer_shadow/xqa_active_merge.py``). It has to
         be installed before the first XQA call (the modules are built lazily), and the
         stock kernel runs when the shadow cannot be built.
+
+        ``VLLM_MUSE_SPARK_SM120_XQA_SPEC_ONE_WAVE`` additionally sizes the spec-dec
+        verify launch of 5 to 8 query tokens to one wave of CTAs (rounding-level, the
+        partial results merge in another order).
         """
         try:
             from vllm.models.muse_spark.nvidia.flashinfer_shadow import (
                 xqa_active_merge,
             )
 
-            xqa_active_merge.install()
+            xqa_active_merge.install(
+                one_wave=envs.VLLM_MUSE_SPARK_SM120_XQA_SPEC_ONE_WAVE
+            )
         except Exception as e:
             logger.warning_once(
                 "The XQA active merge is off: %s: %s. The stock XQA kernel runs.",

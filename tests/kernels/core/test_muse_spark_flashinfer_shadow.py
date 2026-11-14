@@ -36,6 +36,7 @@ class FakeSpec:
     build_dir: Path
     fail: BaseException | None = None
     built: int = 0
+    extra_cuda_cflags: list | None = None
 
     def build_and_load(self):
         self.built += 1
@@ -125,6 +126,26 @@ def test_derive_spec_renames_and_replaces_only_the_shadowed_source(
     unrelated = FakeSpec("other", [other_src], None, tmp_path)
     replace = {stock_src: shadow_src}
     assert shadow.derive_spec(unrelated, tag="t", replace=replace) is None
+
+
+def test_derive_spec_adds_compile_flags_after_the_stock_ones(monkeypatch, tmp_path):
+    _workspace(monkeypatch, tmp_path)
+    stock_src = Path("/stock/csrc/xqa/mha.cu")
+    shadow_src = tmp_path / "mha.cu"
+    shadow_src.write_text("// shadow\n")
+    replace = {stock_src: shadow_src}
+    stock = FakeSpec("xqa_a", [stock_src], None, tmp_path, extra_cuda_cflags=["-DA=1"])
+    plain = shadow.derive_spec(stock, tag="t", replace=replace)
+    assert plain.extra_cuda_cflags == ["-DA=1"]
+    flagged = shadow.derive_spec(stock, tag="u", replace=replace, cuda_cflags=["-DB=2"])
+    assert flagged.extra_cuda_cflags == ["-DA=1", "-DB=2"]
+    assert stock.extra_cuda_cflags == ["-DA=1"]
+    # The flags are not in the digest of the sources: the tag keeps the names apart.
+    assert flagged.name != plain.name
+    # A spec without flags of its own.
+    bare = FakeSpec("xqa_b", [stock_src], None, tmp_path)
+    flagged = shadow.derive_spec(bare, tag="u", replace=replace, cuda_cflags=["-DB=2"])
+    assert flagged.extra_cuda_cflags == ["-DB=2"]
 
 
 def test_materialize_is_content_addressed_and_idempotent(monkeypatch, tmp_path):

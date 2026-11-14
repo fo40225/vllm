@@ -145,23 +145,31 @@ def derive_spec(
     tag: str,
     replace: Mapping[Path, Path],
     include_dirs: Sequence[Path] = (),
+    cuda_cflags: Sequence[str] = (),
 ) -> Any | None:
     """The shadow of ``stock_spec`` (a ``JitSpecNvcc``) with sources replaced.
 
     ``replace`` maps a stock source path to its shadow (compiled from a copy in the
     FlashInfer workspace, see ``materialize``); None when the spec compiles none of
     them. ``include_dirs`` go in front of the include directories of the stock spec.
+    ``cuda_cflags`` are added to the compile flags of the stock spec: they are not in
+    the digest of the sources, so a build that uses them needs a ``tag`` of its own.
     """
     sources = [Path(s) for s in stock_spec.sources]
     shadows = {s: replace[s] for s in sources if s in replace}
     if not shadows:
         return None
     digest = source_digest(list(shadows.values()))
+    changes: dict[str, Any] = {}
+    if cuda_cflags:
+        stock_flags = stock_spec.extra_cuda_cflags or ()
+        changes["extra_cuda_cflags"] = [*stock_flags, *cuda_cflags]
     return dataclasses.replace(
         stock_spec,
         name=f"{stock_spec.name}_muse_{tag}_{digest}",
         sources=[materialize(shadows[s]) if s in shadows else s for s in sources],
         extra_include_dirs=[*include_dirs, *(stock_spec.extra_include_dirs or ())],
+        **changes,
     )
 
 
