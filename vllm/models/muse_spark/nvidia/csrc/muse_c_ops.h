@@ -22,6 +22,36 @@ void mul_and_silu_scaled_fp4_experts_quant(
     at::Tensor const& input_offset_by_experts,
     at::Tensor const& output_scale_offset_by_experts);
 
+// SiLU * up + per-expert NVFP4 quantization of the exact GEMM1's output, which
+// holds the two halves as stacked matrices: input [2 * m_topk, k], the first
+// half in rows [0, m_topk) and the second in rows [m_topk, 2 * m_topk). The
+// first half is the gate if gate_first, else the up half. Quantizes
+// up * silu(gate) to output [m_topk, k / 2], bit-identical to the stock
+// silu_and_mul_scaled_fp4_experts_quant on the same values laid out
+// [gate | up].
+void silu_and_mul_split_scaled_fp4_experts_quant(
+    at::Tensor& output, at::Tensor& output_scale, at::Tensor const& input,
+    at::Tensor const& input_global_scale,
+    at::Tensor const& input_offset_by_experts,
+    at::Tensor const& output_scale_offset_by_experts, bool gate_first);
+
+// Tables of the exact GEMM1 (muse_nvfp4_split_gemm1.cu): the grouped GEMM
+// reads w13 [E, 2N, K / 2] as [2E, N, K / 2], group 2e + h being half h of
+// expert e, on two copies of the activation rows. From the tables of the E
+// experts (expert_offsets and blockscale_offsets [E + 1], problem_sizes [E, 3]
+// = (M, 2N, K), as get_cutlass_moe_mm_data makes them) and the activations
+// a_fp4 [R, K / 2], it writes expert_offsets_x2 and blockscale_offsets_x2
+// [2E], problem_sizes_x2 [2E, 3] = (M, N, K), and the rows that experts own,
+// twice, to a_fp4_x2 [2R, K / 2] (copy h at rows [h * R, (h + 1) * R)); the
+// other rows are untouched.
+void split_gemm1_prepare(at::Tensor const& a_fp4,
+                         at::Tensor const& expert_offsets,
+                         at::Tensor const& blockscale_offsets,
+                         at::Tensor const& problem_sizes, at::Tensor& a_fp4_x2,
+                         at::Tensor& expert_offsets_x2,
+                         at::Tensor& blockscale_offsets_x2,
+                         at::Tensor& problem_sizes_x2);
+
 // NVFP4 (W4A4) MoE experts for a few tokens on SM120 (muse_nvfp4_decode_moe.cu).
 // One persistent launch: routing + activation quantization + GEMM1 + SiLU * up +
 // NVFP4 requantization into hq, then GEMM2 into route-major unweighted bf16

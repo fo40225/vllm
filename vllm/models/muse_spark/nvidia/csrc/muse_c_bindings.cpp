@@ -17,6 +17,18 @@ TORCH_LIBRARY(_muse_C, m) {
       "Tensor input_offset_by_experts, "
       "Tensor output_scale_offset_by_experts) -> ()");
 
+  // Exact GEMM1 of the CUTLASS grouped-GEMM path (separate gate / up alphas).
+  m.def(
+      "silu_and_mul_split_scaled_fp4_experts_quant(Tensor! output, Tensor! "
+      "output_scale, Tensor input, Tensor input_global_scale, "
+      "Tensor input_offset_by_experts, "
+      "Tensor output_scale_offset_by_experts, bool gate_first) -> ()");
+  m.def(
+      "split_gemm1_prepare(Tensor a_fp4, Tensor expert_offsets, "
+      "Tensor blockscale_offsets, Tensor problem_sizes, Tensor! a_fp4_x2, "
+      "Tensor! expert_offsets_x2, Tensor! blockscale_offsets_x2, "
+      "Tensor! problem_sizes_x2) -> ()");
+
   // NVFP4 (W4A4) MoE experts for a few tokens (decode), see muse_c_ops.h.
   m.def(
       "nvfp4_decode_moe(Tensor hidden, Tensor topk_ids, Tensor? expert_map, "
@@ -47,6 +59,9 @@ TORCH_LIBRARY(_muse_C, m) {
 TORCH_LIBRARY_IMPL(_muse_C, CUDA, m) {
   m.impl("mul_and_silu_scaled_fp4_experts_quant",
          &muse_spark::mul_and_silu_scaled_fp4_experts_quant);
+  m.impl("silu_and_mul_split_scaled_fp4_experts_quant",
+         &muse_spark::silu_and_mul_split_scaled_fp4_experts_quant);
+  m.impl("split_gemm1_prepare", &muse_spark::split_gemm1_prepare);
   m.impl("nvfp4_decode_moe", &muse_spark::nvfp4_decode_moe);
   m.impl("nvfp4_decode_act_quant", &muse_spark::nvfp4_decode_act_quant);
   m.impl("muse_spark_mul_tanh_soft_cap",

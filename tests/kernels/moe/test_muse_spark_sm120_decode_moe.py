@@ -373,16 +373,19 @@ def test_activation_quant_is_byte_identical_to_the_stock_op(t: int) -> None:
 
 
 # ------------------------------------------------------------------------------
-# Stages against the CUTLASS composition (the fold is the identity at s3 == s1)
+# Stages against the CUTLASS composition: with the exact GEMM1 (the gate and up
+# halves as groups of their own), whatever the scales; with the fold of s3 / s1
+# into the intermediate scale only where it is the identity (s3 == s1)
 # ------------------------------------------------------------------------------
+@pytest.mark.parametrize("exact", [True, False], ids=["exact", "folded"])
 @pytest.mark.parametrize("up_first", [False, True])
 @pytest.mark.parametrize("t", [1, 4, 8])
 @torch.inference_mode()
 def test_stages_match_the_cutlass_composition(
-    layer: _Layer, t: int, up_first: bool
+    layer: _Layer, t: int, up_first: bool, exact: bool
 ) -> None:
-    if layer.diff_s:
-        pytest.skip("the CUTLASS composition folds s3 / s1 into the intermediate scale")
+    if layer.diff_s and not exact:
+        pytest.skip("the fold rounds the up half to bf16 in the gate's scale")
     u, ids, _ = _routing(t, 3)
     engine = _Engine(layer, up_first)
     rows, perm = engine.run(u, ids)
@@ -403,13 +406,32 @@ def test_stages_match_the_cutlass_composition(
     aq, asf = ops.scaled_fp4_experts_quant(
         ops.shuffle_rows(u, a_map), a_gs, eo, bo, TOP_K
     )
-    c1 = torch.empty(t * TOP_K, 2 * H, dtype=torch.bfloat16, device="cuda")
-    g1 = (layer.a13 * layer.s1).float().contiguous()
-    ops.cutlass_fp4_moe_mm(
-        c1, aq, layer.w13, asf, layer.sf13, g1, ps1, eo[:-1], bo[:-1]
-    )
     a2_gs = torch.full((e,), float(1 / layer.a2), device="cuda")
-    iq, isf = ops.silu_and_mul_scaled_fp4_experts_quant(c1, a2_gs, eo, bo, TOP_K)
+    if exact:
+        aq2, eo2, bo2, ps = muse_c.split_gemm1_prepare(aq, eo, bo, ps1)
+        alphas = torch.stack((layer.a13 * layer.s1, layer.a13 * layer.s3), 1)
+        c1 = torch.empty(2 * t * TOP_K, H, dtype=torch.bfloat16, device="cuda")
+        ops.cutlass_fp4_moe_mm(
+            c1,
+            aq2,
+            layer.w13.view(2 * e, H, H // 2),
+            asf,
+            layer.sf13.view(2 * e, H, H // 16),
+            alphas.flatten().float().contiguous(),
+            ps,
+            eo2,
+            bo2,
+        )
+        iq, isf = muse_c.silu_and_mul_split_scaled_fp4_experts_quant(
+            c1, a2_gs, eo, bo, TOP_K, True
+        )
+    else:
+        c1 = torch.empty(t * TOP_K, 2 * H, dtype=torch.bfloat16, device="cuda")
+        g1 = (layer.a13 * layer.s1).float().contiguous()
+        ops.cutlass_fp4_moe_mm(
+            c1, aq, layer.w13, asf, layer.sf13, g1, ps1, eo[:-1], bo[:-1]
+        )
+        iq, isf = ops.silu_and_mul_scaled_fp4_experts_quant(c1, a2_gs, eo, bo, TOP_K)
     c3 = torch.empty(t * TOP_K, H, dtype=torch.bfloat16, device="cuda")
     g2 = (layer.a2 * layer.s2).float().contiguous()
     ops.cutlass_fp4_moe_mm(c3, iq, layer.w2, isf, layer.sf2, g2, ps2, eo[:-1], bo[:-1])

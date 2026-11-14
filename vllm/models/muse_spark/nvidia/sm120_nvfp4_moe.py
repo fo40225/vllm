@@ -11,10 +11,14 @@ The experts stop after GEMM2 and hand the unweighted rows to the post-GEMM2 hook
 (the post-expert norm), which also does the weighted top-k sum.
 
 MuseSpark checkpoints carry separate global scales for the gate (w1) and up
-(w3) halves of ``w13``, while the grouped GEMM takes one alpha per expert. The
-up-side gain is folded into the intermediate quantization scale instead (see
-``fold_sm120_nvfp4_scales``), which yields the same FP4 codes as two alphas. The
-muse kernel keeps the two alphas apart and needs no fold.
+(w3) halves of ``w13``, while the grouped GEMM takes one alpha per group. The
+muse kernel keeps the two alphas apart. The CUTLASS path does too where the
+``_muse_C`` extension is available (``VLLM_MUSE_SPARK_SM120_EXACT_GEMM1``): each
+half of an expert is a group of GEMM1 of its own, so both are rounded to bf16 in
+their own scale, as the muse kernel and the exact fake-quant definition do. The
+stock-ops fallback folds the up-side gain into the intermediate quantization
+scale instead (see ``fold_sm120_nvfp4_scales``), which yields the same FP4 codes
+as two alphas up to where the bf16 roundings of the up half land (~3% rel L2).
 
 The checkpoint's ``w13`` rows are ``[gate; up]``, and every layer keeps that
 order (and the stock SiLU * up quantization kernel in its CUTLASS path) except
@@ -85,6 +89,8 @@ logger = init_logger(__name__)
 _SHAPE_ALIGNMENT = 128
 # Bounds the temporary copy of one half while the gate / up halves are swapped.
 _SWAP_CHUNK_BYTES = 32 << 20
+# The grouped GEMM sets up its groups with one thread block of one thread each.
+_MAX_GEMM_GROUPS = 1024
 
 
 class Sm120NvFp4Scales(NamedTuple):
@@ -122,6 +128,36 @@ def decode_kernel_params(scales: Sm120NvFp4Scales) -> tuple[torch.Tensor, torch.
     return prm, scales.gs.contiguous()
 
 
+class ExactGemm1Scales(NamedTuple):
+    """fp32 scales of the exact GEMM1 of the CUTLASS path (see
+    ``exact_gemm1_scales``)."""
+
+    alphas1: torch.Tensor  # [2E], the alpha of half h of expert e at 2 * e + h
+    a2_gscale: torch.Tensor  # [E], the global activation scale 1 / a2 of GEMM2
+
+
+def exact_gemm1_scales(
+    scales: Sm120NvFp4Scales, up_gate_layout: bool
+) -> ExactGemm1Scales:
+    """The scales of GEMM1 with the gate and up halves apart, for w13 stored as
+    the layer holds it (``[up; gate]`` if ``up_gate_layout``, else ``[gate; up]``).
+
+    Each half is a group of its own with its exact alpha (``a13 * s1`` for the
+    gate, ``a13 * s3`` for up), and the intermediate is quantized with ``1 / a2``
+    like the decode kernel does, so no ``s3 / s1`` is left to fold anywhere.
+    GEMM2 keeps the alpha ``a2 * s2`` of the fold.
+    """
+    first, second = (
+        (scales.alpha_u, scales.alpha_g)
+        if up_gate_layout
+        else (scales.alpha_g, scales.alpha_u)
+    )
+    return ExactGemm1Scales(
+        alphas1=torch.stack((first, second), dim=1).flatten().contiguous(),
+        a2_gscale=scales.gs[1].expand_as(scales.alpha2).contiguous(),
+    )
+
+
 def fold_sm120_nvfp4_scales(
     w13_weight_scale_2: torch.Tensor,
     w13_input_scale: torch.Tensor,
@@ -138,10 +174,11 @@ def fold_sm120_nvfp4_scales(
         a1_gscale = 1 / a13            g1_alphas = a13 * s1
         a2_gscale = (s3 / s1) / a2     g2_alphas = a2 * s2
 
-    The decode kernel needs no fold: it keeps the gate and up alphas apart
-    (``alpha_g = a13 * s1``, ``alpha_u = a13 * s3``, ``alpha2 = a2 * s2``) and
-    quantizes the intermediate with ``1 / a2``. ``g1_alphas`` alone cannot give
-    ``s3`` back, which is why this takes the raw ``w13_weight_scale_2``.
+    The decode kernel and the exact GEMM1 of the CUTLASS path need no fold: they
+    keep the gate and up alphas apart (``alpha_g = a13 * s1``, ``alpha_u = a13 *
+    s3``, ``alpha2 = a2 * s2``) and quantize the intermediate with ``1 / a2``
+    (see ``exact_gemm1_scales``). ``g1_alphas`` alone cannot give ``s3`` back,
+    which is why this takes the raw ``w13_weight_scale_2``.
     """
     s1 = w13_weight_scale_2[:, 0].float()
     s3 = w13_weight_scale_2[:, 1].float()
@@ -354,9 +391,10 @@ def _config_without_decode_engine(moe_backend: str) -> str | None:
 
     A decode engine and the CUTLASS grouped GEMMs round differently (b12x also is
     not bitwise deterministic; the muse kernel applies the gate and up global
-    scales separately where CUTLASS folds them, ~3% rel L2 apart on a real
-    checkpoint). With an engine, the output of a request would depend on the
-    number of other requests in its step, which batch-invariant mode forbids.
+    scales separately where the folded CUTLASS path does not, ~3% rel L2 apart on
+    a real checkpoint, though not where the CUTLASS GEMM1 is exact too). With an
+    engine, the output of a request would depend on the number of other requests
+    in its step, which batch-invariant mode forbids.
     """
     if moe_backend != "auto":
         return f"--moe-backend {moe_backend}"
@@ -431,6 +469,12 @@ class MuseSparkSm120NvFp4Experts(mk.FusedMoEExpertsModular):
         # checkpoint scales where the native weights are processed. The CUTLASS
         # and b12x paths use the folded quant config.
         self.decode_scales: Sm120NvFp4Scales | None = None
+        # Set by the owner: whether the CUTLASS path runs GEMM1 with the gate and
+        # up alphas apart (it needs ``decode_scales`` and the ``_muse_C``
+        # extension). The scales it reads are derived by
+        # ``process_weights_after_loading``.
+        self.exact_gemm1 = False
+        self.exact_scales: ExactGemm1Scales | None = None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         # The layer tensors seen here are not always the ones ``apply`` receives:
@@ -441,6 +485,12 @@ class MuseSparkSm120NvFp4Experts(mk.FusedMoEExpertsModular):
         # global scales are stale as well). The first forward pass prepares it.
         self.b12x = None
         self.muse = None
+        self.exact_scales = None
+        if self.exact_gemm1:
+            assert self.decode_scales is not None, "GEMM1 needs the exact scales"
+            self.exact_scales = exact_gemm1_scales(
+                self.decode_scales, self.up_gate_layout
+            )
 
     def _ensure_b12x(self, w1: torch.Tensor, w2: torch.Tensor, capturing: bool) -> None:
         """Keep the b12x engine on the tensors ``apply`` receives.
@@ -772,6 +822,67 @@ class MuseSparkSm120NvFp4Experts(mk.FusedMoEExpertsModular):
         rows = self.b12x.run(hidden_states.contiguous(), topk_ids, expert_map)
         return route_major_moe_output(rows, topk_weights, topk_ids, expert_map)
 
+    def _gemm1_exact(
+        self,
+        permuted_in: torch.Tensor,
+        w1: torch.Tensor,
+        expert_offsets: torch.Tensor,
+        blockscale_offsets: torch.Tensor,
+        problem_sizes: torch.Tensor,
+        workspace2: torch.Tensor,
+        top_k: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Quantizes the permuted activations, runs GEMM1 with the gate and up
+        halves apart, then quantizes SiLU * up.
+
+        The grouped GEMM takes one alpha per group, so every half of an expert is
+        a group of its own: ``w1`` [E, 2N, K / 2] and its swizzled block scales
+        are read as [2E, N, K / 2] (half h of expert e is group 2e + h), each with
+        its exact alpha. Both halves multiply the same rows, stored twice by
+        ``split_gemm1_prepare``; the halves of the output are two stacked
+        [R, N] matrices (rows [h * R, (h + 1) * R)). Every half is rounded to
+        bf16 in its own scale, like the muse kernel does, and the intermediate is
+        quantized with the true ``1 / a2``.
+        """
+        assert self.exact_scales is not None and self.w1_scale is not None
+        assert self.a1_gscale is not None
+        logger.info_once(
+            "MuseSpark SM120 MoE: the CUTLASS grouped GEMMs run GEMM1 with the gate "
+            "and up global scales apart (VLLM_MUSE_SPARK_SM120_EXACT_GEMM1=1)."
+        )
+        num_routes = permuted_in.size(0)
+        num_experts = w1.size(0)
+        intermediate = w1.size(1) // 2
+        a_fp4, a_blockscale = ops.scaled_fp4_experts_quant(
+            permuted_in, self.a1_gscale, expert_offsets, blockscale_offsets, top_k
+        )
+        # `permuted_in` is dead from here on.
+        a_x2, offsets, sf_offsets, sizes = muse_c.split_gemm1_prepare(
+            a_fp4, expert_offsets, blockscale_offsets, problem_sizes
+        )
+        del a_fp4
+        gemm1_out = _resize_cache(workspace2, (2 * num_routes, intermediate))
+        ops.cutlass_fp4_moe_mm(
+            gemm1_out,
+            a_x2,
+            w1.view(2 * num_experts, intermediate, -1),
+            a_blockscale,
+            self.w1_scale.view(2 * num_experts, intermediate, -1),
+            self.exact_scales.alphas1,
+            sizes,
+            offsets,
+            sf_offsets,
+        )
+        del a_x2, a_blockscale
+        return muse_c.silu_and_mul_split_scaled_fp4_experts_quant(
+            gemm1_out,
+            self.exact_scales.a2_gscale,
+            expert_offsets,
+            blockscale_offsets,
+            top_k,
+            gate_first=not self.up_gate_layout,
+        )
+
     def _apply_cutlass(
         self,
         hidden_states: torch.Tensor,
@@ -785,7 +896,8 @@ class MuseSparkSm120NvFp4Experts(mk.FusedMoEExpertsModular):
         """Both grouped GEMMs; returns the unweighted, un-normed GEMM2 rows.
 
         It reads the swizzled block scales and the folded scales from the quant
-        config; ``w1`` is stored as ``up_gate_layout`` says.
+        config, or, with ``exact_scales``, GEMM1 runs with the gate and up alphas
+        apart (see ``_gemm1_exact``); ``w1`` is stored as ``up_gate_layout`` says.
         """
         assert self.w1_scale is not None and self.w2_scale is not None
         assert self.g1_alphas is not None and self.g2_alphas is not None
@@ -827,34 +939,45 @@ class MuseSparkSm120NvFp4Experts(mk.FusedMoEExpertsModular):
 
         permuted_in = _resize_cache(workspace2, (num_routes, hidden))
         _shuffle_rows_into(hidden_states.contiguous(), a_map, permuted_in)
-        # NOTE: the op allocates a fixed-size scale buffer on every call; it has
-        # no preallocated variant in the Python wrapper.
-        a_fp4, a_blockscale = ops.scaled_fp4_experts_quant(
-            permuted_in, self.a1_gscale, expert_offsets, blockscale_offsets, top_k
-        )
-        # `permuted_in` is dead from here on.
-        gemm1_out = _resize_cache(workspace2, (num_routes, 2 * intermediate))
-        ops.cutlass_fp4_moe_mm(
-            gemm1_out,
-            a_fp4,
-            w1,
-            a_blockscale,
-            self.w1_scale,
-            self.g1_alphas,
-            problem_sizes1,
-            expert_offsets[:-1],
-            blockscale_offsets[:-1],
-        )
-        del a_fp4, a_blockscale
-        if self.up_gate_layout:
-            # GEMM1 yields [up; gate]: the fused kernel applies SiLU to the
-            # second half, like the stock op does to the first.
-            quantize_intermediate = muse_c.mul_and_silu_scaled_fp4_experts_quant
+        if self.exact_scales is not None and 2 * num_experts <= _MAX_GEMM_GROUPS:
+            h_fp4, h_blockscale = self._gemm1_exact(
+                permuted_in,
+                w1,
+                expert_offsets,
+                blockscale_offsets,
+                problem_sizes1,
+                workspace2,
+                top_k,
+            )
         else:
-            quantize_intermediate = ops.silu_and_mul_scaled_fp4_experts_quant
-        h_fp4, h_blockscale = quantize_intermediate(
-            gemm1_out, self.a2_gscale, expert_offsets, blockscale_offsets, top_k
-        )
+            # NOTE: the op allocates a fixed-size scale buffer on every call; it
+            # has no preallocated variant in the Python wrapper.
+            a_fp4, a_blockscale = ops.scaled_fp4_experts_quant(
+                permuted_in, self.a1_gscale, expert_offsets, blockscale_offsets, top_k
+            )
+            # `permuted_in` is dead from here on.
+            gemm1_out = _resize_cache(workspace2, (num_routes, 2 * intermediate))
+            ops.cutlass_fp4_moe_mm(
+                gemm1_out,
+                a_fp4,
+                w1,
+                a_blockscale,
+                self.w1_scale,
+                self.g1_alphas,
+                problem_sizes1,
+                expert_offsets[:-1],
+                blockscale_offsets[:-1],
+            )
+            del a_fp4, a_blockscale
+            if self.up_gate_layout:
+                # GEMM1 yields [up; gate]: the fused kernel applies SiLU to the
+                # second half, like the stock op does to the first.
+                quantize_intermediate = muse_c.mul_and_silu_scaled_fp4_experts_quant
+            else:
+                quantize_intermediate = ops.silu_and_mul_scaled_fp4_experts_quant
+            h_fp4, h_blockscale = quantize_intermediate(
+                gemm1_out, self.a2_gscale, expert_offsets, blockscale_offsets, top_k
+            )
         # `gemm1_out` is dead from here on.
         down = _resize_cache(workspace2, (num_routes, hidden))
         ops.cutlass_fp4_moe_mm(

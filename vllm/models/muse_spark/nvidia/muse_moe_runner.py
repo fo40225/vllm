@@ -10,6 +10,7 @@ from typing import Any, cast
 
 import torch
 
+import vllm.envs as envs
 from vllm.distributed import get_tp_group, tensor_model_parallel_all_reduce
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
@@ -683,6 +684,17 @@ class MuseSparkModelOptNvFp4FusedMoE(ModelOptNvFp4FusedMoE):
         self.decode_engine = select_decode_engine(moe_config.moe_backend, moe_config)
         self.use_b12x_decode = self.decode_engine == "b12x"
         self.use_muse_decode = self.decode_engine == "muse"
+        # Whether GEMM1 of the CUTLASS grouped GEMMs keeps the gate and up global
+        # scales apart. It needs the _muse_C extension, which is loaded with the
+        # weights; a layer that cannot load it demotes this for good.
+        self.exact_gemm1 = envs.VLLM_MUSE_SPARK_SM120_EXACT_GEMM1
+        if self.exact_gemm1 and (reason := muse_c.preflight()) is not None:
+            logger.info_once(
+                "MuseSpark SM120 MoE: the CUTLASS grouped GEMMs fold the gate and up "
+                "global scales (the _muse_C extension is not available: %s).",
+                reason,
+            )
+            self.exact_gemm1 = False
         logger.info_once(
             "MuseSpark NVFP4: native FP4 MoE on SM120 with %s.",
             {
@@ -771,18 +783,20 @@ class MuseSparkModelOptNvFp4FusedMoE(ModelOptNvFp4FusedMoE):
         # The packed weights are used as loaded, except that a layer which runs
         # the b12x engine reorders w13 to [up; gate] in place, before its block
         # scales are swizzled. A decode engine needs the _muse_C extension (for
-        # its kernel, or for the quantization kernel of the reordered layout), so
-        # it is loaded first: if it cannot be built, the layer keeps the
-        # checkpoint's order and the stock kernels. The muse engine takes the
-        # checkpoint's order as it is.
+        # its kernel, or for the quantization kernel of the reordered layout), and
+        # so does the exact GEMM1 of the CUTLASS path (for its tables and its
+        # SiLU * up quantization), so it is loaded first: if it cannot be built,
+        # the layer keeps the checkpoint's order and the stock kernels. The muse
+        # engine takes the checkpoint's order as it is.
         # A weight reload (layerwise reload, refit) runs this again on freshly
         # loaded tensors in the checkpoint's order, so swapping again is right.
         # The engine was chosen at construction and stays (it is only ever
         # demoted below, and a demotion is final), so the layout is the same on
         # every (re)load.
         engine = self.decode_engine
-        if engine != "cutlass" and not self._load_muse_c():
+        if (engine != "cutlass" or self.exact_gemm1) and not self._load_muse_c():
             engine = "cutlass"
+            self.exact_gemm1 = False
         self.decode_engine = engine
         self.use_b12x_decode = engine == "b12x"
         self.use_muse_decode = engine == "muse"
@@ -812,6 +826,7 @@ class MuseSparkModelOptNvFp4FusedMoE(ModelOptNvFp4FusedMoE):
         experts.up_gate_layout = up_gate_layout
         experts.use_b12x_decode = self.use_b12x_decode
         experts.use_muse_decode = self.use_muse_decode
+        experts.exact_gemm1 = self.exact_gemm1
         # The raw global scales again, for the exact gate / up / down alphas of
         # the decode kernel (the quant config only carries the folded ones). This
         # runs on every (re)load, so the scales never go stale.
@@ -833,7 +848,7 @@ class MuseSparkModelOptNvFp4FusedMoE(ModelOptNvFp4FusedMoE):
             logger.warning_once(
                 "MuseSpark SM120 MoE: the _muse_C extension could not be built "
                 "(%s: %s); the decode engines are off and the CUTLASS grouped "
-                "GEMMs run every batch.",
+                "GEMMs run every batch with the gate and up scales folded.",
                 type(e).__name__,
                 e,
             )

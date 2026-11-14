@@ -45,6 +45,7 @@ from vllm.models.muse_spark.nvidia.sm120_nvfp4_moe import (
     MuseSparkSm120NvFp4Experts,
     b12x_decode_engine_enabled,
     decode_kernel_params,
+    exact_gemm1_scales,
     fold_sm120_nvfp4_scales,
     make_sm120_nvfp4_quant_config,
     swap_gate_up_halves_,
@@ -70,6 +71,9 @@ HEADROOM_A2 = 1.2371
 STAGE_FAITHFUL_REL_L2 = 1e-2
 # ...and against bf16 activations, which only bounds the FP4 quantization error.
 BF16_ACTIVATION_REL_L2 = 0.25
+# The exact GEMM1 against the exact fake-quant definition: only the rounding of
+# the kernels' accumulation (tensor cores against an fp32 matmul) is left.
+EXACT_GEMM1_REL_L2 = 5e-3
 # The b12x kernel rounds the intermediate differently from the reference, so some
 # of its FP4 codes differ. A handful of routes average that out less, and the
 # rows before the norm are dominated by the largest of them.
@@ -155,16 +159,18 @@ def engine_calls(monkeypatch) -> list[str]:
 @pytest.fixture
 def quant_kernels(monkeypatch) -> list[str]:
     """The kernel that quantizes the intermediate of every CUTLASS ``apply``, in
-    order: ``stock`` for [gate; up] weights, ``muse`` for [up; gate]."""
+    order: with the folded GEMM1 ``stock`` for [gate; up] weights and ``muse`` for
+    [up; gate]; with the exact GEMM1 ``split`` for both."""
     seen: list[str] = []
     for label, owner, name in (
         ("stock", ops, "silu_and_mul_scaled_fp4_experts_quant"),
         ("muse", muse_c, "mul_and_silu_scaled_fp4_experts_quant"),
+        ("split", muse_c, "silu_and_mul_split_scaled_fp4_experts_quant"),
     ):
 
-        def spy(*args, _kernel=getattr(owner, name), _label=label):
+        def spy(*args, _kernel=getattr(owner, name), _label=label, **kwargs):
             seen.append(_label)
-            return _kernel(*args)
+            return _kernel(*args, **kwargs)
 
         monkeypatch.setattr(owner, name, spy)
     return seen
@@ -345,15 +351,18 @@ def _reference_rows(
     *,
     a1_gscale: float | None,
     a2_gscale: torch.Tensor | None,
+    exact: bool = False,
 ) -> torch.Tensor:
     """Unweighted GEMM2 rows [T, top_k, K] in fp32 (rounded to bf16 like the
     kernel's), zero for the routes that are not local.
 
     Without scales the activations stay bf16. With them the activations are
-    quantized where the kernel quantizes them, in the folded domain: GEMM1 uses
-    the gate scale for both halves, so ``up`` carries s1 instead of s3, and the
-    intermediate is quantized with ``a2_gscale = (s3 / s1) / a2`` per expert.
-    GEMM2 then needs the s3 / s1 back.
+    quantized where the kernel quantizes them. By default that is the folded
+    domain: GEMM1 uses the gate scale for both halves, so ``up`` carries s1
+    instead of s3, and the intermediate is quantized with
+    ``a2_gscale = (s3 / s1) / a2`` per expert. GEMM2 then needs the s3 / s1 back.
+    With ``exact`` both halves carry their own scale (and are rounded to bf16 in
+    it) and the intermediate is quantized with ``a2_gscale = 1 / a2``.
     """
     folded = a1_gscale is not None
     assert folded == (a2_gscale is not None)
@@ -364,10 +373,12 @@ def _reference_rows(
     rows = torch.zeros(num_tokens, top_k, K, dtype=torch.float32, device=x.device)
     for e in torch.unique(topk_ids[valid]).tolist():
         tokens, slots = ((topk_ids == e) & valid).nonzero(as_tuple=True)
-        h = problem._hidden(e, x[tokens], folded)
+        h = problem._hidden(e, x[tokens], folded and not exact)
         if folded:
-            s1, s3 = problem.s13[e].tolist()
-            h = _fake_quant_nvfp4(h, a2_gscale[e].item()) * (s3 / s1)
+            h = _fake_quant_nvfp4(h, a2_gscale[e].item())
+            if not exact:
+                s1, s3 = problem.s13[e].tolist()
+                h = h * (s3 / s1)
         rows[tokens, slots] = (h @ problem.dense(e)[3].T).bfloat16().float()
     return rows
 
@@ -395,6 +406,7 @@ def _check_against_references(
     a1_gscale,
     a2_gscale,
     stage_bound: float = STAGE_FAITHFUL_REL_L2,
+    exact: bool = False,
 ) -> None:
     assert out.shape == x.shape and out.dtype == x.dtype
     assert torch.isfinite(out).all(), "non-finite values leaked into the output"
@@ -412,6 +424,7 @@ def _check_against_references(
                 valid,
                 a1_gscale=scales[0],
                 a2_gscale=scales[1],
+                exact=exact,
             )
             ref = _finalize_reference(rows, valid, topk_weights, norm)
             assert ref.abs().max() > 0
@@ -440,6 +453,7 @@ def _check_rows_against_reference(
     a1_gscale,
     a2_gscale,
     bound: float,
+    exact: bool = False,
 ) -> torch.Tensor:
     """The unweighted GEMM2 rows of the routes, zero for the remote ones, are
     those of the stage-faithful reference. Returns them [T, top_k, K]."""
@@ -458,6 +472,7 @@ def _check_rows_against_reference(
             valid,
             a1_gscale=a1_gscale,
             a2_gscale=a2_gscale,
+            exact=exact,
         )
     finally:
         torch.backends.cuda.matmul.allow_tf32 = old_tf32
@@ -548,6 +563,34 @@ def test_decode_scales_are_exact_and_consistent_with_the_fold() -> None:
     assert torch.equal(gs, scales.gs)
 
 
+@pytest.mark.parametrize("up_gate", [False, True])
+def test_exact_gemm1_scales_keep_the_gate_and_up_alphas_apart(up_gate: bool) -> None:
+    g = torch.Generator().manual_seed(2)
+    num_experts = 6
+    w13_scale_2 = torch.rand(num_experts, 2, generator=g, dtype=torch.float32) * 0.02
+    w13_scale_2 += 0.005
+    w13_input_scale = torch.rand(num_experts, 2, generator=g, dtype=torch.float32) + 0.5
+    w2_scale_2 = torch.rand(num_experts, generator=g, dtype=torch.float32) * 0.02
+    w2_input_scale = torch.rand(num_experts, generator=g, dtype=torch.float32) + 0.5
+    scales = fold_sm120_nvfp4_scales(
+        w13_scale_2, w13_input_scale, w2_scale_2, w2_input_scale
+    )
+    exact = exact_gemm1_scales(scales, up_gate)
+    assert exact.alphas1.shape == (2 * num_experts,)
+    assert exact.a2_gscale.shape == (num_experts,)
+    for tensor in exact:
+        assert tensor.dtype == torch.float32 and tensor.is_contiguous()
+    a13 = w13_input_scale.max().item()
+    a2 = w2_input_scale.max().item()
+    for e in range(num_experts):
+        s1, s3 = w13_scale_2[e].tolist()
+        first, second = (s3, s1) if up_gate else (s1, s3)
+        assert s1 != s3
+        assert math.isclose(exact.alphas1[2 * e].item(), a13 * first, rel_tol=1e-6)
+        assert math.isclose(exact.alphas1[2 * e + 1].item(), a13 * second, rel_tol=1e-6)
+        assert math.isclose(exact.a2_gscale[e].item(), 1 / a2, rel_tol=1e-6)
+
+
 @pytest.mark.parametrize("num_experts", [1, 5, 16])
 @torch.inference_mode()
 def test_swap_gate_up_halves_in_chunks(monkeypatch, num_experts: int) -> None:
@@ -582,6 +625,7 @@ def test_swap_gate_up_halves_in_chunks(monkeypatch, num_experts: int) -> None:
 # ------------------------------------------------------------------------------
 # The layer: runner -> quant method -> experts -> finalizer
 # ------------------------------------------------------------------------------
+@pytest.mark.parametrize("exact", [True, False], ids=["exact", "folded"])
 @pytest.mark.parametrize("moe_backend", ["auto", "cutlass"])
 @pytest.mark.parametrize("num_tokens", [1, 16])
 @pytest.mark.parametrize("top_k", [4, 8])
@@ -593,10 +637,13 @@ def test_sm120_layer_matches_the_references(
     hook_rows,
     engine_calls,
     quant_kernels,
+    monkeypatch,
     moe_backend,
     num_tokens,
     top_k,
+    exact,
 ) -> None:
+    monkeypatch.setenv("VLLM_MUSE_SPARK_SM120_EXACT_GEMM1", "1" if exact else "0")
     problem = _Problem()
     checkpoint = problem.checkpoint()
     w13_loaded = problem.w13.clone()
@@ -652,6 +699,23 @@ def test_sm120_layer_matches_the_references(
     torch.testing.assert_close(experts.g1_alphas, a13 * s1, rtol=1e-6, atol=0)
     torch.testing.assert_close(experts.a2_gscale, s3 / s1 / a2, rtol=1e-6, atol=0)
     torch.testing.assert_close(experts.g2_alphas, a2 * problem.s2, rtol=1e-6, atol=0)
+    # The exact GEMM1 keeps the gate and up alphas apart, in the stored order.
+    assert experts.exact_gemm1 == exact
+    if exact:
+        first, second = (s3, s1) if up_gate else (s1, s3)
+        torch.testing.assert_close(
+            experts.exact_scales.alphas1,
+            torch.stack((a13 * first, a13 * second), dim=1).flatten(),
+            rtol=1e-6,
+            atol=0,
+        )
+        exact_a2_gscale = torch.full_like(s1, 1 / a2)
+        torch.testing.assert_close(
+            experts.exact_scales.a2_gscale, exact_a2_gscale, rtol=1e-6, atol=0
+        )
+    else:
+        assert experts.exact_scales is None
+        exact_a2_gscale = None
 
     g = torch.Generator(device="cuda").manual_seed(1)
     x = torch.randn(num_tokens, K, device="cuda", generator=g).to(torch.bfloat16)
@@ -661,7 +725,7 @@ def test_sm120_layer_matches_the_references(
     out = run_moe(runner, vllm_config, x, router_logits)
     # An eager forward pass is CUTLASS, whatever the batch size.
     assert engine_calls == ["cutlass"]
-    assert quant_kernels == ["muse" if up_gate else "stock"]
+    assert quant_kernels == ["split" if exact else "muse" if up_gate else "stock"]
     # It prepared the engine on the stored weights, if the layer runs it.
     assert (experts.b12x is not None) == up_gate
     if up_gate:
@@ -682,7 +746,8 @@ def test_sm120_layer_matches_the_references(
         norm,
         valid,
         experts.a1_gscale[0].item(),
-        experts.a2_gscale,
+        exact_a2_gscale if exact else experts.a2_gscale,
+        exact=exact,
     )
     _check_rows_against_reference(
         hook_rows[0],
@@ -691,8 +756,9 @@ def test_sm120_layer_matches_the_references(
         topk_ids,
         valid,
         experts.a1_gscale[0].item(),
-        experts.a2_gscale,
+        exact_a2_gscale if exact else experts.a2_gscale,
         STAGE_FAITHFUL_REL_L2,
+        exact=exact,
     )
     # One device, one token layout: CUTLASS' permuted rows go straight to the norm.
     assert row_layouts == [False]
@@ -717,7 +783,8 @@ def test_sm120_layer_keeps_the_checkpoint_layout_without_the_muse_c_extension(
     dist_init, workspace_init, engine_calls, quant_kernels, monkeypatch
 ) -> None:
     """A host that passes the preflight but cannot build the extension: the
-    layer neither swaps the weights nor runs b12x, and uses the stock kernel."""
+    layer neither swaps the weights nor runs b12x, and uses the stock kernel
+    with the folded scales."""
 
     def cannot_build():
         raise RuntimeError("nvcc: out of luck")
@@ -739,6 +806,8 @@ def test_sm120_layer_keeps_the_checkpoint_layout_without_the_muse_c_extension(
     experts = routed.quant_method.moe_kernel.fused_experts
     assert not routed.quant_method.use_b12x_decode
     assert not experts.use_b12x_decode
+    # The exact GEMM1 needs the extension too: the folded one runs instead.
+    assert not experts.exact_gemm1 and experts.exact_scales is None
     assert not experts.up_gate_layout and experts.b12x is None
     assert torch.equal(routed.w13_weight.data, problem.w13)
     x = _activations(4, seed=1)
@@ -766,7 +835,8 @@ def test_sm120_layer_without_a_usable_b12x_runs_cutlass_only(
 ) -> None:
     """b12x is importable but unusable (a version mismatch, no CUTLASS DSL): the
     default ``auto`` leaves the layer on CUTLASS and the stock kernel, and the
-    model still loads."""
+    model still loads. With the exact GEMM1 off nothing needs the extension."""
+    monkeypatch.setenv("VLLM_MUSE_SPARK_SM120_EXACT_GEMM1", "0")
     monkeypatch.setattr(
         sm120_nvfp4_moe, "b12x_unusable_reason", lambda: "b12x lacks plan_weights"
     )
@@ -804,7 +874,7 @@ def test_sm120_b12x_setup_failure_leaves_the_layer_on_cutlass(
 ) -> None:
     """b12x passes the probe but fails to set the engine up: ``auto`` never
     raises. The layer already holds [up; gate] (the extension is built), so it
-    keeps using the _muse_C kernel. The first eager forward pass makes the one
+    keeps using the _muse_C kernels. The first eager forward pass makes the one
     attempt, which turns the engine off for this layer and for all later ones."""
 
     class Failing:
@@ -851,7 +921,7 @@ def test_sm120_b12x_setup_failure_leaves_the_layer_on_cutlass(
         patch.setattr(sm120_nvfp4_moe, "_capturing", lambda: True)
         run_moe(runner, vllm_config, x, router_logits)
     assert Failing.attempts == 1 and experts.b12x is None
-    assert engine_calls == ["cutlass"] * 3 and quant_kernels == ["muse"] * 3
+    assert engine_calls == ["cutlass"] * 3 and quant_kernels == ["split"] * 3
 
     # The next layer does not try again either: it sees the failure and stops.
     other = _Experts(
@@ -934,7 +1004,9 @@ class _Experts:
     ``prepare=False`` leaves it for that pass.
 
     ``expert_map`` is None when every expert is local, and ``a2_gscale`` is the
-    kernel's per-expert intermediate scale indexed by global expert id.
+    kernel's per-expert intermediate scale indexed by global expert id. With
+    ``exact`` GEMM1 keeps the gate and up alphas apart (``1 / a2`` is then the
+    intermediate scale), else it folds them.
     """
 
     def __init__(
@@ -948,6 +1020,7 @@ class _Experts:
         b12x: bool = False,
         prepare: bool = True,
         up_gate: bool = True,
+        exact: bool = False,
     ):
         num_local = local_experts.numel()
         # The block scales are taken per local expert; the input scales are those
@@ -976,6 +1049,16 @@ class _Experts:
         self.experts = self.kernel.fused_experts
         self.experts.post_gemm2_hook = MusePostExpertFinalize(norm, moe_config)
         self.experts.up_gate_layout = up_gate
+        if exact:
+            self.experts.decode_scales = fold_sm120_nvfp4_scales(
+                problem.s13[local_experts],
+                problem.in13,
+                problem.s2[local_experts],
+                problem.in2,
+            )
+            self.experts.exact_gemm1 = True
+            self.experts.process_weights_after_loading(None)
+            assert self.experts.exact_scales is not None
         if b12x:
             self.experts.use_b12x_decode = True
             if prepare:
@@ -989,7 +1072,9 @@ class _Experts:
             )
         self.a1_gscale = quant_config.a1_gscale[0].item()
         self.a2_gscale = torch.zeros(E, dtype=torch.float32, device="cuda")
-        self.a2_gscale[local_experts] = quant_config.a2_gscale
+        self.a2_gscale[local_experts] = (
+            self.experts.exact_scales.a2_gscale if exact else quant_config.a2_gscale
+        )
 
     @property
     def b12x(self) -> b12x_decode_moe.B12xDecodeMoE | None:
@@ -1033,9 +1118,10 @@ def _run_experts(
     *,
     tp_size: int = 1,
     up_gate: bool = True,
+    exact: bool = False,
 ):
     """Runs the CUTLASS experts of one rank holding ``local_experts``, with w13
-    stored [up; gate] or [gate; up].
+    stored [up; gate] or [gate; up], and GEMM1 exact or folded.
 
     Returns the output, the expert map, the activation scale and the per-expert
     intermediate scales of ``_Experts``.
@@ -1047,16 +1133,18 @@ def _run_experts(
         topk_ids.shape[1],
         tp_size=tp_size,
         up_gate=up_gate,
+        exact=exact,
     )
     out = experts.apply(x, topk_ids, topk_weights)
     return out, experts.expert_map, experts.a1_gscale, experts.a2_gscale
 
 
+@pytest.mark.parametrize("exact", [True, False], ids=["exact", "folded"])
 @pytest.mark.parametrize("up_gate", [True, False])
 @pytest.mark.parametrize("top_k", [4, 8])
 @torch.inference_mode()
 def test_sm120_expert_parallel_skips_the_remote_routes(
-    dist_init, workspace_init, row_layouts, top_k, up_gate
+    dist_init, workspace_init, row_layouts, top_k, up_gate, exact
 ) -> None:
     problem = _Problem()
     norm = _make_norm()
@@ -1074,7 +1162,14 @@ def test_sm120_expert_parallel_skips_the_remote_routes(
     )
     x = torch.randn(num_tokens, K, device="cuda").to(torch.bfloat16)
     out, expert_map, a1_gscale, a2_gscale = _run_experts(
-        problem, x, topk_ids, topk_weights, norm, local_experts, up_gate=up_gate
+        problem,
+        x,
+        topk_ids,
+        topk_weights,
+        norm,
+        local_experts,
+        up_gate=up_gate,
+        exact=exact,
     )
     valid = expert_map[topk_ids.long()] >= 0
     assert not valid[0].any() and valid[1:].any() and not valid.all()
@@ -1088,6 +1183,7 @@ def test_sm120_expert_parallel_skips_the_remote_routes(
         valid,
         a1_gscale,
         a2_gscale,
+        exact=exact,
     )
     assert torch.count_nonzero(out[0]) == 0
     assert row_layouts == [False]
@@ -1115,11 +1211,12 @@ def test_sm120_expert_parallel_without_local_routes(
     assert row_layouts == [False]
 
 
+@pytest.mark.parametrize("exact", [True, False], ids=["exact", "folded"])
 @pytest.mark.parametrize("up_gate", [True, False])
 @pytest.mark.parametrize("top_k", [4, 8])
 @torch.inference_mode()
 def test_sm120_tensor_parallel_hands_over_route_major_rows(
-    dist_init, workspace_init, row_layouts, top_k, up_gate
+    dist_init, workspace_init, row_layouts, top_k, up_gate, exact
 ) -> None:
     """With TP the rows are all-reduced before the norm, so they must come in the
     same order on every rank. One process stands in for the ranks: the TP group
@@ -1139,6 +1236,7 @@ def test_sm120_tensor_parallel_hands_over_route_major_rows(
         all_experts,
         tp_size=2,
         up_gate=up_gate,
+        exact=exact,
     )
     assert expert_map is None
     _check_against_references(
@@ -1151,8 +1249,86 @@ def test_sm120_tensor_parallel_hands_over_route_major_rows(
         torch.ones_like(topk_ids, dtype=torch.bool),
         a1_gscale,
         a2_gscale,
+        exact=exact,
     )
     assert row_layouts == [True]
+
+
+def _exact_reference_output(problem, x, topk_ids, topk_weights, norm, valid):
+    """The final output of the exact fake-quant definition (the gate and up
+    halves rounded to bf16 in their own scales)."""
+    a1_gscale = 1 / problem.in13.max().item()
+    a2_gscale = torch.full((E,), 1 / problem.in2.max().item(), device="cuda")
+    old_tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        rows = _reference_rows(
+            problem,
+            x,
+            topk_ids.long(),
+            valid,
+            a1_gscale=a1_gscale,
+            a2_gscale=a2_gscale,
+            exact=True,
+        )
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = old_tf32
+    return _finalize_reference(rows, valid, topk_weights, norm)
+
+
+@pytest.mark.parametrize("up_gate", [True, False])
+@torch.inference_mode()
+def test_sm120_exact_gemm1_follows_the_exact_scales_where_the_fold_does_not(
+    dist_init, workspace_init, up_gate: bool
+) -> None:
+    """The gate and up scales differ in every expert. The fold rounds the up half
+    to bf16 in the gate's scale, which moves some FP4 codes of the intermediate:
+    the exact GEMM1 stays on the exact definition, within the rounding noise of
+    the kernels, and the fold does not."""
+    problem = _Problem()
+    norm = _make_norm()
+    all_experts = torch.arange(E, dtype=torch.long, device="cuda")
+    num_tokens, top_k = 128, 8
+    topk_ids, topk_weights = _routes(num_tokens, top_k, None, remote_tokens=0)
+    x = _activations(num_tokens, seed=1)
+    valid = torch.ones_like(topk_ids, dtype=torch.bool)
+    ref = _exact_reference_output(problem, x, topk_ids, topk_weights, norm, valid)
+    errors = {}
+    for exact in (True, False):
+        experts = _Experts(
+            problem, norm, all_experts, top_k, up_gate=up_gate, exact=exact
+        )
+        errors[exact] = _rel_l2(experts.apply(x, topk_ids, topk_weights), ref)
+    assert errors[True] <= EXACT_GEMM1_REL_L2, errors
+    assert errors[False] >= 10 * errors[True], errors
+
+
+@torch.inference_mode()
+def test_sm120_exact_gemm1_falls_back_when_the_groups_do_not_fit(
+    dist_init, workspace_init, quant_kernels, monkeypatch
+) -> None:
+    """Every expert is two groups of the grouped GEMM, which sets up its groups
+    with one thread each: past that limit the folded GEMM1 runs."""
+    monkeypatch.setattr(sm120_nvfp4_moe, "_MAX_GEMM_GROUPS", 2 * E - 1)
+    problem = _Problem()
+    norm = _make_norm()
+    all_experts = torch.arange(E, dtype=torch.long, device="cuda")
+    topk_ids, topk_weights = _routes(16, 8, None, remote_tokens=0)
+    x = _activations(16, seed=1)
+    experts = _Experts(problem, norm, all_experts, 8, up_gate=False, exact=True)
+    out = experts.apply(x, topk_ids, topk_weights)
+    assert quant_kernels == ["stock"]
+    _check_against_references(
+        out,
+        problem,
+        x,
+        topk_ids.long(),
+        topk_weights,
+        norm,
+        torch.ones_like(topk_ids, dtype=torch.bool),
+        experts.a1_gscale,
+        experts.experts.a2_gscale,
+    )
 
 
 # ------------------------------------------------------------------------------
@@ -1943,3 +2119,69 @@ def test_muse_c_quantization_is_bit_identical_to_the_stock_kernel(
     assert stock_fp4[:local_rows].any() and stock_sf.any()
     assert torch.equal(muse_fp4, stock_fp4)
     assert torch.equal(muse_sf, stock_sf)
+
+    # The exact GEMM1 stacks the two halves as [R, N] matrices.
+    gate, up = gate_up[:, :intermediate], gate_up[:, intermediate:]
+    for gate_first, stacked in ((True, (gate, up)), (False, (up, gate))):
+        split_fp4, split_sf = run(
+            lambda *args, _gate_first=gate_first: (
+                torch.ops._muse_C.silu_and_mul_split_scaled_fp4_experts_quant(
+                    *args, _gate_first
+                )
+            ),
+            torch.cat(stacked, dim=0),
+        )
+        assert torch.equal(split_fp4, stock_fp4), gate_first
+        assert torch.equal(split_sf, stock_sf), gate_first
+
+
+@pytest.mark.parametrize("sizes", [[0, 3, 0, 130, 1, 128, 7, 0], [5] * 8, [0] * 8])
+@pytest.mark.parametrize("spare_rows", [0, 77])
+@torch.inference_mode()
+def test_muse_c_split_gemm1_prepare(sizes: list[int], spare_rows: int) -> None:
+    """The tables of the 2E groups and the two copies of the rows that experts
+    own; the spare rows after them are not touched."""
+    muse_c.load()
+    num_experts, hidden, intermediate = len(sizes), 512, 256
+    local_rows = sum(sizes)
+    num_rows = local_rows + spare_rows
+    g = torch.Generator(device="cuda").manual_seed(sum(sizes))
+    a_fp4 = torch.randint(
+        0, 256, (num_rows, hidden // 2), dtype=torch.uint8, device="cuda", generator=g
+    )
+    offsets = torch.tensor([0, *sizes], dtype=torch.int32).cumsum(0).int()
+    padded = torch.tensor([0, *[-(-m // 128) * 128 for m in sizes]]).cumsum(0).int()
+    problem_sizes = torch.tensor(
+        [[m, 2 * intermediate, hidden] for m in sizes], dtype=torch.int32
+    )
+    poison = 0x5A
+    a_x2 = torch.full(
+        (2 * num_rows, hidden // 2), poison, dtype=torch.uint8, device="cuda"
+    )
+    tables = [
+        torch.full(shape, -7, dtype=torch.int32, device="cuda")
+        for shape in ((2 * num_experts,), (2 * num_experts,), (2 * num_experts, 3))
+    ]
+    torch.ops._muse_C.split_gemm1_prepare(
+        a_fp4, offsets.cuda(), padded.cuda(), problem_sizes.cuda(), a_x2, *tables
+    )
+    expert_offsets, sf_offsets, sizes_x2 = (t.cpu() for t in tables)
+    for e, m in enumerate(sizes):
+        for h in range(2):
+            group = 2 * e + h
+            assert expert_offsets[group] == offsets[e] + h * num_rows
+            assert sf_offsets[group] == padded[e]
+            assert sizes_x2[group].tolist() == [m, intermediate, hidden]
+    for h in range(2):
+        copy = a_x2[h * num_rows : (h + 1) * num_rows]
+        assert torch.equal(copy[:local_rows], a_fp4[:local_rows])
+        assert (copy[local_rows:] == poison).all()
+    # The wrapper allocates the same outputs.
+    wrapped = muse_c.split_gemm1_prepare(
+        a_fp4, offsets.cuda(), padded.cuda(), problem_sizes.cuda()
+    )
+    assert torch.equal(wrapped[1].cpu(), expert_offsets)
+    assert torch.equal(wrapped[2].cpu(), sf_offsets)
+    assert torch.equal(wrapped[3].cpu(), sizes_x2)
+    assert torch.equal(wrapped[0][:local_rows], a_fp4[:local_rows])
+    assert torch.equal(wrapped[0][num_rows : num_rows + local_rows], a_fp4[:local_rows])

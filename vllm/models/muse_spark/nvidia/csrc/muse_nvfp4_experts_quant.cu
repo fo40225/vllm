@@ -16,10 +16,12 @@
 
 // Adapted from vLLM csrc/quantization/fp4/nvfp4_experts_quant.cu (v0.32.0):
 // the fused SiLU+Mul NVFP4 experts quantization for activations laid out as
-// [up | gate] instead of [gate | up]. Only the gate/up load offsets differ
-// from the stock kernel; the expert lookup, scale-factor layout and numerics
-// are unchanged. Build with the stock flags: no --use_fast_math, and
-// NVFP4_ENABLE_ELTS16 undefined (8 elements per thread).
+// [up | gate] instead of [gate | up], and for the "split" layout of the exact
+// GEMM1 (two [rows, N] matrices, one per half, stacked in one buffer). Only the
+// gate/up load offsets differ from the stock kernel; the expert lookup,
+// scale-factor layout and numerics are unchanged. Build with the stock flags:
+// no --use_fast_math, and NVFP4_ENABLE_ELTS16 undefined (8 elements per
+// thread).
 
 // Only c10 headers: <ATen/cuda/CUDAContext.h> needs cusparse.h and cusolverDn.h,
 // which the stock runtime images do not ship.
@@ -62,17 +64,27 @@ static int multi_processor_count(int device) {
   return value;
 }
 
+// Where the up and gate values of row r, column vector c are, in units of
+// PackedVec: `in[r * row_stride + c + up_off]` and `in[r * row_stride + c +
+// gate_off]`.
+struct InputLayout {
+  int64_t row_stride;
+  int64_t up_off;
+  int64_t gate_off;
+};
+
 // NVFP4 quantization kernel for experts (low-latency path).
-// Expects input with up||gate layout (the halves of the stock kernel's
-// gate||up layout exchanged) and fuses up * SiLU(gate) before quantization.
-// Use UE4M3 scale factors.
+// Reads up and gate where `layout` puts them (up||gate: the halves of the stock
+// kernel's gate||up layout exchanged) and fuses up * SiLU(gate) before
+// quantization. Use UE4M3 scale factors.
 template <class Type, bool SMALL_NUM_EXPERTS = false>
 __global__ void __launch_bounds__(512, VLLM_BLOCKS_PER_SM(512))
     cvt_mul_and_silu_to_fp4(int32_t numRows, int32_t numCols, Type const* in,
                             float const* SFScale, uint32_t* out,
                             uint32_t* SFout, uint32_t* input_offset_by_experts,
                             uint32_t* output_scale_offset_by_experts,
-                            int n_experts, bool low_latency) {
+                            int n_experts, bool low_latency,
+                            InputLayout layout) {
   using PackedVec = PackedVec<Type>;
   static constexpr int CVT_FP4_NUM_THREADS_PER_SF =
       (CVT_FP4_SF_VEC_SIZE / CVT_FP4_ELTS_PER_THREAD);
@@ -87,8 +99,6 @@ __global__ void __launch_bounds__(512, VLLM_BLOCKS_PER_SM(512))
   int32_t const numValidRows =
       min(numRows,
           static_cast<int32_t>(__ldca(&input_offset_by_experts[n_experts])));
-  // Input has up || gate layout (doubled width)
-  int inColsPerRow = colsPerRow * 2;
 
   // Each global thread processes one element
   for (int globalIdx = tid; globalIdx < numValidRows * colsPerRow;
@@ -143,12 +153,14 @@ __global__ void __launch_bounds__(512, VLLM_BLOCKS_PER_SM(512))
       }
     }
 
-    // Load up from the first half and gate from the second half, then apply
-    // the fused SiLU+Mul
-    int64_t inOffset = rowIdx * inColsPerRow + colIdx;
-    PackedVec in_vec_up = reinterpret_cast<PackedVec const*>(in)[inOffset];
+    // Load up and gate from where the layout puts them, then apply the fused
+    // SiLU+Mul
+    int64_t inOffset =
+        static_cast<int64_t>(rowIdx) * layout.row_stride + colIdx;
+    PackedVec in_vec_up =
+        reinterpret_cast<PackedVec const*>(in)[inOffset + layout.up_off];
     PackedVec in_vec_gate =
-        reinterpret_cast<PackedVec const*>(in)[inOffset + colsPerRow];
+        reinterpret_cast<PackedVec const*>(in)[inOffset + layout.gate_off];
     PackedVec quant_input = compute_silu_mul(in_vec_gate, in_vec_up);
 
     // Get the output tensor offset.
@@ -175,15 +187,15 @@ __global__ void __launch_bounds__(512, VLLM_BLOCKS_PER_SM(512))
 }
 
 // NVFP4 quantization kernel for LARGE_M_TOPK = true (large m_topk optimized
-// version). Expects input with up||gate layout and fuses up * SiLU(gate)
-// before quantization.
+// version). Reads up and gate where `layout` puts them and fuses
+// up * SiLU(gate) before quantization.
 template <class Type, bool SMALL_NUM_EXPERTS = false>
 __global__ void __launch_bounds__(1024, VLLM_BLOCKS_PER_SM(1024))
     cvt_mul_and_silu_to_fp4(int32_t numRows, int32_t numCols, Type const* in,
                             float const* SFScale, uint32_t* out,
                             uint32_t* SFout, uint32_t* input_offset_by_experts,
                             uint32_t* output_scale_offset_by_experts,
-                            int n_experts) {
+                            int n_experts, InputLayout layout) {
   using PackedVec = PackedVec<Type>;
   static constexpr int CVT_FP4_NUM_THREADS_PER_SF =
       (CVT_FP4_SF_VEC_SIZE / CVT_FP4_ELTS_PER_THREAD);
@@ -218,8 +230,6 @@ __global__ void __launch_bounds__(1024, VLLM_BLOCKS_PER_SM(1024))
   int colsPerRow = numCols / CVT_FP4_ELTS_PER_THREAD;
   int32_t const numValidRows =
       min(numRows, static_cast<int32_t>(shared_input_offsets[n_experts]));
-  // Input has up || gate layout (doubled width)
-  int inColsPerRow = colsPerRow * 2;
 
   // Each global thread processes one element
   for (int globalIdx = tid; globalIdx < numValidRows * colsPerRow;
@@ -252,12 +262,14 @@ __global__ void __launch_bounds__(1024, VLLM_BLOCKS_PER_SM(1024))
       }
     }
 
-    // Load up from the first half and gate from the second half, then apply
-    // the fused SiLU+Mul
-    int64_t inOffset = rowIdx * inColsPerRow + colIdx;
-    PackedVec in_vec_up = reinterpret_cast<PackedVec const*>(in)[inOffset];
+    // Load up and gate from where the layout puts them, then apply the fused
+    // SiLU+Mul
+    int64_t inOffset =
+        static_cast<int64_t>(rowIdx) * layout.row_stride + colIdx;
+    PackedVec in_vec_up =
+        reinterpret_cast<PackedVec const*>(in)[inOffset + layout.up_off];
     PackedVec in_vec_gate =
-        reinterpret_cast<PackedVec const*>(in)[inOffset + colsPerRow];
+        reinterpret_cast<PackedVec const*>(in)[inOffset + layout.gate_off];
     PackedVec quant_input = compute_silu_mul(in_vec_gate, in_vec_up);
 
     int64_t outOffset = rowIdx * colsPerRow + colIdx;
@@ -282,7 +294,8 @@ template <typename T>
 void quant_impl(void* output, void* output_scale, void* input,
                 void* input_global_scale, void* input_offset_by_experts,
                 void* output_scale_offset_by_experts, int m_topk, int k,
-                int n_experts, int multiProcessorCount, cudaStream_t stream) {
+                int n_experts, int multiProcessorCount, InputLayout layout,
+                cudaStream_t stream) {
   // Grid, Block size.
   // Each thread converts 8 values.
   int const workSizePerRow = k / CVT_FP4_ELTS_PER_THREAD;
@@ -313,7 +326,7 @@ void quant_impl(void* output, void* output_scale, void* input,
               reinterpret_cast<uint32_t*>(output_scale),
               reinterpret_cast<uint32_t*>(input_offset_by_experts),
               reinterpret_cast<uint32_t*>(output_scale_offset_by_experts),
-              n_experts);
+              n_experts, layout);
     } else {
       cvt_mul_and_silu_to_fp4<T, true>
           <<<grid, block, shared_mem_size, stream>>>(
@@ -323,7 +336,7 @@ void quant_impl(void* output, void* output_scale, void* input,
               reinterpret_cast<uint32_t*>(output_scale),
               reinterpret_cast<uint32_t*>(input_offset_by_experts),
               reinterpret_cast<uint32_t*>(output_scale_offset_by_experts),
-              n_experts);
+              n_experts, layout);
     }
   } else {
     // The low-latency vectorized expert lookup only handles full 16-expert
@@ -337,7 +350,7 @@ void quant_impl(void* output, void* output_scale, void* input,
               reinterpret_cast<uint32_t*>(output_scale),
               reinterpret_cast<uint32_t*>(input_offset_by_experts),
               reinterpret_cast<uint32_t*>(output_scale_offset_by_experts),
-              n_experts, /* bool low_latency */ true);
+              n_experts, /* bool low_latency */ true, layout);
     } else {
       cvt_mul_and_silu_to_fp4<T, true>
           <<<grid, block, 0, stream>>>(
@@ -347,7 +360,7 @@ void quant_impl(void* output, void* output_scale, void* input,
               reinterpret_cast<uint32_t*>(output_scale),
               reinterpret_cast<uint32_t*>(input_offset_by_experts),
               reinterpret_cast<uint32_t*>(output_scale_offset_by_experts),
-              n_experts, /* bool low_latency */ true);
+              n_experts, /* bool low_latency */ true, layout);
     }
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -410,18 +423,14 @@ static void validate_fp4_experts_quant_inputs(
   TORCH_CHECK(output_scale.size(1) * 4 == padded_k);
 }
 
-void mul_and_silu_scaled_fp4_experts_quant(
-    at::Tensor& output, at::Tensor& output_scale, at::Tensor const& input,
-    at::Tensor const& input_global_scale,
-    at::Tensor const& input_offset_by_experts,
-    at::Tensor const& output_scale_offset_by_experts) {
-  TORCH_CHECK(input.dim() == 2, "input must be 2D");
-  auto m_topk = input.size(0);
-  // Input has up || gate layout, so k = input.size(1) / 2
-  auto k_times_2 = input.size(1);
-  TORCH_CHECK(k_times_2 % 2 == 0, "input width must be even (up || gate)");
-  auto k = k_times_2 / 2;
-
+// Quantizes up * silu(gate) of the m_topk rows of `input`, which `layout`
+// describes, for k columns per half.
+static void silu_mul_quant(at::Tensor& output, at::Tensor& output_scale,
+                           at::Tensor const& input,
+                           at::Tensor const& input_global_scale,
+                           at::Tensor const& input_offset_by_experts,
+                           at::Tensor const& output_scale_offset_by_experts,
+                           int64_t m_topk, int64_t k, InputLayout layout) {
   validate_fp4_experts_quant_inputs(output, output_scale, input,
                                     input_global_scale, input_offset_by_experts,
                                     output_scale_offset_by_experts, m_topk, k);
@@ -437,14 +446,54 @@ void mul_and_silu_scaled_fp4_experts_quant(
                      input.data_ptr(), input_global_scale.data_ptr(),
                      input_offset_by_experts.data_ptr(),
                      output_scale_offset_by_experts.data_ptr(), m_topk, k,
-                     n_experts, multiProcessorCount, stream);
+                     n_experts, multiProcessorCount, layout, stream);
   } else {
     quant_impl<__nv_bfloat16>(
         output.data_ptr(), output_scale.data_ptr(), input.data_ptr(),
         input_global_scale.data_ptr(), input_offset_by_experts.data_ptr(),
         output_scale_offset_by_experts.data_ptr(), m_topk, k, n_experts,
-        multiProcessorCount, stream);
+        multiProcessorCount, layout, stream);
   }
+}
+
+void mul_and_silu_scaled_fp4_experts_quant(
+    at::Tensor& output, at::Tensor& output_scale, at::Tensor const& input,
+    at::Tensor const& input_global_scale,
+    at::Tensor const& input_offset_by_experts,
+    at::Tensor const& output_scale_offset_by_experts) {
+  TORCH_CHECK(input.dim() == 2, "input must be 2D");
+  auto m_topk = input.size(0);
+  // Input has up || gate layout, so k = input.size(1) / 2
+  auto k_times_2 = input.size(1);
+  TORCH_CHECK(k_times_2 % 2 == 0, "input width must be even (up || gate)");
+  auto k = k_times_2 / 2;
+  // Row-major [m_topk, 2k]: the up half first, the gate half k columns later.
+  int64_t const cols_per_half = k / CVT_FP4_ELTS_PER_THREAD;
+  InputLayout const layout{2 * cols_per_half, 0, cols_per_half};
+  silu_mul_quant(output, output_scale, input, input_global_scale,
+                 input_offset_by_experts, output_scale_offset_by_experts,
+                 m_topk, k, layout);
+}
+
+void silu_and_mul_split_scaled_fp4_experts_quant(
+    at::Tensor& output, at::Tensor& output_scale, at::Tensor const& input,
+    at::Tensor const& input_global_scale,
+    at::Tensor const& input_offset_by_experts,
+    at::Tensor const& output_scale_offset_by_experts, bool gate_first) {
+  TORCH_CHECK(input.dim() == 2, "input must be 2D");
+  TORCH_CHECK(input.size(0) % 2 == 0,
+              "input must hold the two halves as stacked [m_topk, k] matrices");
+  // Row r of the first half is row r of the input, row r of the second half
+  // is row m_topk + r.
+  auto m_topk = input.size(0) / 2;
+  auto k = input.size(1);
+  int64_t const cols = k / CVT_FP4_ELTS_PER_THREAD;
+  int64_t const second = m_topk * cols;
+  InputLayout const layout{cols, gate_first ? second : 0,
+                           gate_first ? 0 : second};
+  silu_mul_quant(output, output_scale, input, input_global_scale,
+                 input_offset_by_experts, output_scale_offset_by_experts,
+                 m_topk, k, layout);
 }
 
 }  // namespace muse_spark

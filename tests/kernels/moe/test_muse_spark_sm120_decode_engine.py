@@ -79,13 +79,14 @@ if _unusable is not None:
     )
 
 ENGINE_ENV = "VLLM_MUSE_SPARK_SM120_DECODE_ENGINE"
-# Final output of the muse engine against the exact reference, per layer: the
-# kernel rounds like the CUTLASS composition and the reference (see the kernel
-# tests), so only a few intermediate codes flip.
-REPLAY_REL_L2_SAME_S = 3e-3
-# CUTLASS folds the up-side gain into the intermediate scale, the kernel applies
-# separate alphas: the design's expected distance between the two is ~0.03.
-REPLAY_REL_L2_DIFF_S = 5e-2
+# Final output of the muse engine and of the CUTLASS path against the exact
+# reference: both round like the reference (see the kernel tests), the CUTLASS
+# GEMM1 keeping the gate and up scales apart like the kernel does, so only a few
+# intermediate codes flip.
+REPLAY_REL_L2 = 3e-3
+# The muse engine and the exact CUTLASS path compute the same rows bit for bit;
+# what is left between the two layer outputs is the finalizer's.
+ENGINE_AGREEMENT_REL_L2 = 1e-6
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -738,16 +739,18 @@ def engine_calls(monkeypatch) -> list[str]:
 @pytest.fixture
 def quant_kernels(monkeypatch) -> list[str]:
     """The kernel that quantizes the intermediate of every CUTLASS ``apply``:
-    ``stock`` for [gate; up] weights, ``muse`` for [up; gate]."""
+    ``split`` with the exact GEMM1; with the folded one ``stock`` for [gate; up]
+    weights and ``muse`` for [up; gate]."""
     seen: list[str] = []
     for label, owner, name in (
         ("stock", ops, "silu_and_mul_scaled_fp4_experts_quant"),
         ("muse", muse_c, "mul_and_silu_scaled_fp4_experts_quant"),
+        ("split", muse_c, "silu_and_mul_split_scaled_fp4_experts_quant"),
     ):
 
-        def spy(*args, _kernel=getattr(owner, name), _label=label):
+        def spy(*args, _kernel=getattr(owner, name), _label=label, **kwargs):
             seen.append(_label)
-            return _kernel(*args)
+            return _kernel(*args, **kwargs)
 
         monkeypatch.setattr(owner, name, spy)
     return seen
@@ -794,7 +797,8 @@ def test_layer_runs_the_muse_engine_in_graphs(
     quant_method = routed.quant_method
     experts = quant_method.moe_kernel.fused_experts
     assert type(experts) is MuseSparkSm120NvFp4Experts
-    # auto: the muse engine, on the checkpoint's layout and the stock kernel.
+    # auto: the muse engine, on the checkpoint's layout; CUTLASS keeps the gate
+    # and up scales apart.
     assert quant_method.decode_engine == "muse"
     assert quant_method.use_muse_decode and not quant_method.use_b12x_decode
     assert experts.use_muse_decode and not experts.use_b12x_decode
@@ -815,7 +819,7 @@ def test_layer_runs_the_muse_engine_in_graphs(
     # An eager forward pass is CUTLASS, whatever the batch size; it prepares the
     # engine on the stored weights.
     assert engine_calls == ["cutlass"]
-    assert quant_kernels == ["stock"]
+    assert quant_kernels == ["split"]
     assert experts.muse is not None
     assert experts.muse.reads(
         routed.w13_weight.data,
@@ -826,11 +830,11 @@ def test_layer_runs_the_muse_engine_in_graphs(
     topk_weights, topk_ids = router._compute_routing(x, logits, None)
     rows_ref, valid = layer.reference_rows(x, topk_ids.to(torch.int32), "fq")
     ref = _finalize(rows_ref, topk_weights, layer.gamma, valid)
-    cutlass_bound = REPLAY_REL_L2_DIFF_S if layer.diff_s else REPLAY_REL_L2_SAME_S
-    assert _rel_l2(out_eager, ref) <= cutlass_bound
+    assert _rel_l2(out_eager, ref) <= REPLAY_REL_L2
 
     # The captured graph runs the muse engine for up to eight tokens (it replays
-    # no Python), and CUTLASS beyond that, and is checked against the eager run.
+    # no Python), and CUTLASS beyond that, and is checked against the eager run:
+    # the engine and the CUTLASS path agree, whatever the scales.
     uses_muse = num_tokens <= MUSE_MAX_TOKENS
     x2, logits2 = _inputs(num_tokens, 2)
     assert_cudagraph_replays(
@@ -840,11 +844,11 @@ def test_layer_runs_the_muse_engine_in_graphs(
         logits,
         x2,
         logits2,
-        max_rel_l2=cutlass_bound if uses_muse else None,
+        max_rel_l2=ENGINE_AGREEMENT_REL_L2 if uses_muse else None,
     )
     assert engine_calls.count("muse") == int(uses_muse)
     assert engine_calls[0] == "cutlass"
-    assert quant_kernels.count("muse") == 0
+    assert quant_kernels.count("muse") == 0 and quant_kernels.count("stock") == 0
     assert not bool(muse_decode_moe._scratch[x.device].ctl.any())
     if uses_muse:
         # The replay is exactly the muse engine: compare with an eager call of it.
@@ -887,8 +891,9 @@ def test_layer_layout_follows_the_selected_engine(
     assert quant_method.decode_engine == engine
     assert experts.use_muse_decode == (engine == "muse")
     assert experts.use_b12x_decode == (engine == "b12x")
-    # Only b12x reorders w13 to [up; gate]; the others keep the checkpoint's order
-    # and the CUTLASS path quantizes the intermediate with the stock kernel.
+    # Only b12x reorders w13 to [up; gate]; the others keep the checkpoint's order.
+    # Whatever the layout, the CUTLASS path quantizes the intermediate with the
+    # kernel of the exact GEMM1.
     up_gate = engine == "b12x"
     assert experts.up_gate_layout == up_gate
     stored = _swap_halves(layer.w13) if up_gate else layer.w13
@@ -901,13 +906,13 @@ def test_layer_layout_follows_the_selected_engine(
     x, logits = _inputs(5, 4)
     out = run_moe(runner, vllm_config, x, logits)
     assert engine_calls == ["cutlass"]
-    assert quant_kernels == ["muse" if up_gate else "stock"]
+    assert quant_kernels == ["split"]
     topk_weights, topk_ids = router._compute_routing(x, logits, None)
     rows_ref, valid = layer.reference_rows(x, topk_ids.to(torch.int32), "fq")
     ref = _finalize(rows_ref, topk_weights, layer.gamma, valid)
     # Same weights, same scales (same_s), whichever layout: CUTLASS rounds like
     # the reference.
-    assert _rel_l2(out, ref) <= REPLAY_REL_L2_SAME_S
+    assert _rel_l2(out, ref) <= REPLAY_REL_L2
     assert (experts.muse is not None) == (engine == "muse")
     assert (experts.b12x is not None) == up_gate
 
@@ -954,6 +959,9 @@ def test_layer_without_a_toolchain_never_selects_a_decode_engine(
     quant_method = runner.routed_experts.quant_method
     assert quant_method.decode_engine == "cutlass"
     assert not quant_method.moe_kernel.fused_experts.up_gate_layout
+    # Neither does the exact GEMM1, which needs the extension as well.
+    assert not quant_method.exact_gemm1
+    assert not quant_method.moe_kernel.fused_experts.exact_gemm1
 
 
 @torch.inference_mode()
@@ -1071,6 +1079,6 @@ def test_layer_weight_reload_keeps_the_layout_and_prepares_the_engine_late(
     # And inside a graph, the engine is the one prepared on the persistent weights.
     x2, logits2 = _inputs(3, 12)
     assert_cudagraph_replays(
-        runner, vllm_config, x, logits, x2, logits2, max_rel_l2=REPLAY_REL_L2_SAME_S
+        runner, vllm_config, x, logits, x2, logits2, max_rel_l2=REPLAY_REL_L2
     )
     assert engine_calls.count("muse") == 1

@@ -143,6 +143,7 @@ if TYPE_CHECKING:
     VLLM_MUSE_SPARK_SM120_DECODE_ENGINE: Literal["auto", "muse", "b12x", "cutlass"] = (
         "auto"
     )
+    VLLM_MUSE_SPARK_SM120_EXACT_GEMM1: bool = True
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
     VLLM_ROCM_USE_AITER_LINEAR_HIPBMM: bool = False
     VLLM_ROCM_USE_AITER_MOE: bool = True
@@ -1305,6 +1306,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "auto",
         ["auto", "muse", "b12x", "cutlass"],
         case_sensitive=False,
+    ),
+    # Muse Spark on SM120: run GEMM1 of the CUTLASS grouped-GEMM NVFP4 MoE with
+    # the gate and up global weight scales apart (one group per half, and the
+    # JIT-built _muse_C extension for the SiLU * up quantization), so that the
+    # intermediate is rounded like the muse decode kernel and the exact
+    # fake-quant definition do, instead of folding the up / gate scale ratio into
+    # a later scale (~3% rel L2 apart from them where the scales differ). Set to
+    # 0 to keep the folded single-alpha GEMM1 (no extension needed). Read when
+    # the weights are loaded.
+    "VLLM_MUSE_SPARK_SM120_EXACT_GEMM1": lambda: bool(
+        int(os.getenv("VLLM_MUSE_SPARK_SM120_EXACT_GEMM1", "1"))
     ),
     # use aiter linear op if aiter ops are enabled
     # The following list of related ops

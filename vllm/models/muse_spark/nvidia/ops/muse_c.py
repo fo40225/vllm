@@ -41,6 +41,7 @@ _CSRC_DIR = Path(__file__).resolve().parent.parent / "csrc"
 _SOURCES = (
     "muse_c_bindings.cpp",
     "muse_nvfp4_experts_quant.cu",
+    "muse_nvfp4_split_gemm1.cu",
     "muse_nvfp4_decode_moe.cu",
     "muse_spark_mul_tanh_soft_cap.cu",
     "muse_spark_qknorm_rope_kv_insert.cu",
@@ -382,6 +383,31 @@ def load() -> None:
         logger.warning("Could not register _muse_C fake ops", exc_info=True)
 
 
+def _allocate_experts_quant_outputs(
+    m_numtopk: int, k: int, topk: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Output buffers of the experts quantization of ``m_numtopk`` rows of width
+    ``k``, sized like the stock wrapper does."""
+    # Control the maximum number of tokens per expert supported by the
+    # NVFP4 MoE Expert Quantization (see the stock wrapper).
+    MAX_TOKENS_PER_EXPERT = envs.VLLM_MAX_TOKENS_PER_EXPERT_FP4_MOE
+    assert m_numtopk <= MAX_TOKENS_PER_EXPERT * topk, (
+        f"m_numtopk must be less than MAX_TOKENS_PER_EXPERT("
+        f"{MAX_TOKENS_PER_EXPERT})"
+        f" for cutlass_moe_fp4, observed m_numtopk = {m_numtopk}. Use"
+        f" VLLM_MAX_TOKENS_PER_EXPERT_FP4_MOE to set this value."
+    )
+    scales_k = k // 16
+    padded_k = (scales_k + (4 - 1)) // 4
+
+    # output is uint8 and packed fp4 values
+    output = torch.empty(m_numtopk, k // 2, device=device, dtype=torch.uint8)
+    output_scales = torch.empty(
+        MAX_TOKENS_PER_EXPERT * topk, padded_k, dtype=torch.int32, device=device
+    )
+    return output, output_scales
+
+
 def mul_and_silu_scaled_fp4_experts_quant(
     input_tensor: torch.Tensor,
     input_global_scale: torch.Tensor,
@@ -409,32 +435,10 @@ def mul_and_silu_scaled_fp4_experts_quant(
     assert input_tensor.ndim == 2, (
         f"input.ndim needs to be == 2, but got {input_tensor.ndim}."
     )
-
-    # Control the maximum number of tokens per expert supported by the
-    # NVFP4 MoE Expert Quantization (see the stock wrapper).
-    MAX_TOKENS_PER_EXPERT = envs.VLLM_MAX_TOKENS_PER_EXPERT_FP4_MOE
     m_numtopk, k_times_2 = input_tensor.shape
     assert k_times_2 % 2 == 0, "input width must be even (up || gate layout)"
-    k = k_times_2 // 2
-
-    assert m_numtopk <= MAX_TOKENS_PER_EXPERT * topk, (
-        f"m_numtopk must be less than MAX_TOKENS_PER_EXPERT("
-        f"{MAX_TOKENS_PER_EXPERT})"
-        f" for cutlass_moe_fp4, observed m_numtopk = {m_numtopk}. Use"
-        f" VLLM_MAX_TOKENS_PER_EXPERT_FP4_MOE to set this value."
-    )
-    scales_k = k // 16
-    padded_k = (scales_k + (4 - 1)) // 4
-
-    # output is uint8 and packed fp4 values
-    output = torch.empty(
-        m_numtopk, k // 2, device=input_tensor.device, dtype=torch.uint8
-    )
-    output_scales = torch.empty(
-        MAX_TOKENS_PER_EXPERT * topk,
-        padded_k,
-        dtype=torch.int32,
-        device=input_tensor.device,
+    output, output_scales = _allocate_experts_quant_outputs(
+        m_numtopk, k_times_2 // 2, topk, input_tensor.device
     )
     torch.ops._muse_C.mul_and_silu_scaled_fp4_experts_quant(
         output,
@@ -446,3 +450,93 @@ def mul_and_silu_scaled_fp4_experts_quant(
     )
     output_scales = output_scales.view(torch.float8_e4m3fn)
     return output, output_scales
+
+
+def silu_and_mul_split_scaled_fp4_experts_quant(
+    input_tensor: torch.Tensor,
+    input_global_scale: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    blockscale_offsets: torch.Tensor,
+    topk: int,
+    gate_first: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused SiLU+Mul+NVFP4 quantization of the output of the exact GEMM1.
+
+    The input holds the two halves of the expert outputs as stacked matrices,
+    the first half in the rows ``[0, m_topk)`` and the second in
+    ``[m_topk, 2 * m_topk)``; the first half is the gate if ``gate_first``,
+    else the up half. The result is bit-identical to the stock
+    ``silu_and_mul_scaled_fp4_experts_quant`` on the same values laid out
+    [gate | up].
+
+    Args:
+        input_tensor: The stacked halves [2 * m_topk, k]
+        input_global_scale: A per-expert scaling factor [n_experts]
+        expert_offsets: The expert offsets tensor [n_experts+1] (of m_topk rows)
+        blockscale_offsets: The blockscale offsets tensor [n_experts+1]
+        topk: Number of top-k experts selected
+        gate_first: Whether the gate is the first half
+    Outputs:
+        output: The quantized tensor in NVFP4 [m_topk, k/2]
+        output_scales: The blockscale tensor in FP8-E4M3
+    """
+    load()
+    assert input_tensor.ndim == 2, (
+        f"input.ndim needs to be == 2, but got {input_tensor.ndim}."
+    )
+    rows, k = input_tensor.shape
+    assert rows % 2 == 0, "input must hold two stacked halves"
+    output, output_scales = _allocate_experts_quant_outputs(
+        rows // 2, k, topk, input_tensor.device
+    )
+    torch.ops._muse_C.silu_and_mul_split_scaled_fp4_experts_quant(
+        output,
+        output_scales,
+        input_tensor,
+        input_global_scale,
+        expert_offsets,
+        blockscale_offsets,
+        gate_first,
+    )
+    return output, output_scales.view(torch.float8_e4m3fn)
+
+
+def split_gemm1_prepare(
+    a_fp4: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    blockscale_offsets: torch.Tensor,
+    problem_sizes: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Tables and activations of the exact GEMM1: ``(a_fp4_x2, expert_offsets_x2,
+    blockscale_offsets_x2, problem_sizes_x2)``.
+
+    The grouped GEMM reads ``w13`` [E, 2N, K / 2] (and its swizzled block scales)
+    as ``[2E, N, K / 2]``: group ``2e + h`` is half ``h`` of expert ``e``, with
+    its own alpha. Both halves multiply the same rows, which are stored twice in
+    ``a_fp4_x2`` [2R, K / 2] (the output of a group lands at the offset of its
+    input); the activation scale factors are shared. ``problem_sizes`` is the
+    ``[E, 3]`` table of the GEMM with ``2N`` columns. Only the rows that experts
+    own are copied.
+    """
+    load()
+    num_experts = problem_sizes.shape[0]
+    rows, row_bytes = a_fp4.shape
+    a_fp4_x2 = torch.empty(2 * rows, row_bytes, dtype=torch.uint8, device=a_fp4.device)
+    expert_offsets_x2 = torch.empty(
+        2 * num_experts, dtype=torch.int32, device=a_fp4.device
+    )
+    blockscale_offsets_x2 = torch.empty_like(expert_offsets_x2)
+    problem_sizes_x2 = torch.empty(
+        2 * num_experts, 3, dtype=torch.int32, device=a_fp4.device
+    )
+    torch.ops._muse_C.split_gemm1_prepare(
+        a_fp4,
+        expert_offsets,
+        blockscale_offsets,
+        problem_sizes,
+        a_fp4_x2,
+        expert_offsets_x2,
+        blockscale_offsets_x2,
+        problem_sizes_x2,
+    )
+    return a_fp4_x2, expert_offsets_x2, blockscale_offsets_x2, problem_sizes_x2
