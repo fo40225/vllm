@@ -310,9 +310,13 @@ def _triton_boundary_kwargs(
         and pre_norm.variance_size_override is None
         and post_norm.hidden_size == pre_norm.hidden_size == branch_shape[-1]
         # Where FlashInfer's dual-norm kernel could run the boundary, the Triton
-        # one does not: leave that to the two-step path.
+        # one does not: leave that to the two-step path. It never runs on SM120
+        # (``_fused_norm_arch_supported`` admits compute capability 10.x only), even
+        # where a newer FlashInfer exports the symbol, so the answer there is the
+        # static one: the same on every rank and on every call.
         and (
             gated_residual_next_rmsnorm is None
+            or _on_sm120()
             or not _uses_flashinfer_dual_norm(
                 post_norm, connection, pre_norm, out_dtype
             )
@@ -2911,7 +2915,10 @@ class MuseSpark1xDecoderLayer(nn.Module):
         it (the L2 prefetch of the shards is then at best a head start for it). The
         answer follows the chain of ``_defers_column_gather``, the MoE layer's
         ``_deferred_unpooler_columns`` and the next boundary; it does not see the
-        norm parameters that the boundary checks (a hint-level approximation).
+        norm parameters that the boundary checks (a hint-level approximation). The one
+        gate of the boundary that is not about the shapes, the FlashInfer dual-norm
+        clause of ``_triton_boundary_kwargs``, never blocks on a device that can have
+        ``fuses_gemv_gather`` (SM120 only), so it needs no term here.
         """
         moe = self.feed_forward
         return (
@@ -3152,6 +3159,10 @@ class MuseSpark1xModel(LlamaModel):
             not sharded
             or not self.fuse_across_layers
             or not getattr(self.config, "muse_spark_tep_fused_boundary", True)
+            # FlashInfer's gather + dual norm is an MNNVL kernel of the 10.x parts: on
+            # SM120 the TP communicator's gather boundary takes the columns
+            # (ops/fused_boundary.py).
+            or _on_sm120()
         ):
             return
         all_gather = maybe_create_all_gather_dual_norm(

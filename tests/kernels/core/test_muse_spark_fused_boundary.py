@@ -11,6 +11,8 @@ shows as a different tensor or a wrong call count; the communicator's own kernel
 compared with the Triton ones bit for bit in the host plugin's tests.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -247,7 +249,8 @@ def test_boundaries_the_triton_kernel_does_not_serve_keep_the_two_steps(
     half = partial_sum(boundary)
     half.branch = half.branch.half()
     norm_residual_then_norm(half, pre_norm, out_dtype=torch.bfloat16)
-    # where FlashInfer's dual norm could run the boundary
+    # where FlashInfer's dual norm could run the boundary (a device other than SM120)
+    monkeypatch.setattr(model_ops, "_on_sm120", lambda: False)
     monkeypatch.setattr(model_ops, "gated_residual_next_rmsnorm", object())
     monkeypatch.setattr(
         model_ops, "supports_gated_residual_next_rmsnorm", lambda *_: False
@@ -741,3 +744,155 @@ def test_the_l2_prefetch_keeps_the_unpooler_where_the_gemv_is_not_fused(
     if case == "dense layer":
         layer.feed_forward = torch.nn.Identity()
     assert not layer.fuses_unpooler_gemv(1)
+
+
+@pytest.fixture
+def flashinfer_dual_norm_exported(monkeypatch, two_step):
+    """A FlashInfer that exports ``gated_residual_next_rmsnorm`` (0.7.2 does) whose
+    kernel does not take this device (``supports_gated_residual_next_rmsnorm`` is False,
+    as on SM120)."""
+    monkeypatch.setattr(model_ops, "gated_residual_next_rmsnorm", object())
+    monkeypatch.setattr(
+        model_ops, "supports_gated_residual_next_rmsnorm", lambda *_: False
+    )
+    return two_step
+
+
+@requires_cuda
+@pytest.mark.parametrize("rows", [1, 4, 8])
+def test_sm120_keeps_the_communicator_boundaries_beside_an_exported_flashinfer_norm(
+    monkeypatch, flashinfer_dual_norm_exported, rows
+):
+    """The FlashInfer symbol is present but its kernel never runs on SM120: the
+    communicator-fused boundaries (attention all-reduce, unpooler gather, unpooler GEMV
+    + gather) must stay on, as they were while FlashInfer did not export it."""
+    two_step = flashinfer_dual_norm_exported
+    torch.manual_seed(rows)
+    boundary, pre_norm = make_residual_boundary(rows)
+    expected = norm_residual_then_norm(boundary, pre_norm, out_dtype=torch.bfloat16)
+    shard = boundary.branch[:, : HIDDEN // TP_SIZE].contiguous()
+    sharded = MuseSpark1xColumnShardedStream(
+        stream=boundary.stream,
+        branch=shard,
+        post_norm=boundary.post_norm,
+        connection=boundary.connection,
+        all_gather=None,
+    )
+    projected, x, w = make_projected(boundary, rows)
+    two_step.clear()
+
+    monkeypatch.setattr(model_ops, "_on_sm120", lambda: True)
+    communicator = use_communicator(monkeypatch, FakeCommunicator())
+    for stream, kind in (
+        (partial_sum(boundary), "all_reduce_boundary"),
+        (sharded, "all_gather_boundary"),
+        (projected, "gemv_all_gather_boundary"),
+    ):
+        communicator.calls.clear()
+        out, new_stream = norm_residual_then_norm(
+            stream, pre_norm, out_dtype=torch.bfloat16
+        )
+        assert communicator.calls == [kind]
+        assert two_step == []
+        if kind == "all_reduce_boundary":
+            assert torch.equal(out, expected[0])
+            assert torch.equal(new_stream, expected[1])
+
+
+@requires_cuda
+def test_other_devices_keep_the_two_steps_where_the_flashinfer_norm_may_run(
+    monkeypatch, flashinfer_dual_norm_exported
+):
+    """Off SM120 nothing changes: an exported FlashInfer symbol still routes the
+    boundary away from the communicator (its kernel may run there)."""
+    two_step = flashinfer_dual_norm_exported
+    boundary, pre_norm = make_residual_boundary(4)
+    monkeypatch.setattr(model_ops, "_on_sm120", lambda: False)
+    communicator = use_communicator(monkeypatch, FakeCommunicator())
+    norm_residual_then_norm(partial_sum(boundary), pre_norm, out_dtype=torch.bfloat16)
+    assert communicator.calls == []
+    assert two_step == ["all_reduce"]
+    # and without the symbol (FlashInfer 0.7.0) the communicator takes it, any device
+    monkeypatch.setattr(model_ops, "gated_residual_next_rmsnorm", None)
+    two_step.clear()
+    norm_residual_then_norm(partial_sum(boundary), pre_norm, out_dtype=torch.bfloat16)
+    assert communicator.calls == ["all_reduce_boundary"]
+    assert two_step == []
+
+
+@requires_cuda
+@pytest.mark.parametrize("symbol", [None, object()], ids=["no symbol", "symbol"])
+@pytest.mark.parametrize("on_sm120", [False, True], ids=["other", "sm120"])
+def test_the_boundary_gate_depends_on_the_device_not_on_the_tensors(
+    monkeypatch, symbol, on_sm120
+):
+    """``_triton_boundary_kwargs`` is the one gate of the three communicator boundaries:
+    closed only where the FlashInfer norm is exported and the device is not SM120."""
+    boundary, pre_norm = make_residual_boundary(4)
+    monkeypatch.setattr(model_ops, "gated_residual_next_rmsnorm", symbol)
+    monkeypatch.setattr(model_ops, "_on_sm120", lambda: on_sm120)
+    kwargs = model_ops._triton_boundary_kwargs(
+        boundary.stream,
+        boundary.post_norm,
+        boundary.connection,
+        pre_norm,
+        tuple(boundary.branch.shape),
+        torch.bfloat16,
+        None,
+    )
+    assert (kwargs is None) == (symbol is not None and not on_sm120)
+
+
+@requires_cuda
+@pytest.mark.parametrize("rows", [1, 2, 4])
+def test_the_l2_prefetch_hint_matches_the_gate_beside_an_exported_flashinfer_norm(
+    monkeypatch, flashinfer_dual_norm_exported, rows
+):
+    """Where ``fuses_unpooler_gemv`` (the L2 prefetch drops the unpooler shard then)
+    answers True, the boundary after the layer really runs the communicator's GEMV."""
+    two_step = flashinfer_dual_norm_exported
+    monkeypatch.setattr(model_ops, "_on_sm120", lambda: True)
+    communicator = use_communicator(monkeypatch, GemvLimitedCommunicator())
+    layer = make_unpooler_gemv_layer()
+    assert layer.fuses_unpooler_gemv(rows)
+    boundary, pre_norm = make_residual_boundary(rows)
+    projected, _, _ = make_projected(boundary, rows)
+    two_step.clear()
+    norm_residual_then_norm(projected, pre_norm, out_dtype=torch.bfloat16)
+    assert communicator.calls == ["gemv_all_gather_boundary"]
+    assert two_step == []
+
+
+@pytest.mark.parametrize("on_sm120", [False, True], ids=["other", "sm120"])
+def test_flashinfer_unpooler_gather_workspace_is_not_built_on_sm120(
+    monkeypatch, on_sm120
+):
+    """The FlashInfer gather + dual norm would shadow the communicator's gather
+    boundary (``_defers_column_gather`` takes the workspace branch first)."""
+    built = []
+    workspace = SimpleNamespace(compile=lambda **_: None)
+
+    def create(*args, **kwargs):
+        built.append(args)
+        return workspace
+
+    monkeypatch.setattr(model_ops, "maybe_create_all_gather_dual_norm", create)
+    monkeypatch.setattr(model_ops, "_on_sm120", lambda: on_sm120)
+    layer = make_layer_stub()
+    layer.feed_forward.shard_unpooler = True
+    layer.post_ffn_norm = SimpleNamespace(
+        has_weight=False,
+        variance_epsilon=1e-8,
+        fused_gain_center=0.0,
+    )
+    model = SimpleNamespace(
+        layers=[layer],
+        start_layer=0,
+        end_layer=1,
+        fuse_across_layers=True,
+        config=SimpleNamespace(hidden_size=HIDDEN),
+        norm=SimpleNamespace(variance_epsilon=1e-5, fused_gain_center=0.0),
+    )
+    model_ops.MuseSpark1xModel._configure_column_gather(model)
+    assert bool(built) == (not on_sm120)
+    assert (layer.all_gather_dual_norm is workspace) == (not on_sm120)
