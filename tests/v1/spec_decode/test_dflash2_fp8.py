@@ -6,23 +6,28 @@ CPU tests: the per-channel quantizer, the model hook's gating (flag values, what
 is not quantized). GPU tests, on the real per-rank shapes of the TP8 draft (hidden 8192,
 intermediate 28672, 64 / 8 heads of 128, vocabulary 202048): the error of each kernel
 against an fp32 reference stays inside a bound next to the bf16 GEMM's own, capture and
-replay of a CUDA graph give the eager bits, and a repeated call gives the same bits.
+replay of a CUDA graph give the eager bits, a repeated call gives the same bits, the FP8
+candidate head returns the bf16 head's top-k (up to ties) and never a padded column.
 """
 
 import glob
+import os
 from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.nn.functional as F
+from torch import nn
 
 from vllm.distributed import parallel_state
 from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
     UnquantizedLinearMethod,
 )
+from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.muse_draft_fp8 import (
     FP8_DTYPE,
+    DraftFp8Head,
     DraftFp8LinearMethod,
     quantize_draft_linear,
     quantize_rows,
@@ -154,6 +159,7 @@ def fake_draft(num_layers: int = 2, k: int = 64, n: int = 32):
         )
     fc = lin(k, 5 * k, 99)
     fake = SimpleNamespace(model=SimpleNamespace(layers=layers, fc=fc))
+    fake.fp8_head = None
     return fake
 
 
@@ -177,18 +183,21 @@ def test_hook_is_a_noop_when_the_flag_is_off(monkeypatch):
         assert torch.equal(lin.weight.data, w)
 
 
-@pytest.mark.parametrize("flag", ["-1", "2"])
+@pytest.mark.parametrize("flag", ["-1", "3"])
 def test_hook_rejects_a_bad_flag(monkeypatch, flag):
     monkeypatch.setenv(FLAG, flag)
-    with pytest.raises(ValueError, match="expected 0 or 1"):
+    with pytest.raises(ValueError, match="expected 0, 1 or 2"):
         DFlash2Qwen3ForCausalLM.process_weights_after_loading(fake_draft())
 
 
+@pytest.mark.parametrize("flag", ["1", "2"])
 @pytest.mark.parametrize("kernel", KERNELS)
-def test_hook_quantizes_the_draft_linears_and_leaves_the_fc(monkeypatch, kernel):
+def test_hook_quantizes_the_draft_linears_and_leaves_the_fc(
+    monkeypatch, flag, kernel
+):
     if kernel == "marlin" and not torch.cuda.is_available():
         pytest.skip("the Marlin repack needs a GPU")
-    monkeypatch.setenv(FLAG, "1")
+    monkeypatch.setenv(FLAG, flag)
     monkeypatch.setenv(KERNEL_FLAG, kernel)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     fake = fake_draft()
@@ -228,6 +237,19 @@ def test_hook_skips_layers_that_are_not_plain_bf16(monkeypatch):
 def test_a_bad_kernel_name_is_rejected():
     with pytest.raises(ValueError, match="expected one of"):
         DraftFp8LinearMethod("triton", 8, 8)
+
+
+def test_attach_fp8_head_gates_on_the_flag(monkeypatch):
+    fake = fake_draft(num_layers=1)
+    head = SimpleNamespace(
+        weight=torch.zeros(4, 4, dtype=torch.bfloat16), quant_method=object()
+    )
+    monkeypatch.setenv(FLAG, "1")
+    DFlash2Qwen3ForCausalLM.attach_fp8_head(fake, head)  # not mode 2: nothing
+    assert fake.fp8_head is None
+    monkeypatch.setenv(FLAG, "2")
+    DFlash2Qwen3ForCausalLM.attach_fp8_head(fake, head)  # not a plain matrix: warns
+    assert fake.fp8_head is None
 
 
 # --------------------------------------------------------------------------------
@@ -327,6 +349,92 @@ def test_cuda_graph_replay_equals_eager(kernel, m):
         graph.replay()
         torch.cuda.synchronize()
         assert torch.equal(y_static, run(x_new))
+
+
+# --------------------------------------------------------------------------------
+# The candidate head (GPU).
+# --------------------------------------------------------------------------------
+
+VOCAB_SHARD = 25256  # 202048 / 8
+HIDDEN = 8192
+
+
+def fake_lm_head(vocab_start: int = 3 * VOCAB_SHARD, padding: int = 0):
+    weight = realistic_weight(VOCAB_SHARD, HIDDEN, seed=8, device="cuda")
+    return SimpleNamespace(
+        weight=nn.Parameter(weight, requires_grad=False),
+        quant_method=SimpleNamespace(
+            apply=lambda head, x, bias=None: F.linear(x, head.weight)
+        ),
+        tp_size=1,
+        shard_indices=SimpleNamespace(
+            org_vocab_start_index=vocab_start, num_org_vocab_padding=padding
+        ),
+    )
+
+
+@needs_cuda
+def test_the_fp8_head_returns_the_bf16_top_k_and_no_padded_column(default_vllm_config):
+    k = 16
+    lm_head = fake_lm_head()
+    fp8_head = DraftFp8Head(lm_head)
+    assert fp8_head.weight_q.shape == (VOCAB_SHARD + 8, HIDDEN)  # 25264, CUTLASS rows
+    assert fp8_head.shard_indices.num_org_vocab_padding == 8
+    assert fp8_head.nbytes < lm_head.weight.numel() * 2 * 0.51
+    processor = LogitsProcessor(202048, scale=0.1767766952966369, soft_cap=20.0)
+    generator = torch.Generator().manual_seed(9)
+    overlap = []
+    for m in (8, 128, 256):
+        hidden = (torch.randn(m, HIDDEN, generator=generator) * 3).to(
+            "cuda", torch.bfloat16
+        )
+        ref_ids, ref_values = processor.get_top_k_tokens(lm_head, hidden, k)
+        ids, values = processor.get_top_k_tokens(fp8_head, hidden, k)
+        assert ids.shape == (m, k) and values.shape == (m, k)
+        start = lm_head.shard_indices.org_vocab_start_index
+        assert ids.min() >= start and ids.max() < start + VOCAB_SHARD
+        overlap += [
+            len(set(a.tolist()) & set(b.tolist())) / k
+            for a, b in zip(ids.cpu(), ref_ids.cpu(), strict=True)
+        ]
+        # The rank-aligned values agree within the FP8 error of a logit (e4m3 weights and
+        # activations: about 3.5% of the largest element, as in the layer test).
+        assert (values - ref_values).abs().max() < 0.05 * values.abs().max()
+    # Random Gaussian logits have close ranks: the FP8 head swaps some tied entries.
+    assert sum(overlap) / len(overlap) > 0.7, sum(overlap) / len(overlap)
+
+
+@needs_cuda
+def test_the_fp8_head_masks_the_vocabulary_padding_too(default_vllm_config):
+    lm_head = fake_lm_head(padding=5)
+    fp8_head = DraftFp8Head(lm_head)
+    assert fp8_head.shard_indices.num_org_vocab_padding == 5 + 8
+    processor = LogitsProcessor(202048)
+    # Make the padding rows the best candidates: they must still be masked out.
+    lm_head.weight.data[-5:] = 1.0
+    fp8_head = DraftFp8Head(lm_head)
+    hidden = torch.ones(8, HIDDEN, device="cuda", dtype=torch.bfloat16)
+    ids, _ = processor.get_top_k_tokens(fp8_head, hidden, 16)
+    start = lm_head.shard_indices.org_vocab_start_index
+    assert ids.max() < start + VOCAB_SHARD - 5
+
+
+@needs_cuda
+def test_the_head_graph_replay_equals_eager(default_vllm_config):
+    lm_head = fake_lm_head()
+    fp8_head = DraftFp8Head(lm_head)
+    processor = LogitsProcessor(202048, scale=0.1767766952966369, soft_cap=20.0)
+    hidden = torch.randn(64, HIDDEN, device="cuda", dtype=torch.bfloat16)
+    processor.get_top_k_tokens(fp8_head, hidden, 16)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        ids_static, values_static = processor.get_top_k_tokens(fp8_head, hidden, 16)
+    hidden.copy_(torch.randn(64, HIDDEN, device="cuda", dtype=torch.bfloat16))
+    graph.replay()
+    torch.cuda.synchronize()
+    ids, values = processor.get_top_k_tokens(fp8_head, hidden, 16)
+    assert torch.equal(ids_static, ids) and torch.equal(values_static, values)
 
 
 # --------------------------------------------------------------------------------

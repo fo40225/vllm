@@ -23,8 +23,14 @@ from vllm.model_executor.layers.linear import (
     UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.muse_draft_fp8 import quantize_draft_linear
+from vllm.model_executor.layers.muse_draft_fp8 import (
+    DraftFp8Head,
+    quantize_draft_linear,
+)
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    UnquantizedEmbeddingMethod,
+)
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
@@ -455,6 +461,9 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
             scale=float(draft_config.get("output_multiplier", 1.0)),
             soft_cap=softcap if softcap > 0 else None,
         )
+        # The FP8 copy of the target's lm_head (VLLM_MUSE_SPARK_SM120_DRAFT_FP8=2), set by
+        # ``attach_fp8_head`` once the draft has been given the target's head.
+        self.fp8_head: DraftFp8Head | None = None
 
     def process_weights_after_loading(self) -> None:
         """Quantize the draft layers to FP8 (VLLM_MUSE_SPARK_SM120_DRAFT_FP8 >= 1).
@@ -465,8 +474,10 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
         stays bf16 as well: VLLM_MUSE_SPARK_SM120_DRAFT_FC_SHARD=2 slices its rows.
         """
         mode = envs.VLLM_MUSE_SPARK_SM120_DRAFT_FP8
-        if mode not in (0, 1):
-            raise ValueError(f"VLLM_MUSE_SPARK_SM120_DRAFT_FP8={mode}: expected 0 or 1.")
+        if mode not in (0, 1, 2):
+            raise ValueError(
+                f"VLLM_MUSE_SPARK_SM120_DRAFT_FP8={mode}: expected 0, 1 or 2."
+            )
         if mode == 0:
             return
         kernel = envs.VLLM_MUSE_SPARK_SM120_DRAFT_FP8_KERNEL
@@ -493,6 +504,31 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
             kernel,
             count,
             freed / 2**20,
+        )
+
+    def attach_fp8_head(self, lm_head: nn.Module) -> None:
+        """Give the candidate top-k an FP8 copy of ``lm_head`` (flag 2); the loader of
+        the draft calls this once the draft has been given the target's head."""
+        if envs.VLLM_MUSE_SPARK_SM120_DRAFT_FP8 != 2:
+            return
+        weight = getattr(lm_head, "weight", None)
+        if (
+            not isinstance(
+                lm_head.quant_method, (UnquantizedEmbeddingMethod, UnquantizedLinearMethod)
+            )
+            or weight is None
+            or weight.dtype not in (torch.bfloat16, torch.float16)
+        ):
+            logger.warning(
+                "VLLM_MUSE_SPARK_SM120_DRAFT_FP8=2 does not apply to the head: it is "
+                "not a plain bf16 matrix. The candidate top-k keeps the bf16 head."
+            )
+            return
+        self.fp8_head = DraftFp8Head(lm_head)
+        logger.info(
+            "DFlash2 candidate head in FP8 (VLLM_MUSE_SPARK_SM120_DRAFT_FP8=2): an "
+            "extra copy of %.0f MiB per rank.",
+            self.fp8_head.nbytes / 2**20,
         )
 
     @staticmethod
@@ -561,8 +597,9 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
     def compute_candidates(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        head = self.fp8_head if self.fp8_head is not None else self.lm_head
         return self.candidate_logits_processor.get_top_k_tokens(
-            self.lm_head, hidden_states, self.model.candidate_selector.top_k
+            head, hidden_states, self.model.candidate_selector.top_k
         )
 
 

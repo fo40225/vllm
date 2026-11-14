@@ -18,6 +18,8 @@ Both are plain device ops of a fixed schedule (no atomics: run-to-run determinis
 and capture into CUDA graphs.
 """
 
+from types import SimpleNamespace
+
 import torch
 from torch import nn
 
@@ -174,3 +176,44 @@ def quantize_draft_linear(layer: LinearBase, kernel: str) -> int:
     )
     return before - after
 
+
+class _HeadMethod:
+    """The ``quant_method`` of ``DraftFp8Head`` as ``LogitsProcessor._apply_head`` calls it."""
+
+    def apply(
+        self, head: "DraftFp8Head", x: torch.Tensor, bias: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        if bias is not None:
+            raise ValueError("the FP8 draft head has no bias")
+        return cutlass_fp8_linear(x, head.weight_q, head.weight_scale)
+
+
+class DraftFp8Head(nn.Module):
+    """An e4m3 copy of a vocab-parallel lm_head shard for the draft's candidate top-k.
+
+    The draft shares the target's bf16 lm_head (which the target needs as it is), so the
+    FP8 head is an extra copy (half the bytes of the shard) that the draft reads instead.
+    It stands in for the head in ``LogitsProcessor.get_top_k_tokens``: the rows are padded
+    to a multiple of 16 for CUTLASS and the logits come back as wide as the padded
+    shard, the padding counted in ``shard_indices.num_org_vocab_padding`` so that the
+    top-k masks those columns to -inf as it masks the vocabulary padding.
+    """
+
+    def __init__(self, lm_head: nn.Module) -> None:
+        super().__init__()
+        weight = lm_head.weight.data
+        wq, scale = quantize_rows(weight, _CUTLASS_ROW_ALIGN)
+        self.register_buffer("weight_q", wq)
+        self.register_buffer("weight_scale", scale)
+        self.quant_method = _HeadMethod()
+        self.tp_size = lm_head.tp_size
+        shard = lm_head.shard_indices
+        self.shard_indices = SimpleNamespace(
+            org_vocab_start_index=shard.org_vocab_start_index,
+            num_org_vocab_padding=shard.num_org_vocab_padding
+            + (wq.shape[0] - weight.shape[0]),
+        )
+
+    @property
+    def nbytes(self) -> int:
+        return self.weight_q.numel() + self.weight_scale.numel() * 4

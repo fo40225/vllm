@@ -1851,22 +1851,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Muse Spark on SM120: the DFlash2 draft's weights in FP8 (e4m3, one scale per output
     # channel, quantized at load from the bf16 checkpoint). At decode the draft's GEMMs
-    # (gate_up, down, QKV, O and the ten kernel projections) are weight-streaming bound
-    # at 1.2-1.4 TB/s, so e4m3 halves their time. 0: bf16 (the draft as loaded). 1: the
-    # linear layers of the draft layers and their kernel projections; the aux fc stays
-    # bf16 (FC_SHARD=2 slices and gathers it) and so do the candidate head, which is the
-    # target's lm_head, and the fused context K/V weight. The verification is exact (the
-    # draft is a proposal, the rejection sampler keeps the output distribution); the
-    # cost is acceptance length, so every change of the value needs the AL check. Frees
-    # about 670 MiB per rank (re-derive --kv-cache-memory-bytes). Read once, when the
-    # draft model is loaded.
+    # (gate_up, down, QKV, O, the ten kernel projections and the candidate head) are
+    # weight-streaming bound at 1.2-1.4 TB/s, so e4m3 halves their time. 0: bf16 (the
+    # draft as loaded). 1: the linear layers of the draft layers (and their kernel
+    # projections); the aux fc stays bf16 (FC_SHARD=2 slices and gathers it). 2: also an
+    # FP8 copy of the target's lm_head shard for the draft's candidate top-k (the target
+    # keeps its bf16 head, so this costs half a shard, 197 MiB, instead of freeing
+    # memory). The verification is exact (the draft is a proposal, the rejection sampler
+    # keeps the output distribution); the cost is acceptance length, so every change of
+    # the value needs the AL check. Frees about 670 MiB per rank at 1 (re-derive
+    # --kv-cache-memory-bytes). Read once, when the draft model is loaded.
     "VLLM_MUSE_SPARK_SM120_DRAFT_FP8": lambda: int(
         os.getenv("VLLM_MUSE_SPARK_SM120_DRAFT_FP8", "0")
     ),
-    # Muse Spark on SM120: the GEMM behind VLLM_MUSE_SPARK_SM120_DRAFT_FP8: "marlin" =
-    # weight-only FP8 (bf16 activations: the lowest error, the same time as cutlass up to
-    # 64 rows, slower above) or "cutlass" = FP8 weights and dynamic per-token FP8
-    # activations on the FP8 tensor cores.
+    # Muse Spark on SM120: the GEMM behind VLLM_MUSE_SPARK_SM120_DRAFT_FP8 for the draft
+    # layers: "marlin" = weight-only FP8 (bf16 activations: the lowest error, the same
+    # time as cutlass up to 64 rows, slower above) or "cutlass" = FP8 weights and dynamic
+    # per-token FP8 activations on the FP8 tensor cores. The candidate head always runs
+    # cutlass (Marlin is slower than bf16 above 64 rows there).
     "VLLM_MUSE_SPARK_SM120_DRAFT_FP8_KERNEL": lambda: os.getenv(
         "VLLM_MUSE_SPARK_SM120_DRAFT_FP8_KERNEL", "cutlass"
     ),
