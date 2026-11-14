@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 
+from vllm import envs
 from vllm.compilation.breakable_cudagraph import (
     BreakableCUDAGraphWrapper,
     is_breakable_cudagraph_enabled,
@@ -87,9 +88,17 @@ class BatchExecutionDescriptor:
     @property
     def is_full_decode_graph(self) -> bool:
         """A FULL graph of decode-only batches (uniform or varlen decode), the only
-        kind a mixed prefill batch is never dispatched to."""
-        return self.cg_mode == CUDAGraphMode.FULL and (
-            self.uniform_token_count is not None or self.max_query_len is not None
+        kind a mixed prefill batch is never dispatched to.
+
+        Never a microbatched twin (``num_ubatches > 1``): the twin of a mixed FULL
+        graph inherits ``uniform_token_count`` from it (``_maybe_ubatch_twin``), so
+        the descriptor alone cannot tell a decode twin from a prefill one, and the
+        capture of a twin does not set the forward-context flag in any case.
+        """
+        return (
+            self.cg_mode == CUDAGraphMode.FULL
+            and self.num_ubatches == 1
+            and (self.uniform_token_count is not None or self.max_query_len is not None)
         )
 
 
@@ -532,8 +541,18 @@ class CudaGraphManager:
                             self._capture_mem_samples.append(free_before - free_after)
                         self.graphs[desc] = graph
                         compilation_counter.num_cudagraph_captured += 1
+                        self._after_graph_capture(desc, forward_fn)
 
         self._graphs_captured = True
+
+    def _after_graph_capture(
+        self,
+        desc: BatchExecutionDescriptor,
+        forward_fn: Callable[[CUDAGraphMode], None],
+    ) -> None:
+        """Called inside ``capture`` right after a FULL graph of ``desc`` is
+        captured, with the forward function of its capture pass (still valid for an
+        eager call). Nothing to do by default."""
 
     def captured_token_counts(self) -> list[int]:
         """Sorted token counts with a captured graph, ignoring LoRA variants."""
@@ -615,6 +634,27 @@ class CudaGraphManager:
         return self.breakable_cg_runner(**model_inputs)
 
 
+def _bit_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """Equality of the bits (a NaN equals itself, +0 differs from -0)."""
+    return (
+        a.shape == b.shape
+        and a.dtype == b.dtype
+        and torch.equal(
+            a.contiguous().view(torch.uint8), b.contiguous().view(torch.uint8)
+        )
+    )
+
+
+def _differing_rows(a: torch.Tensor, b: torch.Tensor) -> str:
+    if a.shape != b.shape or a.dtype != b.dtype:
+        return f"shape/dtype {tuple(a.shape)}/{a.dtype} vs {tuple(b.shape)}/{b.dtype}"
+    rows = a.shape[0]
+    ua = a.contiguous().view(torch.uint8).reshape(rows, -1)
+    ub = b.contiguous().view(torch.uint8).reshape(rows, -1)
+    bad = (ua != ub).any(dim=1).nonzero().flatten().tolist()
+    return f"{len(bad)} of {rows} rows differ, first rows {bad[:4]}"
+
+
 class ModelCudaGraphManager(CudaGraphManager):
     """CudaGraphManager with model-specific capture and hidden state management."""
 
@@ -641,6 +681,10 @@ class ModelCudaGraphManager(CudaGraphManager):
         self.aux_hidden_states: list[torch.Tensor] = []
         self.use_aux_hidden_state_outputs = False
         self.intermediate_tensors: IntermediateTensors | None = None
+        # State of the opt-in replay self-check (VLLM_CUDAGRAPH_REPLAY_SELFCHECK).
+        self._selfcheck_buffers: InputBuffers | None = None
+        self._selfchecked: list[BatchExecutionDescriptor] = []
+        self._selfcheck_failures: list[str] = []
 
     def capture(
         self,
@@ -659,6 +703,8 @@ class ModelCudaGraphManager(CudaGraphManager):
     ) -> None:
         """Capture CUDA graphs for model forward pass."""
         self.use_aux_hidden_state_outputs = use_aux_hidden_state_outputs
+        self._selfcheck_buffers = input_buffers
+        self._log_flagged_decode_graphs()
         if self.use_breakable_cg:
             self.init_breakable_cg_runner(model)
 
@@ -756,6 +802,10 @@ class ModelCudaGraphManager(CudaGraphManager):
                     model, model_inputs, ubatch_state, for_capture=True
                 )
 
+                # The warm-up / capture pass of a microbatched twin does not set
+                # ForwardContext.full_decode_graph (set by forward_fn below, which this
+                # path returns before): a twin never takes a graph-only layout, a DBO
+                # decode launch keeps its graph batches as the eager ones.
                 def ubatch_forward_fn(cg_mode: CUDAGraphMode) -> None:
                     assert cg_mode != CUDAGraphMode.PIECEWISE, (
                         "DBO does not support PIECEWISE cudagraphs"
@@ -821,6 +871,121 @@ class ModelCudaGraphManager(CudaGraphManager):
             return forward_fn
 
         super().capture(create_forward_fn, progress_bar_desc)
+        self._finish_replay_selfcheck()
+
+    def _log_flagged_decode_graphs(self) -> None:
+        """Say how many FULL graphs are decode graphs.
+
+        Their warm-up and capture pass run with ``ForwardContext.full_decode_graph``
+        set, which a model that lays its batch out differently inside a decode graph
+        (the Muse Spark sequence-parallel stream) reads: with none of them in the
+        capture list the flag is inert whatever the model is told.
+        """
+        if self._max_full_descs_to_capture is not None:
+            return  # a memory-profiling sample, not the graph set of the launch
+        full = self._capture_descs.get(CUDAGraphMode.FULL, [])
+        flagged = sorted(d.num_tokens for d in full if d.is_full_decode_graph)
+        logger.info(
+            "CUDA graphs: %d FULL decode graphs are flagged full_decode_graph "
+            "(token counts %s), %d other FULL graphs, %d PIECEWISE graphs.",
+            len(flagged),
+            f"{flagged[0]}..{flagged[-1]}" if flagged else "none",
+            len(full) - len(flagged),
+            len(self._capture_descs.get(CUDAGraphMode.PIECEWISE, [])),
+        )
+
+    def _after_graph_capture(
+        self,
+        desc: BatchExecutionDescriptor,
+        forward_fn: Callable[[CUDAGraphMode], None],
+    ) -> None:
+        if (
+            envs.VLLM_CUDAGRAPH_REPLAY_SELFCHECK
+            and self._max_full_descs_to_capture is None
+            and desc.cg_mode == CUDAGraphMode.FULL
+            and desc.num_ubatches == 1
+            and desc.num_tokens >= envs.VLLM_CUDAGRAPH_REPLAY_SELFCHECK_MIN_TOKENS
+            and self.is_last_pp_rank
+        ):
+            self._replay_selfcheck(desc, forward_fn)
+
+    def _replay_selfcheck(
+        self,
+        desc: BatchExecutionDescriptor,
+        forward_fn: Callable[[CUDAGraphMode], None],
+    ) -> None:
+        """Run the whole model eagerly and as a replay of the graph on the same inputs.
+
+        The warm-up pass of a graph is an eager run with the flag of its capture
+        pass, so the two must agree bit for bit; a replay is also run twice, so a
+        state that a replay leaves behind (a counter, a scratch buffer another stream
+        still writes) shows as a second replay that differs from the first. Random
+        token ids make every row of the dummy batch distinct. A mismatch is
+        collected, and raised when the capture ends (``_finish_replay_selfcheck``).
+
+        Only for graphs whose eager pass takes the kernels of the replay: a model with
+        capture-only kernels (the Muse Spark decode MoE engines below 129 tokens)
+        differs from its graph by design (see the env
+        ``VLLM_CUDAGRAPH_REPLAY_SELFCHECK_MIN_TOKENS``).
+        """
+        assert self._selfcheck_buffers is not None and self.hidden_states is not None
+        n = desc.num_tokens
+        ids = self._selfcheck_buffers.input_ids[:n]
+        gen = torch.Generator(device=ids.device)
+        gen.manual_seed(n)
+        vocab = self.vllm_config.model_config.get_vocab_size()
+        ids.copy_(torch.randint(0, vocab, (n,), device=ids.device, generator=gen))
+
+        def outputs() -> list[torch.Tensor]:
+            torch.accelerator.synchronize()
+            assert self.hidden_states is not None
+            return [
+                self.hidden_states[:n].clone(),
+                *(x[:n].clone() for x in self.aux_hidden_states),
+            ]
+
+        forward_fn(CUDAGraphMode.NONE)
+        eager = outputs()
+        CudaGraphManager.run_fullgraph(self, desc)
+        first = outputs()
+        CudaGraphManager.run_fullgraph(self, desc)
+        second = outputs()
+        problems = []
+        for i, (e, r1, r2) in enumerate(zip(eager, first, second)):
+            if not _bit_equal(e, r1):
+                problems.append(
+                    f"replay != eager pass (output {i}: {_differing_rows(e, r1)})"
+                )
+            if not _bit_equal(r1, r2):
+                problems.append(
+                    f"second replay != first (output {i}: {_differing_rows(r1, r2)})"
+                )
+        self._selfchecked.append(desc)
+        if problems:
+            self._selfcheck_failures.append(f"{desc}: " + "; ".join(problems))
+
+    def _finish_replay_selfcheck(self) -> None:
+        if not envs.VLLM_CUDAGRAPH_REPLAY_SELFCHECK or self._max_full_descs_to_capture:
+            return
+        checked = self._selfchecked
+        flagged = sorted(d.num_tokens for d in checked if d.is_full_decode_graph)
+        if self._selfcheck_failures:
+            for failure in self._selfcheck_failures:
+                logger.error("CUDA graph replay self-check FAILED: %s", failure)
+            raise RuntimeError(
+                f"CUDA graph replay self-check: {len(self._selfcheck_failures)} of "
+                f"{len(checked)} FULL graphs differ from their eager pass: "
+                + self._selfcheck_failures[0]
+            )
+        logger.info(
+            "CUDA graph replay self-check: %d FULL graphs of at least %d tokens "
+            "(%d decode graphs, token counts %s) replay bit for bit as their eager "
+            "pass, twice.",
+            len(checked),
+            envs.VLLM_CUDAGRAPH_REPLAY_SELFCHECK_MIN_TOKENS,
+            len(flagged),
+            f"{flagged[0]}..{flagged[-1]}" if flagged else "none",
+        )
 
     def run_fullgraph(
         self, desc: BatchExecutionDescriptor

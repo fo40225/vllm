@@ -224,6 +224,8 @@ if TYPE_CHECKING:
     VLLM_USE_STANDALONE_COMPILE: bool = True
     VLLM_ENABLE_PREGRAD_PASSES: bool = True
     VLLM_USE_BREAKABLE_CUDAGRAPH: bool = False
+    VLLM_CUDAGRAPH_REPLAY_SELFCHECK: bool = False
+    VLLM_CUDAGRAPH_REPLAY_SELFCHECK_MIN_TOKENS: int = 0
     VLLM_DP_MASTER_IP: str = ""
     VLLM_DP_MASTER_PORT: int = 0
     VLLM_RANDOMIZE_DP_DUMMY_INPUTS: bool = False
@@ -817,6 +819,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # https://github.com/pytorch/pytorch/issues/174502
     "VLLM_ENABLE_PREGRAD_PASSES": lambda: (
         os.environ.get("VLLM_ENABLE_PREGRAD_PASSES", "1") == "1"
+    ),
+    # Debugging aid of the model runner v2 graph manager: after capturing each FULL
+    # graph, run the model once eagerly (the flag of the capture pass included) and
+    # twice as a replay of the graph on the same random token ids, and fail the launch
+    # if a replay differs from the eager pass or from the first replay in a single bit.
+    # Off by default (it runs every graph a few times and allocates eager activations).
+    # A model whose eager pass takes another kernel than its captured graph (the Muse
+    # Spark decode MoE engines, which only run inside a capture) differs from the graph
+    # by design: VLLM_CUDAGRAPH_REPLAY_SELFCHECK_MIN_TOKENS limits the check to graphs
+    # of at least that many tokens (0: every FULL graph).
+    "VLLM_CUDAGRAPH_REPLAY_SELFCHECK": lambda: (
+        os.environ.get("VLLM_CUDAGRAPH_REPLAY_SELFCHECK", "0") == "1"
+    ),
+    "VLLM_CUDAGRAPH_REPLAY_SELFCHECK_MIN_TOKENS": lambda: int(
+        os.environ.get("VLLM_CUDAGRAPH_REPLAY_SELFCHECK_MIN_TOKENS", "0")
     ),
     # Experimental: breakable cudagraph does not rely on torch.compile
     "VLLM_USE_BREAKABLE_CUDAGRAPH": lambda: (

@@ -3,6 +3,7 @@
 
 from collections import defaultdict
 from contextlib import contextmanager
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -781,3 +782,195 @@ def test_model_capture_flags_the_pass_of_a_full_decode_graph(monkeypatch):
         (False, CUDAGraphMode.NONE, 16),
         (False, CUDAGraphMode.PIECEWISE, 16),
     ]
+
+
+def test_a_microbatched_twin_is_never_a_full_decode_graph():
+    """The twin of a mixed FULL graph inherits ``uniform_token_count`` and the capture
+    of a twin sets no forward-context flag: the descriptor must not claim to be one."""
+    twin = BatchExecutionDescriptor(
+        cg_mode=CUDAGraphMode.FULL,
+        num_tokens=272,
+        num_reqs=34,
+        uniform_token_count=8,
+        num_ubatches=2,
+    )
+    assert not twin.is_full_decode_graph
+    assert replace(twin, num_ubatches=1).is_full_decode_graph
+
+
+def _model_manager(monkeypatch, capture_sizes=(8, 16, 24)):
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    monkeypatch.setattr(
+        gpu_cudagraph_utils.current_platform, "get_global_graph_pool", lambda: object()
+    )
+    vllm_config = _create_decode_vllm_config(list(capture_sizes), max_num_seqs=8)
+    vllm_config.model_config = SimpleNamespace(get_vocab_size=lambda: 1000)
+    return gpu_cudagraph_utils.ModelCudaGraphManager(
+        vllm_config=vllm_config,
+        device=torch.device("cpu"),
+        cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+        decode_query_len=8,
+    )
+
+
+def test_the_capture_says_how_many_decode_graphs_it_flags(monkeypatch):
+    """A launch whose graph set holds no FULL decode graph flags nothing: the line the
+    launch check reads must say so (count and token range), and only for the real
+    capture, not for the memory-profiling sample."""
+    manager = _model_manager(monkeypatch)
+    full = manager._capture_descs[CUDAGraphMode.FULL]
+    expected = sorted(d.num_tokens for d in full if d.is_full_decode_graph)
+    assert expected, "the decode graphs of the launch shape are flagged ones"
+    logged = []
+    monkeypatch.setattr(
+        gpu_cudagraph_utils.logger, "info", lambda fmt, *args: logged.append(fmt % args)
+    )
+    manager._log_flagged_decode_graphs()
+    other = len(full) - len(expected)
+    pieces = len(manager._capture_descs.get(CUDAGraphMode.PIECEWISE, []))
+    line = (
+        f"CUDA graphs: {len(expected)} FULL decode graphs are flagged "
+        f"full_decode_graph (token counts {expected[0]}..{expected[-1]}), "
+        f"{other} other FULL graphs, {pieces} PIECEWISE graphs."
+    )
+    assert logged == [line]
+    logged.clear()
+    manager._max_full_descs_to_capture = 2
+    manager._log_flagged_decode_graphs()
+    assert logged == []
+    # No FULL decode graph at all.
+    manager._max_full_descs_to_capture = None
+    manager._capture_descs = {
+        CUDAGraphMode.FULL: [
+            BatchExecutionDescriptor(
+                cg_mode=CUDAGraphMode.FULL, num_tokens=16, num_reqs=8
+            )
+        ]
+    }
+    manager._log_flagged_decode_graphs()
+    assert (
+        "0 FULL decode graphs are flagged full_decode_graph (token counts none)"
+        in (logged[0])
+    )
+
+
+def test_bit_equality_counts_nans_and_the_sign_of_zero():
+    nan = torch.full((4, 8), float("nan"), dtype=torch.bfloat16)
+    assert gpu_cudagraph_utils._bit_equal(nan, nan.clone())
+    zeros = torch.zeros(4, 8, dtype=torch.bfloat16)
+    negative = zeros.clone()
+    negative[2, 3] = -0.0
+    assert not gpu_cudagraph_utils._bit_equal(zeros, negative)
+    assert "1 of 4 rows differ, first rows [2]" in gpu_cudagraph_utils._differing_rows(
+        zeros, negative
+    )
+    assert not gpu_cudagraph_utils._bit_equal(zeros, zeros.float())
+
+
+def _selfcheck_manager(monkeypatch, replay):
+    """A manager whose graph of ``DESC`` is a stand-in that calls ``replay(manager)``
+    and whose forward function writes a function of the token ids."""
+    monkeypatch.setenv("VLLM_CUDAGRAPH_REPLAY_SELFCHECK", "1")
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_offloader",
+        lambda: SimpleNamespace(sync_prev_onload=lambda: None),
+    )
+    manager = _model_manager(monkeypatch)
+    buffers = SimpleNamespace(input_ids=torch.zeros(64, dtype=torch.int32))
+    manager._selfcheck_buffers = buffers
+    manager.hidden_states = torch.zeros(64, 4, dtype=torch.bfloat16)
+    desc = BatchExecutionDescriptor(
+        cg_mode=CUDAGraphMode.FULL, num_tokens=16, num_reqs=2, uniform_token_count=8
+    )
+    manager.graphs[desc] = SimpleNamespace(replay=lambda: replay(manager))
+
+    def forward_fn(cg_mode):
+        assert cg_mode == CUDAGraphMode.NONE
+        write_hidden(manager)
+
+    def write_hidden(m, add=0.0):
+        ids = buffers.input_ids[:16].to(torch.float32)
+        m.hidden_states[:16] = (ids[:, None] + torch.arange(4)).to(torch.bfloat16) + add
+
+    manager.write_hidden = write_hidden
+    return manager, desc, forward_fn
+
+
+def test_the_replay_selfcheck_passes_when_the_graph_is_the_eager_pass(monkeypatch):
+    manager, desc, forward_fn = _selfcheck_manager(
+        monkeypatch, lambda m: m.write_hidden(m)
+    )
+    ran = []
+    monkeypatch.setattr(
+        gpu_cudagraph_utils.logger, "info", lambda fmt, *args: ran.append(fmt % args)
+    )
+    manager._after_graph_capture(desc, forward_fn)
+    assert manager._selfchecked == [desc] and manager._selfcheck_failures == []
+    # The batch is made of distinct random rows.
+    assert len(set(manager._selfcheck_buffers.input_ids[:16].tolist())) > 8
+    manager._finish_replay_selfcheck()
+    assert (
+        "1 FULL graphs of at least 0 tokens (1 decode graphs, token counts 16..16)"
+        in (ran[-1])
+    )
+
+
+def test_the_replay_selfcheck_names_a_graph_that_differs_from_the_eager_pass(
+    monkeypatch,
+):
+    manager, desc, forward_fn = _selfcheck_manager(
+        monkeypatch, lambda m: m.write_hidden(m, add=16.0)
+    )
+    manager._after_graph_capture(desc, forward_fn)
+    assert len(manager._selfcheck_failures) == 1
+    assert (
+        "replay != eager pass (output 0: 16 of 16 rows differ"
+        in (manager._selfcheck_failures[0])
+    )
+    with pytest.raises(RuntimeError, match="1 of 1 FULL graphs differ"):
+        manager._finish_replay_selfcheck()
+
+
+def test_the_replay_selfcheck_names_a_state_the_replay_leaves_behind(monkeypatch):
+    count = []
+
+    def replay(m):
+        count.append(1)
+        m.write_hidden(m, add=16.0 if len(count) == 2 else 0.0)
+
+    manager, desc, forward_fn = _selfcheck_manager(monkeypatch, replay)
+    # The first replay equals the eager pass, the second one does not.
+    manager._after_graph_capture(desc, forward_fn)
+    assert len(manager._selfcheck_failures) == 1
+    assert "second replay != first" in manager._selfcheck_failures[0]
+    assert "replay != eager pass" not in manager._selfcheck_failures[0]
+
+
+def test_the_replay_selfcheck_runs_for_full_graphs_of_a_real_launch_only(monkeypatch):
+    manager, desc, forward_fn = _selfcheck_manager(monkeypatch, lambda m: None)
+    calls = []
+    monkeypatch.setattr(manager, "_replay_selfcheck", lambda d, f: calls.append(d))
+    manager._after_graph_capture(desc, forward_fn)
+    manager._after_graph_capture(replace(desc, num_ubatches=2), forward_fn)
+    manager._after_graph_capture(
+        replace(desc, cg_mode=CUDAGraphMode.PIECEWISE), forward_fn
+    )
+    manager._max_full_descs_to_capture = 2  # the memory-profiling sample
+    manager._after_graph_capture(desc, forward_fn)
+    assert calls == [desc]
+    monkeypatch.setenv("VLLM_CUDAGRAPH_REPLAY_SELFCHECK", "0")
+    manager._max_full_descs_to_capture = None
+    manager._after_graph_capture(desc, forward_fn)
+    assert calls == [desc]
+    # Graphs below the minimum are not checked (their eager pass takes other kernels).
+    monkeypatch.setenv("VLLM_CUDAGRAPH_REPLAY_SELFCHECK", "1")
+    monkeypatch.setenv("VLLM_CUDAGRAPH_REPLAY_SELFCHECK_MIN_TOKENS", "17")
+    manager._after_graph_capture(desc, forward_fn)
+    manager._after_graph_capture(replace(desc, num_tokens=24, num_reqs=3), forward_fn)
+    assert [d.num_tokens for d in calls] == [16, 24]
