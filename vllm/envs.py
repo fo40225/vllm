@@ -1583,9 +1583,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (models/muse_spark/nvidia/flashinfer_shadow) whose CTAs without a tile return
     # and whose merge runs over the active ones only. The output is bitwise the stock
     # kernel's. The patched module is compiled through FlashInfer's JIT under its own
-    # name at the first XQA call (a few minutes per variant, cached) and the stock
-    # kernel runs when it cannot be built or FlashInfer is not 0.7.0.post1. Read once,
-    # when the model is constructed.
+    # name at the first XQA call (about 5 s per variant, cached; the ranks take turns
+    # on FlashInfer's file lock) and the stock kernel runs when it cannot be built or
+    # FlashInfer is not 0.7.0.post1. Read once, when the model is constructed.
     "VLLM_MUSE_SPARK_SM120_XQA_ACTIVE_MERGE": lambda: bool(
         int(os.getenv("VLLM_MUSE_SPARK_SM120_XQA_ACTIVE_MERGE", "1"))
     ),
