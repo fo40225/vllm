@@ -1928,3 +1928,21 @@ class MuseSpark1xForCausalLM(LlamaForCausalLM, SupportsLoRA, MixtureOfExperts):
             n_gates,
         )
         return loaded
+
+    def process_weights_after_loading(self) -> None:
+        """Model-level post-load hook, run by every loader.
+
+        ``--load-format dummy`` never calls ``load_weights``, so materialize the
+        residual-path constants here too (idempotent): dummy-weight runs then
+        take the same fused residual kernels and folded router as real weights.
+        """
+        already = any(
+            getattr(m, "_coefficients_ready", False) for m in self.modules()
+        )
+        n_gates = materialize_residual_path_constants(self)
+        if not already:
+            logger.info(
+                "Materialized residual-path constants for %d gated residual "
+                "connections after loading",
+                n_gates,
+            )
