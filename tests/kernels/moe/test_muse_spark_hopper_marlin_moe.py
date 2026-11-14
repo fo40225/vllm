@@ -23,8 +23,14 @@ from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import 
 from vllm.models.muse_spark.common.layers import MuseSpark1xRMSNormWithInputScale
 from vllm.platforms import current_platform
 
-if not (current_platform.is_device_capability_family(90) and is_fp4_marlin_supported()):
-    pytest.skip("Requires an SM90 GPU with Marlin", allow_module_level=True)
+if not (
+    (
+        current_platform.is_device_capability_family(90)
+        or current_platform.is_device_capability_family(120)
+    )
+    and is_fp4_marlin_supported()
+):
+    pytest.skip("Requires an SM90 or SM120 GPU with Marlin", allow_module_level=True)
 
 E, N, K, TOPK, M = 8, 256, 512, 2, 8
 

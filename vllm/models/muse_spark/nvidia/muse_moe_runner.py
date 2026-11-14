@@ -137,6 +137,19 @@ def validate_deployment(moe_config: FusedMoEConfig, *, kernel_routes: bool) -> N
         )
 
 
+# Capability families that run the route-major Marlin (NVFP4) and Triton (BF16)
+# experts: Hopper, and SM120 as the non-native baseline.
+_ROUTE_MAJOR_CAPABILITY_FAMILIES = (90, 120)
+
+
+def supports_route_major_experts() -> bool:
+    """Whether this device runs the route-major Marlin/Triton experts."""
+    return any(
+        current_platform.is_device_capability_family(family)
+        for family in _ROUTE_MAJOR_CAPABILITY_FAMILIES
+    )
+
+
 def _validate_route_major_deployment(moe_config: FusedMoEConfig) -> None:
     validate_deployment(moe_config, kernel_routes=False)
     parallel_config = moe_config.moe_parallel_config
@@ -572,10 +585,13 @@ class MuseSparkModelOptNvFp4FusedMoE(ModelOptNvFp4FusedMoE):
         quant_config: ModelOptNvFp4Config,
         moe_config: FusedMoEConfig,
     ) -> None:
+        if supports_route_major_experts() and moe_config.moe_backend == "auto":
+            # The oracle prefers FlashInfer CUTLASS over Marlin on SM120.
+            moe_config.moe_backend = "marlin"
         super().__init__(quant_config, moe_config)
         self.use_route_major = (
             self.nvfp4_backend == NvFp4MoeBackend.MARLIN
-            and current_platform.is_device_capability_family(90)
+            and supports_route_major_experts()
         )
         if self.use_route_major:
             _validate_route_major_deployment(moe_config)
@@ -588,8 +604,8 @@ class MuseSparkModelOptNvFp4FusedMoE(ModelOptNvFp4FusedMoE):
             return
         if self.nvfp4_backend != NvFp4MoeBackend.FLASHINFER_TRTLLM:
             raise NotImplementedError(
-                "MuseSpark NVFP4 MoE requires FLASHINFER_TRTLLM or Marlin "
-                f"on Hopper; got {self.nvfp4_backend}."
+                "MuseSpark NVFP4 MoE requires FLASHINFER_TRTLLM, or Marlin on "
+                f"SM90/SM120; got {self.nvfp4_backend}."
             )
         if self.use_a16 or not self.moe.is_act_and_mul:
             raise NotImplementedError(
@@ -746,7 +762,7 @@ class MuseSparkUnquantizedFusedMoE(UnquantizedFusedMoEMethod):
     muse_post_expert_finalize: MusePostExpertFinalize
 
     def __init__(self, moe: FusedMoEConfig) -> None:
-        self.use_route_major = current_platform.is_device_capability_family(90)
+        self.use_route_major = supports_route_major_experts()
         if self.use_route_major:
             _validate_route_major_deployment(moe)
             FusedMoEMethodBase.__init__(self, moe)
