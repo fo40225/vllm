@@ -76,16 +76,29 @@ def muse_max_tokens(num_local_experts: int | None = None) -> int:
     """The largest token count the muse engine serves.
 
     ``VLLM_MUSE_SPARK_SM120_DECODE_MAX_TOKENS`` lowers it (the CUTLASS grouped
-    GEMMs serve the larger batches); a rank with more local experts than the
-    large-batch kernel's plan holds is limited to the small-batch kernel.
+    GEMMs serve the larger batches), but not below the small-batch kernel's 8
+    tokens: a smaller value is raised to 8 with a warning (the engine is turned off
+    with ``VLLM_MUSE_SPARK_SM120_DECODE_ENGINE=cutlass``). A rank with more local
+    experts than the large-batch kernel's plan holds is limited to the small-batch
+    kernel.
     """
-    limit = min(MUSE_MAX_TOKENS, envs.VLLM_MUSE_SPARK_SM120_DECODE_MAX_TOKENS)
+    requested = envs.VLLM_MUSE_SPARK_SM120_DECODE_MAX_TOKENS
+    if requested < MUSE_SMALL_MAX_TOKENS:
+        logger.warning_once(
+            "VLLM_MUSE_SPARK_SM120_DECODE_MAX_TOKENS=%d is below the %d tokens of "
+            "the muse small-batch kernel; using %d. To turn the muse decode engine "
+            "off set VLLM_MUSE_SPARK_SM120_DECODE_ENGINE=cutlass.",
+            requested,
+            MUSE_SMALL_MAX_TOKENS,
+            MUSE_SMALL_MAX_TOKENS,
+        )
+    limit = min(MUSE_MAX_TOKENS, max(requested, MUSE_SMALL_MAX_TOKENS))
     if (
         num_local_experts is not None
         and num_local_experts > MUSE_LARGE_MAX_LOCAL_EXPERTS
     ):
         limit = min(limit, MUSE_SMALL_MAX_TOKENS)
-    return max(limit, 0)
+    return limit
 
 
 def muse_unusable_reason() -> str | None:

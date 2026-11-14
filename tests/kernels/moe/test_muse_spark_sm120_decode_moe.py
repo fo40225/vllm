@@ -988,7 +988,9 @@ def test_large_batch_rows_equal_the_small_batch_kernel(
 
 @pytest.mark.parametrize("routes", [1, 7, 8, 9, 15, 16, 17, 24, 31, 33, 48])
 @torch.inference_mode()
-def test_large_batch_experts_at_the_entry_boundaries(layer: _Layer, routes: int) -> None:
+def test_large_batch_experts_at_the_entry_boundaries(
+    layer: _Layer, routes: int
+) -> None:
     """An expert with 1..48 routes: one entry, or two (a second column group, then a
     second entry) from 9, 17 and 33 routes on; the rows are the small-batch kernel's
     and the entries are as many as the routes need."""
@@ -1155,3 +1157,8 @@ def test_muse_max_tokens_follows_the_experts_and_the_environment(monkeypatch) ->
     assert muse_max_tokens(32) == MAX_LARGE_T
     monkeypatch.setenv("VLLM_MUSE_SPARK_SM120_DECODE_MAX_TOKENS", "8")
     assert muse_max_tokens(32) == 8
+    # Below the small-batch kernel's 8 tokens the engine is not switched off: the
+    # value is raised to 8 (the engine is turned off with DECODE_ENGINE=cutlass).
+    for value in ("7", "1", "0", "-3"):
+        monkeypatch.setenv("VLLM_MUSE_SPARK_SM120_DECODE_MAX_TOKENS", value)
+        assert muse_max_tokens(32) == 8, value

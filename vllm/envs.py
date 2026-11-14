@@ -1341,9 +1341,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # rows in the unit probes (real weights included); end to end on the real model
     # the two engines differ at the rounding level, reproducibly (as they already do
     # at 8 tokens or fewer). The kernel is deterministic and batch invariant. 8
-    # restores the former limit (CUTLASS above 8 tokens). Read once, when a layer's
-    # decode engine is prepared, so it must not change between a CUDA graph capture
-    # and its replay.
+    # restores the former limit (CUTLASS above 8 tokens); smaller values are raised
+    # to 8 with a warning (VLLM_MUSE_SPARK_SM120_DECODE_ENGINE=cutlass turns the
+    # engine off). Read once, when a layer's decode engine is prepared, so it must
+    # not change between a CUDA graph capture and its replay.
     "VLLM_MUSE_SPARK_SM120_DECODE_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_MUSE_SPARK_SM120_DECODE_MAX_TOKENS", "128")
     ),
