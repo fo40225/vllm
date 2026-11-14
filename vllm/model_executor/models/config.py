@@ -97,8 +97,6 @@ class MuseSparkConfig(VerifyAndUpdateConfig):
             return "it needs pipeline and data parallel sizes of 1"
         if pc.use_ubatching:
             return "microbatching is already configured"
-        if vllm_config.speculative_config is not None:
-            return "it does not support speculative decoding"
         if vllm_config.lora_config is not None:
             return "it does not support LoRA"
         if envs.VLLM_USE_V2_MODEL_RUNNER is False:
@@ -108,6 +106,8 @@ class MuseSparkConfig(VerifyAndUpdateConfig):
             return "batch-invariant mode is on"
         # The V2 runner must be able to microbatch this launch: otherwise the launch
         # would end up on the V1 runner (or run unsupported inputs) because of this.
+        # That list also decides on speculative decoding: only the drafters that
+        # build their own attention metadata (DFlash family) may run beside it.
         unsupported = vllm_config._get_dbo_unsupported_features(
             tp_collective_overlap=True
         )

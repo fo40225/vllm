@@ -146,6 +146,15 @@ class OptimizationLevel(IntEnum):
 
 PerformanceMode = Literal["balanced", "interactivity", "throughput"]
 
+# Speculative methods that may run beside microbatches that only overlap the
+# tensor-parallel collectives of eager batches (a model's own opt-in, e.g. Muse Spark
+# prefill overlap). The V2 runner builds no target attention metadata for a
+# microbatched step (each microbatch carries its own) and the drafter of these methods
+# does not read it: DFlashSpeculator builds the draft metadata from its own groups
+# (builds_own_attn_metadata) and takes the target's aux hidden states, which the
+# runner merges back in row order. Every other drafter reads the target metadata.
+DBO_TP_OVERLAP_SPEC_METHODS = ("dflash", "dspark")
+
 IS_QUANTIZED = False
 # The optimizations that depend on these properties currently set to False
 # in all cases.
@@ -3303,8 +3312,14 @@ class VllmConfig:
 
         if self.lora_config is not None:
             unsupported.append("dual batch overlap with LoRA")
-        if self.speculative_config is not None:
-            unsupported.append("dual batch overlap with speculative decoding")
+        if self.speculative_config is not None and not (
+            tp_collective_overlap
+            and self.speculative_config.method in DBO_TP_OVERLAP_SPEC_METHODS
+        ):
+            unsupported.append(
+                "dual batch overlap with speculative decoding "
+                f"(method '{self.speculative_config.method}')"
+            )
         if parallel_config.pipeline_parallel_size > 1:
             unsupported.append("dual batch overlap with pipeline parallelism")
         if (

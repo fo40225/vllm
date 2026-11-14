@@ -1614,13 +1614,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # run-to-run deterministic and identical on all ranks, but not bitwise equal to
     # the unsplit batch (rounding-level differences, as with the sequence-parallel
     # stream). Needs the V2 model runner, SM120, expert parallel, TP > 1, PP = DP = 1
-    # and no speculative decoding, LoRA, multimodal inputs (all modalities capped at
-    # zero by --limit-mm-per-prompt), PIECEWISE CUDA graphs, context parallelism or
-    # VLLM_BATCH_INVARIANT: on such a launch the flag has no effect (a warning if it
-    # was set explicitly), it never changes the model runner the launch gets. 0
-    # turns it off. Two microbatches in flight hold about 0.6 GiB more per rank at
-    # 8192 tokens; the memory profile runs the split batch too, so the KV cache is
-    # sized for them (that much less KV cache).
+    # and no speculative decoding other than the DFlash family (DFlash2, DSpark: the
+    # drafter builds its own attention metadata and takes the merged auxiliary hidden
+    # states, a verify batch is never split), LoRA, multimodal inputs (all
+    # modalities capped at zero by --limit-mm-per-prompt), PIECEWISE CUDA graphs,
+    # context parallelism or VLLM_BATCH_INVARIANT: on such a launch the flag has no
+    # effect (a warning if it was set explicitly), it never changes the model runner
+    # the launch gets. 0 turns it off. Two microbatches in flight hold about 0.6 GiB
+    # more per rank at 8192 tokens; the memory profile runs the split batch too, so
+    # the KV cache is sized for them (that much less KV cache).
     "VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP": lambda: bool(
         int(os.getenv("VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP", "1"))
     ),
