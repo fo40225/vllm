@@ -140,6 +140,9 @@ if TYPE_CHECKING:
     VLLM_ROCM_MUSE_MOE_REDUCE_DTYPE: str = "fp32"
     VLLM_ROCM_MUSE_MOE_ONLINE_QUANT: str = ""
     VLLM_MUSE_SPARK_FUSED_KERNELS: bool = True
+    VLLM_MUSE_SPARK_SM120_DECODE_ENGINE: Literal["auto", "muse", "b12x", "cutlass"] = (
+        "auto"
+    )
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
     VLLM_ROCM_USE_AITER_LINEAR_HIPBMM: bool = False
     VLLM_ROCM_USE_AITER_MOE: bool = True
@@ -1288,6 +1291,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # them. Set to 0 to force the unfused PyTorch paths, e.g. for A/B tests.
     "VLLM_MUSE_SPARK_FUSED_KERNELS": lambda: bool(
         int(os.getenv("VLLM_MUSE_SPARK_FUSED_KERNELS", "1"))
+    ),
+    # Muse Spark on SM120: the engine of the NVFP4 MoE for a few tokens (padded
+    # batches of up to 8 inside CUDA graphs). "auto" picks the _muse_C decode
+    # kernel when the extension builds and the layer has its shapes, else b12x
+    # when usable, else the CUTLASS grouped GEMMs. "muse" and "b12x" force that
+    # engine (falling back with a warning if it cannot be used); "cutlass" turns
+    # both decode engines off. Batch-invariant mode, CUDA graphs off and
+    # --moe-backend != auto also turn them off. Read once, when a layer is
+    # constructed.
+    "VLLM_MUSE_SPARK_SM120_DECODE_ENGINE": env_with_choices(
+        "VLLM_MUSE_SPARK_SM120_DECODE_ENGINE",
+        "auto",
+        ["auto", "muse", "b12x", "cutlass"],
+        case_sensitive=False,
     ),
     # use aiter linear op if aiter ops are enabled
     # The following list of related ops

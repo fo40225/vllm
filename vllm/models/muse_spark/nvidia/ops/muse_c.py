@@ -41,6 +41,7 @@ _CSRC_DIR = Path(__file__).resolve().parent.parent / "csrc"
 _SOURCES = (
     "muse_c_bindings.cpp",
     "muse_nvfp4_experts_quant.cu",
+    "muse_nvfp4_decode_moe.cu",
     "muse_spark_mul_tanh_soft_cap.cu",
     "muse_spark_qknorm_rope_kv_insert.cu",
 )
@@ -311,6 +312,45 @@ def _register_fakes() -> None:
         _fakes_registered.add("fused_muse_spark_qknorm_rope_kv_insert")
 
 
+def _register_decode_fakes() -> None:
+    """Fakes of the NVFP4 decode MoE ops (they only write their arguments)."""
+    if "nvfp4_decode_moe" in _fakes_registered or not _op_defined("nvfp4_decode_moe"):
+        return
+
+    @torch.library.register_fake("_muse_C::nvfp4_decode_moe")
+    def _nvfp4_decode_moe_fake(
+        hidden: torch.Tensor,
+        topk_ids: torch.Tensor,
+        expert_map: torch.Tensor | None,
+        w13: torch.Tensor,
+        sf13: torch.Tensor,
+        w2: torch.Tensor,
+        sf2: torch.Tensor,
+        prm: torch.Tensor,
+        gs: torch.Tensor,
+        up_first: bool,
+        rows: torch.Tensor,
+        perm_idx: torch.Tensor,
+        hq_data: torch.Tensor,
+        hq_sf: torch.Tensor,
+        plan: torch.Tensor,
+        ctl: torch.Tensor,
+        dbg_acc: torch.Tensor | None = None,
+        flags: int = 0,
+        xq_data: torch.Tensor | None = None,
+        xq_sf: torch.Tensor | None = None,
+    ) -> None:
+        return None
+
+    @torch.library.register_fake("_muse_C::nvfp4_decode_act_quant")
+    def _nvfp4_decode_act_quant_fake(
+        hidden: torch.Tensor, gs: torch.Tensor, data: torch.Tensor, sf: torch.Tensor
+    ) -> None:
+        return None
+
+    _fakes_registered.add("nvfp4_decode_moe")
+
+
 def load() -> None:
     """Load the `_muse_C` library, building it on the first use of a cache dir.
 
@@ -337,6 +377,7 @@ def load() -> None:
     # Outside the failure-latching path: a missing fake must not poison load().
     try:
         _register_fakes()
+        _register_decode_fakes()
     except Exception:
         logger.warning("Could not register _muse_C fake ops", exc_info=True)
 

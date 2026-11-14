@@ -44,6 +44,7 @@ from vllm.models.muse_spark.nvidia.sm120_nvfp4_moe import (
     B12X_MAX_TOKENS,
     MuseSparkSm120NvFp4Experts,
     b12x_decode_engine_enabled,
+    decode_kernel_params,
     fold_sm120_nvfp4_scales,
     make_sm120_nvfp4_quant_config,
     swap_gate_up_halves_,
@@ -494,8 +495,10 @@ def test_fold_keeps_the_gate_and_up_scales_apart() -> None:
     )
     a13 = w13_input_scale.max().item()
     a2 = w2_input_scale.max().item()
-    for tensor in scales:
-        assert tensor.shape == (num_experts,) and tensor.dtype == torch.float32
+    for name in scales._fields:
+        tensor = getattr(scales, name)
+        expected = (2,) if name == "gs" else (num_experts,)
+        assert tensor.shape == expected and tensor.dtype == torch.float32
         assert tensor.is_contiguous()
     for e in range(num_experts):
         s1, s3 = w13_scale_2[e].tolist()
@@ -506,6 +509,43 @@ def test_fold_keeps_the_gate_and_up_scales_apart() -> None:
         assert math.isclose(
             scales.g2_alphas[e].item(), a2 * w2_scale_2[e].item(), rel_tol=1e-6
         )
+
+
+def test_decode_scales_are_exact_and_consistent_with_the_fold() -> None:
+    """The decode kernel's scales: the fold's gate / down alphas, plus the up
+    alpha the fold loses and the two global activation scales."""
+    g = torch.Generator().manual_seed(1)
+    num_experts = 7
+    w13_scale_2 = torch.rand(num_experts, 2, generator=g, dtype=torch.float32) * 0.02
+    w13_scale_2 += 0.005
+    w13_input_scale = torch.rand(num_experts, 2, generator=g, dtype=torch.float32) + 0.5
+    w2_scale_2 = torch.rand(num_experts, generator=g, dtype=torch.float32) * 0.02
+    w2_input_scale = torch.rand(num_experts, generator=g, dtype=torch.float32) + 0.5
+    scales = fold_sm120_nvfp4_scales(
+        w13_scale_2, w13_input_scale, w2_scale_2, w2_input_scale
+    )
+    a13 = w13_input_scale.float().max()
+    # Bitwise: the same products as the fold's.
+    assert torch.equal(scales.alpha_g, scales.g1_alphas)
+    assert torch.equal(scales.alpha2, scales.g2_alphas)
+    assert scales.gs[0].item() == scales.a1_gscale[0].item()
+    assert scales.gs[0].item() == (1.0 / a13).item()
+    assert scales.gs[1].item() == (1.0 / w2_input_scale.float().max()).item()
+    # s3 is recoverable from the up alpha, and from the fold's a2_gscale.
+    torch.testing.assert_close(
+        scales.alpha_u / a13, w13_scale_2[:, 1], rtol=1e-6, atol=0
+    )
+    s3_over_s1 = scales.alpha_u / scales.alpha_g
+    torch.testing.assert_close(
+        scales.a2_gscale * w2_input_scale.float().max(), s3_over_s1, rtol=1e-6, atol=0
+    )
+    prm, gs = decode_kernel_params(scales)
+    assert prm.shape == (num_experts, 4) and prm.dtype == torch.float32
+    assert torch.equal(prm[:, 0], scales.alpha_g)
+    assert torch.equal(prm[:, 1], scales.alpha_u)
+    assert torch.equal(prm[:, 2], scales.alpha2)
+    assert torch.all(prm[:, 3] == 0)
+    assert torch.equal(gs, scales.gs)
 
 
 @pytest.mark.parametrize("num_experts", [1, 5, 16])

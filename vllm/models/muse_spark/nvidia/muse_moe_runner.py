@@ -79,10 +79,12 @@ from vllm.models.muse_spark.nvidia.ops.mnnvl_fusions import (
 )
 from vllm.models.muse_spark.nvidia.sm120_nvfp4_moe import (
     B12X_MAX_TOKENS,
+    MUSE_MAX_TOKENS,
     MuseSparkSm120NvFp4Experts,
-    b12x_decode_engine_enabled,
     check_sm120_nvfp4_supported,
+    fold_sm120_nvfp4_scales,
     make_sm120_nvfp4_quant_config,
+    select_decode_engine,
     swap_gate_up_halves_,
 )
 from vllm.platforms import current_platform
@@ -676,14 +678,20 @@ class MuseSparkModelOptNvFp4FusedMoE(ModelOptNvFp4FusedMoE):
         # Load the input scales of every expert, so that their global max (the
         # TRT-LLM semantics) is the same on all ranks under EP.
         self.use_global_sf = True
-        # The CUDA graph and batch invariance settings are in scope here.
-        self.use_b12x_decode = b12x_decode_engine_enabled(moe_config.moe_backend)
+        # The CUDA graph and batch invariance settings are in scope here. The
+        # choice is final for the layer: weight (re)loads derive the layout from it.
+        self.decode_engine = select_decode_engine(moe_config.moe_backend, moe_config)
+        self.use_b12x_decode = self.decode_engine == "b12x"
+        self.use_muse_decode = self.decode_engine == "muse"
         logger.info_once(
             "MuseSpark NVFP4: native FP4 MoE on SM120 with %s.",
-            f"b12x for up to {B12X_MAX_TOKENS} padded tokens in CUDA graphs and "
-            "CUTLASS grouped GEMMs otherwise"
-            if self.use_b12x_decode
-            else "CUTLASS grouped GEMMs",
+            {
+                "muse": f"the muse decode kernel for up to {MUSE_MAX_TOKENS} padded "
+                "tokens in CUDA graphs and CUTLASS grouped GEMMs otherwise",
+                "b12x": f"b12x for up to {B12X_MAX_TOKENS} padded tokens in CUDA "
+                "graphs and CUTLASS grouped GEMMs otherwise",
+                "cutlass": "CUTLASS grouped GEMMs",
+            }[self.decode_engine],
         )
 
     def process_weights_after_loading(self, layer: "MuseSparkRoutedExperts") -> None:
@@ -762,13 +770,23 @@ class MuseSparkModelOptNvFp4FusedMoE(ModelOptNvFp4FusedMoE):
         # [E, 2] and fuse the alphas into it in place; neither is acceptable here.
         # The packed weights are used as loaded, except that a layer which runs
         # the b12x engine reorders w13 to [up; gate] in place, before its block
-        # scales are swizzled. That layout needs the _muse_C extension, so it is
-        # loaded first: if it cannot be built, the layer keeps the checkpoint's
-        # order and the stock kernels.
+        # scales are swizzled. A decode engine needs the _muse_C extension (for
+        # its kernel, or for the quantization kernel of the reordered layout), so
+        # it is loaded first: if it cannot be built, the layer keeps the
+        # checkpoint's order and the stock kernels. The muse engine takes the
+        # checkpoint's order as it is.
         # A weight reload (layerwise reload, refit) runs this again on freshly
         # loaded tensors in the checkpoint's order, so swapping again is right.
-        up_gate_layout = self.use_b12x_decode and self._load_muse_c()
-        self.use_b12x_decode = up_gate_layout
+        # The engine was chosen at construction and stays (it is only ever
+        # demoted below, and a demotion is final), so the layout is the same on
+        # every (re)load.
+        engine = self.decode_engine
+        if engine != "cutlass" and not self._load_muse_c():
+            engine = "cutlass"
+        self.decode_engine = engine
+        self.use_b12x_decode = engine == "b12x"
+        self.use_muse_decode = engine == "muse"
+        up_gate_layout = self.use_b12x_decode
         if up_gate_layout:
             swap_gate_up_halves_(layer.w13_weight.data, layer.w13_weight_scale.data)
         w13_scale, w2_scale, self.moe_quant_config = make_sm120_nvfp4_quant_config(
@@ -792,7 +810,17 @@ class MuseSparkModelOptNvFp4FusedMoE(ModelOptNvFp4FusedMoE):
         experts = self.moe_kernel.fused_experts
         assert isinstance(experts, MuseSparkSm120NvFp4Experts)
         experts.up_gate_layout = up_gate_layout
-        experts.use_b12x_decode = up_gate_layout
+        experts.use_b12x_decode = self.use_b12x_decode
+        experts.use_muse_decode = self.use_muse_decode
+        # The raw global scales again, for the exact gate / up / down alphas of
+        # the decode kernel (the quant config only carries the folded ones). This
+        # runs on every (re)load, so the scales never go stale.
+        experts.decode_scales = fold_sm120_nvfp4_scales(
+            layer.w13_weight_scale_2.data,
+            layer.w13_input_scale.data,
+            layer.w2_weight_scale_2.data,
+            layer.w2_input_scale.data,
+        )
         experts.process_weights_after_loading(layer)
 
     @staticmethod
@@ -804,7 +832,7 @@ class MuseSparkModelOptNvFp4FusedMoE(ModelOptNvFp4FusedMoE):
         except Exception as e:
             logger.warning_once(
                 "MuseSpark SM120 MoE: the _muse_C extension could not be built "
-                "(%s: %s); the b12x decode engine is off and the CUTLASS grouped "
+                "(%s: %s); the decode engines are off and the CUTLASS grouped "
                 "GEMMs run every batch.",
                 type(e).__name__,
                 e,

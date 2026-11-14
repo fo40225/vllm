@@ -22,6 +22,42 @@ void mul_and_silu_scaled_fp4_experts_quant(
     at::Tensor const& input_offset_by_experts,
     at::Tensor const& output_scale_offset_by_experts);
 
+// NVFP4 (W4A4) MoE experts for a few tokens on SM120 (muse_nvfp4_decode_moe.cu).
+// One persistent launch: routing + activation quantization + GEMM1 + SiLU * up +
+// NVFP4 requantization into hq, then GEMM2 into route-major unweighted bf16
+// `rows` [T_PAD * 8, 4096] (rows of non-local routes are left untouched) and
+// `perm_idx` [T_PAD * 8] (route index, or -1 for a non-local route).
+//   hidden [T, 4096] bf16, topk_ids [T, 8] int32 (global ids), expert_map
+//   [E_global] int32 (null: identity), w13 [E_local, 8192, 2048] u8 and w2
+//   [E_local, 4096, 2048] u8 (packed e2m1), sf13 [E_local, 8192, 256] / sf2
+//   [E_local, 4096, 256] e4m3 swizzled, prm [E_local, 4] fp32 = (alpha_g, alpha_u,
+//   alpha2, 0), gs [2] fp32 = (1 / a13, 1 / a2). w13 rows are [up; gate] if
+//   up_first, else [gate; up]. hq_data [64, 2048] u8, hq_sf [64, 256] u8 and
+//   plan (int32, >= 708 entries) are scratch; ctl (int32, >= 66 entries) holds
+//   the persistent kernel's counters: zero it once, every launch leaves it zero.
+//   dbg_acc optionally receives the raw GEMM1 sums. flags: 1 = two launches
+//   (plan B), 2 = zero the counters with a memset node first, 4 = zero the rows
+//   of non-local routes, 8 = with 1: no programmatic dependent launch; bits 16.. override the grid size (0 = one CTA per SM).
+//   xq_data [T, 2048] u8 / xq_sf [T, 256] u8 (linear scales), when given, are the
+//   activations quantized by the stock op (ops.scaled_fp4_quant with
+//   is_sf_swizzled_layout=False and gs[0]) and replace the in-kernel quantization.
+void nvfp4_decode_moe(at::Tensor const& hidden, at::Tensor const& topk_ids,
+                      std::optional<at::Tensor> const& expert_map,
+                      at::Tensor const& w13, at::Tensor const& sf13,
+                      at::Tensor const& w2, at::Tensor const& sf2,
+                      at::Tensor const& prm, at::Tensor const& gs, bool up_first,
+                      at::Tensor& rows, at::Tensor& perm_idx,
+                      at::Tensor& hq_data, at::Tensor& hq_sf, at::Tensor& plan,
+                      at::Tensor& ctl, std::optional<at::Tensor> const& dbg_acc,
+                      int64_t flags, std::optional<at::Tensor> const& xq_data,
+                      std::optional<at::Tensor> const& xq_sf);
+
+// The in-kernel activation quantization of nvfp4_decode_moe on its own, for
+// tests: hidden [T, 4096] bf16 -> codes [T, 2048] u8 and linear e4m3 scales
+// [T, 256] u8, gs[0] = 1 / a13.
+void nvfp4_decode_act_quant(at::Tensor const& hidden, at::Tensor const& gs,
+                            at::Tensor& data, at::Tensor& sf);
+
 // Muse Spark attention-side ops, ported from vllm-project/vllm#62132 (the
 // stock `torch.ops._C` versions of the same ops). Schemas are identical.
 

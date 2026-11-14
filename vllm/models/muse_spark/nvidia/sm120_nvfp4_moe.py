@@ -2,24 +2,28 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """MuseSpark1x native-FP4 (NVFP4 W4A4) MoE experts for SM120.
 
-Two engines on the FP4 tensor cores: grouped CUTLASS GEMMs, and for a few tokens
-inside CUDA graphs the fused b12x decode kernel (``ops/b12x_decode_moe.py``).
+Three engines on the FP4 tensor cores: grouped CUTLASS GEMMs, and for a few
+tokens inside CUDA graphs either the muse decode kernel of the ``_muse_C``
+extension (``ops/muse_decode_moe.py``) or the fused b12x decode kernel
+(``ops/b12x_decode_moe.py``). ``VLLM_MUSE_SPARK_SM120_DECODE_ENGINE`` picks the
+decode engine of a layer when it is constructed (see ``select_decode_engine``).
 The experts stop after GEMM2 and hand the unweighted rows to the post-GEMM2 hook
 (the post-expert norm), which also does the weighted top-k sum.
 
 MuseSpark checkpoints carry separate global scales for the gate (w1) and up
 (w3) halves of ``w13``, while the grouped GEMM takes one alpha per expert. The
 up-side gain is folded into the intermediate quantization scale instead (see
-``fold_sm120_nvfp4_scales``), which yields the same FP4 codes as two alphas.
+``fold_sm120_nvfp4_scales``), which yields the same FP4 codes as two alphas. The
+muse kernel keeps the two alphas apart and needs no fold.
 
-The checkpoint's ``w13`` rows are ``[gate; up]``. A layer that runs the b12x
-engine stores them as ``[up; gate]`` instead (see ``swap_gate_up_halves_``), the
-order the b12x kernels consume without touching the weights, and its CUTLASS
-path quantizes the intermediate with the fused ``_muse_C`` kernel that reads the
-halves in that order. Every other layer keeps the checkpoint's order and the
-stock kernel, so that the JIT-built extension (nvcc and ninja) is needed only
-where b12x runs. ``MuseSparkSm120NvFp4Experts.up_gate_layout`` says which a
-layer holds.
+The checkpoint's ``w13`` rows are ``[gate; up]``, and every layer keeps that
+order (and the stock SiLU * up quantization kernel in its CUTLASS path) except
+one that runs the b12x engine: it stores them as ``[up; gate]`` instead (see
+``swap_gate_up_halves_``), the order the b12x kernels consume without touching
+the weights, and its CUTLASS path quantizes the intermediate with the fused
+``_muse_C`` kernel that reads the halves in that order. The JIT-built extension
+(nvcc and ninja) is needed only where a decode engine runs.
+``MuseSparkSm120NvFp4Experts.up_gate_layout`` says which layout a layer holds.
 """
 
 from typing import NamedTuple
@@ -65,6 +69,13 @@ from vllm.models.muse_spark.nvidia.ops.b12x_decode_moe import (
     b12x_unusable_reason,
     mark_b12x_setup_failed,
 )
+from vllm.models.muse_spark.nvidia.ops.muse_decode_moe import (
+    MUSE_MAX_TOKENS,
+    MuseDecodeMoE,
+    mark_muse_setup_failed,
+    muse_shape_mismatch,
+    muse_unusable_reason,
+)
 from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
@@ -77,12 +88,38 @@ _SWAP_CHUNK_BYTES = 32 << 20
 
 
 class Sm120NvFp4Scales(NamedTuple):
-    """Per-expert fp32 ``[num_local_experts]`` scales of the grouped GEMMs."""
+    """fp32 scales of the SM120 NVFP4 engines.
+
+    The first four are the per-expert ``[num_local_experts]`` scales of the
+    grouped GEMMs (with the up-side gain folded into ``a2_gscale``). The rest
+    are the exact, unfolded scales of the decode kernel, which applies the gate
+    and up alphas separately: ``alpha_g``, ``alpha_u``, ``alpha2`` are per expert
+    and ``gs`` is the pair ``(1 / a13, 1 / a2)`` of global activation scales.
+    """
 
     a1_gscale: torch.Tensor
     g1_alphas: torch.Tensor
     a2_gscale: torch.Tensor
     g2_alphas: torch.Tensor
+    alpha_g: torch.Tensor
+    alpha_u: torch.Tensor
+    alpha2: torch.Tensor
+    gs: torch.Tensor  # [2]
+
+
+def decode_kernel_params(scales: Sm120NvFp4Scales) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(prm [E, 4], gs [2])`` as the decode kernel reads them: per expert
+    ``(alpha_g, alpha_u, alpha2, 0)``, and ``(1 / a13, 1 / a2)``."""
+    prm = torch.stack(
+        (
+            scales.alpha_g,
+            scales.alpha_u,
+            scales.alpha2,
+            torch.zeros_like(scales.alpha_g),
+        ),
+        dim=1,
+    ).contiguous()
+    return prm, scales.gs.contiguous()
 
 
 def fold_sm120_nvfp4_scales(
@@ -100,6 +137,11 @@ def fold_sm120_nvfp4_scales(
 
         a1_gscale = 1 / a13            g1_alphas = a13 * s1
         a2_gscale = (s3 / s1) / a2     g2_alphas = a2 * s2
+
+    The decode kernel needs no fold: it keeps the gate and up alphas apart
+    (``alpha_g = a13 * s1``, ``alpha_u = a13 * s3``, ``alpha2 = a2 * s2``) and
+    quantizes the intermediate with ``1 / a2``. ``g1_alphas`` alone cannot give
+    ``s3`` back, which is why this takes the raw ``w13_weight_scale_2``.
     """
     s1 = w13_weight_scale_2[:, 0].float()
     s3 = w13_weight_scale_2[:, 1].float()
@@ -111,6 +153,10 @@ def fold_sm120_nvfp4_scales(
         g1_alphas=(a13 * s1).contiguous(),
         a2_gscale=((s3 / s1) / a2).contiguous(),
         g2_alphas=(a2 * s2).contiguous(),
+        alpha_g=(a13 * s1).contiguous(),
+        alpha_u=(a13 * s3).contiguous(),
+        alpha2=(a2 * s2).contiguous(),
+        gs=torch.stack((1.0 / a13, 1.0 / a2)).contiguous(),
     )
 
 
@@ -186,6 +232,10 @@ def make_sm120_nvfp4_quant_config(
     return w13_swizzled, w2_swizzled, quant_config
 
 
+# The decode engines a layer can be built for, in the order ``auto`` tries them.
+_AUTO_ENGINES = ("muse", "b12x")
+
+
 def b12x_decode_engine_enabled(moe_backend: str) -> bool:
     """Whether a layer is built for the b12x decode engine, which serves padded
     batches of up to ``B12X_MAX_TOKENS`` tokens inside CUDA graphs.
@@ -194,21 +244,13 @@ def b12x_decode_engine_enabled(moe_backend: str) -> bool:
     ``_muse_C`` extension, so the choice is made at layer construction, from the
     config in scope. ``--moe-backend cutlass`` forces CUTLASS everywhere.
     Otherwise (``auto``) the engine needs CUDA graphs, since it only runs while
-    one is captured, and batch-invariant mode excludes it, since its kernel is
-    not bitwise deterministic. A host whose b12x or build toolchain cannot serve
+    one is captured, and batch-invariant mode excludes it (its kernel is not
+    bitwise deterministic, and it rounds unlike CUTLASS). A host whose b12x or build toolchain cannot serve
     it keeps the checkpoint's layout and the stock kernels.
     """
-    reason = _config_without_b12x(moe_backend)
+    reason, unusable = _b12x_unavailable(moe_backend)
     if reason is not None:
-        logger.info_once(
-            "MuseSpark SM120 MoE: the b12x decode engine is off (%s); the CUTLASS "
-            "grouped GEMMs run every batch.",
-            reason,
-        )
-        return False
-    reason = b12x_unusable_reason() or muse_c.preflight()
-    if reason is not None:
-        logger.warning_once(
+        (logger.warning_once if unusable else logger.info_once)(
             "MuseSpark SM120 MoE: the b12x decode engine is off (%s); the CUTLASS "
             "grouped GEMMs run every batch.",
             reason,
@@ -217,9 +259,109 @@ def b12x_decode_engine_enabled(moe_backend: str) -> bool:
     return True
 
 
-def _config_without_b12x(moe_backend: str) -> str | None:
+def select_decode_engine(moe_backend: str, moe_config: FusedMoEConfig) -> str:
+    """The decode engine of a layer: ``"muse"``, ``"b12x"`` or ``"cutlass"``.
+
+    Chosen when the layer is constructed (the CUDA graph and batch invariance
+    settings are in scope then), from ``VLLM_MUSE_SPARK_SM120_DECODE_ENGINE``:
+
+    * ``auto`` (default): the muse engine if the ``_muse_C`` extension can be
+      built and the layer has the kernel's shapes, else b12x if it is usable,
+      else CUTLASS.
+    * ``muse`` / ``b12x``: that engine; if it cannot be used, a warning says why
+      and the layer falls back (muse to b12x to CUTLASS, b12x to CUTLASS).
+    * ``cutlass``: neither decode engine.
+
+    Batch-invariant mode excludes both engines (CUTLASS at every batch size).
+    Whatever the choice, the engines only serve padded batches of up to eight
+    tokens inside CUDA graphs, so a deployment without CUDA graphs (or with
+    ``--moe-backend cutlass``) gets CUTLASS, and eager passes and larger batches
+    always run the CUTLASS grouped GEMMs.
+    """
+    requested = envs.VLLM_MUSE_SPARK_SM120_DECODE_ENGINE.lower()
+    reason = _config_without_decode_engine(moe_backend)
+    if reason is not None:
+        logger.info_once(
+            "MuseSpark SM120 MoE: the decode engines are off (%s); the CUTLASS "
+            "grouped GEMMs run every batch.",
+            reason,
+        )
+        return "cutlass"
+    if requested == "cutlass":
+        logger.info_once(
+            "MuseSpark SM120 MoE: the decode engines are off "
+            "(VLLM_MUSE_SPARK_SM120_DECODE_ENGINE=cutlass); the CUTLASS grouped "
+            "GEMMs run every batch."
+        )
+        return "cutlass"
+    candidates = _AUTO_ENGINES if requested in ("auto", "muse") else (requested,)
+    skipped: list[tuple[str, str, bool]] = []
+    for engine in candidates:
+        if engine == "muse":
+            reason, unusable = _muse_unavailable(moe_config)
+        else:
+            reason, unusable = _b12x_unavailable(moe_backend)
+        if reason is None:
+            break
+        skipped.append((engine, reason, unusable))
+    else:
+        engine = "cutlass"
+    for name, why, unusable in skipped:
+        # A forced engine, or a host that cannot serve any, deserves a warning;
+        # an engine ``auto`` passes over because of the layer or the mode does not.
+        warn = requested == name or (engine == "cutlass" and unusable)
+        (logger.warning_once if warn else logger.info_once)(
+            "MuseSpark SM120 MoE: the %s decode engine is off (%s).", name, why
+        )
+    logger.info_once(
+        "MuseSpark SM120 MoE: decode engine %s (VLLM_MUSE_SPARK_SM120_DECODE_ENGINE"
+        "=%s).",
+        engine,
+        requested,
+    )
+    return engine
+
+
+def _muse_unavailable(moe_config: FusedMoEConfig) -> tuple[str | None, bool]:
+    """``(reason, unusable)``: why a layer cannot run the muse engine, and whether
+    the host (not the layer or the mode) is the cause."""
+    reason = muse_shape_mismatch(
+        moe_config.hidden_dim,
+        moe_config.intermediate_size_per_partition,
+        moe_config.experts_per_token,
+        moe_config.num_local_experts,
+    )
+    if reason is None and moe_config.in_dtype != torch.bfloat16:
+        reason = "the kernel takes bfloat16 activations"
+    if reason is not None:
+        return reason, False
+    reason = muse_unusable_reason()
+    return reason, reason is not None
+
+
+def _b12x_unavailable(moe_backend: str) -> tuple[str | None, bool]:
+    """Like ``_muse_unavailable`` for the b12x engine, for any layer shape."""
+    reason = _config_without_decode_engine(moe_backend)
+    if reason is not None:
+        return reason, False
+    reason = b12x_unusable_reason() or muse_c.preflight()
+    return reason, reason is not None
+
+
+def _config_without_decode_engine(moe_backend: str) -> str | None:
+    """Why no decode engine can run in this config: they serve CUDA graphs, and
+    batch-invariant mode keeps CUTLASS at every batch size.
+
+    A decode engine and the CUTLASS grouped GEMMs round differently (b12x also is
+    not bitwise deterministic; the muse kernel applies the gate and up global
+    scales separately where CUTLASS folds them, ~3% rel L2 apart on a real
+    checkpoint). With an engine, the output of a request would depend on the
+    number of other requests in its step, which batch-invariant mode forbids.
+    """
     if moe_backend != "auto":
         return f"--moe-backend {moe_backend}"
+    if envs.VLLM_BATCH_INVARIANT:
+        return "batch-invariant mode"
     vllm_config = get_current_vllm_config_or_none()
     if vllm_config is None:
         return "no vLLM config in scope"
@@ -229,8 +371,6 @@ def _config_without_b12x(moe_backend: str) -> str | None:
         or (model_config is not None and model_config.enforce_eager)
     ):
         return "CUDA graphs are off"
-    if envs.VLLM_BATCH_INVARIANT:
-        return "batch-invariant mode"
     return None
 
 
@@ -276,13 +416,21 @@ class MuseSparkSm120NvFp4Experts(mk.FusedMoEExpertsModular):
             raise NotImplementedError("The post-GEMM2 hook does not support LoRA.")
         self.route_major = needs_pre_norm_all_reduce(moe_config)
         # Set by the owner before process_weights_after_loading: whether w1 is
-        # stored [up; gate] (else [gate; up], as in the checkpoint), and whether
-        # to run the b12x engine, which needs that layout. The engine is prepared
-        # by the first forward pass outside of a capture (see ``_ensure_b12x``),
-        # and a layer that cannot prepare it clears ``use_b12x_decode``.
+        # stored [up; gate] (else [gate; up], as in the checkpoint), and which
+        # decode engine to run: b12x, which needs that layout, or the muse
+        # kernel, which takes the checkpoint's. At most one is on. The engine is
+        # prepared by the first forward pass outside of a capture (see
+        # ``_ensure_b12x`` / ``_ensure_muse``), and a layer that cannot prepare
+        # it clears its flag.
         self.up_gate_layout = False
         self.use_b12x_decode = False
+        self.use_muse_decode = False
         self.b12x: B12xDecodeMoE | None = None
+        self.muse: MuseDecodeMoE | None = None
+        # The exact (unfolded) scales of the muse kernel, captured from the raw
+        # checkpoint scales where the native weights are processed. The CUTLASS
+        # and b12x paths use the folded quant config.
+        self.decode_scales: Sm120NvFp4Scales | None = None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         # The layer tensors seen here are not always the ones ``apply`` receives:
@@ -292,6 +440,7 @@ class MuseSparkSm120NvFp4Experts(mk.FusedMoEExpertsModular):
         # is prepared here, and one left from before the reload is dropped (its
         # global scales are stale as well). The first forward pass prepares it.
         self.b12x = None
+        self.muse = None
 
     def _ensure_b12x(self, w1: torch.Tensor, w2: torch.Tensor, capturing: bool) -> None:
         """Keep the b12x engine on the tensors ``apply`` receives.
@@ -367,6 +516,67 @@ class MuseSparkSm120NvFp4Experts(mk.FusedMoEExpertsModular):
             self.use_b12x_decode = False
             logger.warning_once(
                 "MuseSpark SM120 MoE: the b12x decode engine is unavailable (%s); "
+                "the CUTLASS grouped GEMMs run every batch.",
+                reason,
+            )
+
+    def _ensure_muse(self, w1: torch.Tensor, w2: torch.Tensor, capturing: bool) -> None:
+        """Keep the muse engine on the tensors ``apply`` receives.
+
+        Like ``_ensure_b12x``: an engine that is missing (after a load or a
+        reload) or that reads other tensors is prepared now, which launches the
+        kernel once per padded shape, so it must not happen inside a CUDA graph
+        capture, where it raises instead. The engine is an optimization: if it
+        cannot be set up, this layer keeps the CUTLASS grouped GEMMs and stops
+        trying (``use_muse_decode`` is cleared), and so do the layers after it.
+        """
+        assert self.w1_scale is not None and self.w2_scale is not None
+        if self.muse is not None and self.muse.reads(
+            w1, self.w1_scale, w2, self.w2_scale
+        ):
+            return
+        if capturing:
+            raise RuntimeError(
+                "The muse decode engine is not prepared on the MoE weights (it is "
+                "prepared by the first forward pass after the weights are loaded "
+                "or reloaded), and it cannot be prepared inside a CUDA graph "
+                "capture. Run a forward pass outside of the capture first."
+            )
+        assert not self.up_gate_layout, "the muse kernel consumes the [gate; up] layout"
+        assert self.decode_scales is not None, "the muse kernel needs the exact scales"
+        stale = self.muse is not None
+        self.muse = None
+        reason = muse_unusable_reason()
+        if reason is None:
+            logger.info_once(
+                "MuseSpark SM120 MoE: preparing the muse decode engine %s.",
+                "again on the reloaded weights"
+                if stale
+                else "at the first forward pass",
+            )
+            try:
+                prm, gs = decode_kernel_params(self.decode_scales)
+                self.muse = MuseDecodeMoE(
+                    w1,
+                    self.w1_scale,
+                    w2,
+                    self.w2_scale,
+                    prm=prm,
+                    gs=gs,
+                    # Rows that are all-reduced before the norm (TP) must be zero
+                    # where a route is remote; otherwise they are left stale, as
+                    # the finalizers skip them.
+                    zero_non_local=self.route_major,
+                )
+            except Exception as e:
+                logger.debug("muse decode engine setup failed", exc_info=True)
+                reason = f"setup failed: {type(e).__name__}: {e}"
+                if not isinstance(e, ValueError):
+                    mark_muse_setup_failed(reason)
+        if reason is not None:
+            self.use_muse_decode = False
+            logger.warning_once(
+                "MuseSpark SM120 MoE: the muse decode engine is unavailable (%s); "
                 "the CUTLASS grouped GEMMs run every batch.",
                 reason,
             )
@@ -476,10 +686,19 @@ class MuseSparkSm120NvFp4Experts(mk.FusedMoEExpertsModular):
                 "attach the post-GEMM2 hook."
             )
         assert activation == MoEActivation.SILU
-        # b12x only runs while a CUDA graph is captured: a replay never executes
-        # Python, and an eager call costs more host time than it saves.
-        use_b12x = False
-        if self.use_b12x_decode:
+        # The decode engines only run while a CUDA graph is captured: a replay
+        # never executes Python, and an eager call costs more host time than it
+        # saves.
+        use_muse = use_b12x = False
+        if self.use_muse_decode:
+            capturing = _capturing()
+            self._ensure_muse(w1, w2, capturing)
+            use_muse = (
+                self.muse is not None
+                and capturing
+                and hidden_states.shape[0] <= MUSE_MAX_TOKENS
+            )
+        elif self.use_b12x_decode:
             capturing = _capturing()
             self._ensure_b12x(w1, w2, capturing)
             use_b12x = (
@@ -487,7 +706,11 @@ class MuseSparkSm120NvFp4Experts(mk.FusedMoEExpertsModular):
                 and capturing
                 and hidden_states.shape[0] <= B12X_MAX_TOKENS
             )
-        if use_b12x:
+        if use_muse:
+            unfinalized = self._apply_muse(
+                hidden_states, topk_weights, topk_ids, expert_map
+            )
+        elif use_b12x:
             unfinalized = self._apply_b12x(
                 hidden_states, topk_weights, topk_ids, expert_map
             )
@@ -496,6 +719,36 @@ class MuseSparkSm120NvFp4Experts(mk.FusedMoEExpertsModular):
                 hidden_states, w1, w2, topk_weights, topk_ids, expert_map, workspace2
             )
         self._run_post_gemm2_hook(unfinalized, output)
+
+    def _apply_muse(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        expert_map: torch.Tensor | None,
+    ) -> UnfinalizedMoEOutput:
+        """The same rows as ``_apply_cutlass``, in route-major order.
+
+        The kernel reads the weights where they are, through the muse engine,
+        which is prepared on the ones ``apply`` receives. Its permute map is the
+        identity apart from -1 for a route to an expert of another rank, which
+        is what a route-major output holds, so it goes to the finalizer as is;
+        every finalizer skips the -1 routes without reading their rows.
+        """
+        assert self.muse is not None
+        logger.info_once(
+            "MuseSpark SM120 MoE: running the muse decode engine for up to %d "
+            "padded tokens.",
+            MUSE_MAX_TOKENS,
+        )
+        num_tokens, top_k = topk_ids.shape
+        rows, perm_idx = self.muse.run(hidden_states, topk_ids, expert_map)
+        return UnfinalizedMoEOutput(
+            gemm2_permuted=rows,
+            expert_weights=topk_weights,
+            expanded_idx_to_permuted_idx=perm_idx.view(num_tokens, top_k),
+            route_major=True,
+        )
 
     def _apply_b12x(
         self,
