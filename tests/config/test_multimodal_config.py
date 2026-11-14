@@ -662,6 +662,10 @@ def test_consumer_resolves_mm_embedding_inputs(
         if role == "kv_consumer"
         else None
     )
+    # The spec'd mock would answer with a truthy MagicMock.
+    vllm_config._kv_connector_receives_remote_kv = (
+        VllmConfig._kv_connector_receives_remote_kv
+    )
 
     VllmConfig._resolve_mm_embedding_inputs(vllm_config)
 

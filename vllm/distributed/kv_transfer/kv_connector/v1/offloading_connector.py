@@ -76,6 +76,11 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
         # future cache miss, so opt out of the producer-role default.
         return False
 
+    @classmethod
+    def receives_remote_kv(cls, extra_config: dict[str, Any]) -> bool:
+        # A local cache of this engine's own KV: nothing arrives from a producer.
+        return False
+
     def __init__(
         self,
         vllm_config: VllmConfig,

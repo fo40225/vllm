@@ -154,6 +154,20 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
         return False
 
     @classmethod
+    def receives_remote_kv(cls, extra_config: dict[str, Any]) -> bool:
+        """MultiConnector receives remote KV if any of its child connectors does."""
+        connectors_config = extra_config.get("connectors", [])
+        if not connectors_config:
+            return True
+        for conn_config in connectors_config:
+            temp_ktc = KVTransferConfig(**conn_config)
+            connector_cls = KVConnectorFactory.get_connector_class(temp_ktc)
+            child_extra_config = conn_config.get("kv_connector_extra_config", {})
+            if connector_cls.receives_remote_kv(child_extra_config):
+                return True
+        return False
+
+    @classmethod
     def all_children_support_hma(cls, kv_transfer_config: "KVTransferConfig") -> bool:
         """Return True only if every configured child connector supports HMA."""
         connectors_config = kv_transfer_config.kv_connector_extra_config.get(

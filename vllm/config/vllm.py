@@ -2861,6 +2861,25 @@ class VllmConfig:
             f"kernel_config={self.kernel_config!r}"
         )
 
+    @staticmethod
+    def _kv_connector_receives_remote_kv(kv_config: "KVTransferConfig") -> bool:
+        """Whether the connector of a `kv_consumer` / `kv_both` role is fed KV
+        that a remote producer computed (see `KVConnectorBase_V1.receives_remote_kv`).
+
+        A local cache (CPU / disk offload) runs as `kv_both` without receiving
+        anything, so it must not be taken for a disaggregated consumer. An
+        unresolvable connector keeps the consumer reading.
+        """
+        from vllm.distributed.kv_transfer.kv_connector.factory import (
+            KVConnectorFactory,
+        )
+
+        try:
+            connector_cls = KVConnectorFactory.get_connector_class(kv_config)
+        except (ValueError, AttributeError, ImportError):
+            return True
+        return connector_cls.receives_remote_kv(kv_config.kv_connector_extra_config)
+
     def _resolve_mm_embedding_inputs(self) -> None:
         """Accept embedding inputs, tensor optional, on disaggregated consumers.
 
@@ -2883,10 +2902,14 @@ class VllmConfig:
         # Derived, so overwrite unconditionally rather than honouring a value
         # that was set by hand.
         # A language-model-only KV consumer (text-only P/D) stays text-only
-        # unless the user opts in with --enable-mm-embeds.
+        # unless the user opts in with --enable-mm-embeds. A local cache
+        # connector (CPU / disk offload, kv_both) receives no remote KV and is
+        # no consumer here, with or without --language-model-only (the Muse
+        # Spark launch limits every modality to 0 instead of setting that flag).
         mm_config.allow_missing_mm_embeddings = is_ec_consumer or (
             is_kv_consumer
             and (not mm_config.language_model_only or mm_config.enable_mm_embeds)
+            and self._kv_connector_receives_remote_kv(kv_config)
         )
         if not mm_config.allow_missing_mm_embeddings:
             return

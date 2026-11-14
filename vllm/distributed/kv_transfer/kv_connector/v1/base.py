@@ -707,6 +707,27 @@ class KVConnectorBase_V1(ABC):
         return None
 
     @classmethod
+    def receives_remote_kv(cls, extra_config: dict[str, Any]) -> bool:
+        """Whether a consumer role of this connector is fed KV computed elsewhere.
+
+        A disaggregated-prefill consumer receives prompt KV that a remote
+        producer built from the request's multimodal embeddings, so the frontend
+        of such an instance must accept embedding inputs without the tensors
+        (`VllmConfig._resolve_mm_embedding_inputs`). A local best-effort cache
+        (CPU or disk offload) runs as `kv_both` but only reads back KV that this
+        engine computed itself, so it must not switch that machinery on: for a
+        text-only deployment of a multimodal model it would allocate the encoder
+        runner's `[max_num_batched_tokens, hidden]` embedding buffer on the GPU
+        and run the model from input embeddings. Defaults to True (transfer
+        connectors); local caches override it.
+
+        Args:
+            extra_config: the connector's `kv_connector_extra_config`.
+
+        """
+        return True
+
+    @classmethod
     def requires_piecewise_for_cudagraph(cls, extra_config: dict[str, Any]) -> bool:
         """Check if this connector requires PIECEWISE CUDA graph mode.
 
