@@ -52,6 +52,12 @@ TORCH_LIBRARY(_muse_C, m) {
       "Tensor? dbg_acc=None, int flags=0, Tensor? xq_data=None, "
       "Tensor? xq_sf=None) -> ()");
   m.def(
+      "nvfp4_decode_moe_large(Tensor hidden, Tensor topk_ids, Tensor? "
+      "expert_map, Tensor w13, Tensor sf13, Tensor w2, Tensor sf2, Tensor prm, "
+      "Tensor gs, bool up_first, Tensor! rows, Tensor! perm_idx, "
+      "Tensor! hq_data, Tensor! hq_sf, Tensor! xq_data, Tensor! xq_sf, "
+      "Tensor! plan, Tensor! ctl, int flags=0) -> ()");
+  m.def(
       "nvfp4_decode_act_quant(Tensor hidden, Tensor gs, Tensor! data, "
       "Tensor! sf) -> ()");
 
@@ -89,6 +95,7 @@ TORCH_LIBRARY_IMPL(_muse_C, CUDA, m) {
          &muse_spark::gather_scaled_fp4_experts_quant);
   m.impl("moe_route_local", &muse_spark::moe_route_local);
   m.impl("nvfp4_decode_moe", &muse_spark::nvfp4_decode_moe);
+  m.impl("nvfp4_decode_moe_large", &muse_spark::nvfp4_decode_moe_large);
   m.impl("nvfp4_decode_act_quant", &muse_spark::nvfp4_decode_act_quant);
   m.impl("l2_prefetch", &muse_spark::l2_prefetch);
   m.impl("expert_prefetch", &muse_spark::expert_prefetch);

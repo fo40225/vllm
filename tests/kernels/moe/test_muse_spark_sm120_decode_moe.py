@@ -7,6 +7,13 @@ experts; the EP8 case of 32 and the EP4 case of 64 are used here), so the tests
 build one random layer of that size. The reference is an
 exact fake-quantization in torch (activations and the SiLU * up intermediate
 quantized to NVFP4 at the points the CUTLASS composition quantizes them).
+
+Batches of more than 8 tokens run the large-batch variant of the op
+(``nvfp4_decode_moe_large``); ``_Engine.run`` picks it by the token count, and the
+tests of the small-batch kernel are parametrized over larger counts where the
+property is the same, with extra tests for what is specific to it (rows equal to
+the small-batch kernel's bit for bit, the plan it builds in global memory, 256
+local experts).
 """
 
 import pytest
@@ -43,6 +50,22 @@ E_LOCAL_CASES = (E_LOCAL, 64)
 E_GLOBAL = 256
 H = 4096
 TOP_K = 8
+# Largest batch of the large-batch kernel, and its routes. An entry of its plan is one
+# expert and at most LARGE_ENTRY_COLS routes (two MMA column groups), the plan holds
+# LARGE_CAP entries: 256 local experts plus the experts split over entries.
+MAX_LARGE_T = 128
+LARGE_ROUTES = MAX_LARGE_T * TOP_K
+LARGE_ENTRY_COLS = 16
+LARGE_CAP = 256 + LARGE_ROUTES // LARGE_ENTRY_COLS
+# Token counts of the large-batch kernel the generic tests run: the first CUDA graph
+# sizes above 8 (and the speculative-decoding ones, 1 x 9 and 1 x 16), a size that is
+# not a multiple of 8, and the largest.
+LARGE_TS = [9, 16, 24, 33, 64, MAX_LARGE_T]
+# Flags of the ops, see muse_c_ops.h (the large-batch op takes the last two).
+FLAG_TWO_LAUNCH = 1
+FLAG_CTL_MEMSET = 2
+FLAG_ZERO_NON_LOCAL = 4
+FLAG_NO_PDL = 8
 FP8_MAX = 448.0
 FP4_MAX = 6.0
 NIB_RMS = 2.9269  # RMS of a uniformly random e2m1 code
@@ -209,14 +232,26 @@ class _Engine:
             self.sf13 = swizzle_blockscale(sf)
         else:
             self.w13, self.sf13 = layer.w13, layer.sf13
-        self.hq_data = torch.zeros(64, H // 2, dtype=torch.uint8, device=dev)
-        self.hq_sf = torch.zeros(64, H // 16, dtype=torch.uint8, device=dev)
-        self.plan = torch.zeros(1024, dtype=torch.int32, device=dev)
+        # Scratch for the largest batch (the small-batch op takes the first rows).
+        self.hq_data = torch.zeros(LARGE_ROUTES, H // 2, dtype=torch.uint8, device=dev)
+        self.hq_sf = torch.zeros(LARGE_ROUTES, H // 16, dtype=torch.uint8, device=dev)
+        self.xq_data = torch.zeros(MAX_LARGE_T, H // 2, dtype=torch.uint8, device=dev)
+        self.xq_sf = torch.zeros(MAX_LARGE_T, H // 16, dtype=torch.uint8, device=dev)
+        self.plan = torch.zeros(8192, dtype=torch.int32, device=dev)
         # Counters of the persistent kernel: zeroed once, reset by every launch.
-        self.ctl = torch.zeros(128, dtype=torch.int32, device=dev)
+        self.ctl = torch.zeros(512, dtype=torch.int32, device=dev)
         self.buffers = {}
+        self.large_rows = torch.zeros(LARGE_ROUTES, H, dtype=torch.bfloat16, device=dev)
+        self.large_perm = torch.zeros(LARGE_ROUTES, dtype=torch.int32, device=dev)
+        self.last_large = False
 
-    def out_buffers(self, t_pad: int):
+    def out_buffers(self, t_pad: int, large: bool | None = None):
+        """The output buffers of the small-batch op for ``t_pad`` tokens, or the
+        leading rows of the large-batch ones (the default beyond 8 tokens)."""
+        if large is None:
+            large = t_pad > 8
+        if large:
+            return self.large_rows[: t_pad * 8], self.large_perm[: t_pad * 8]
         if t_pad not in self.buffers:
             self.buffers[t_pad] = (
                 torch.zeros(t_pad * 8, H, dtype=torch.bfloat16, device="cuda"),
@@ -224,13 +259,34 @@ class _Engine:
             )
         return self.buffers[t_pad]
 
-    def run(self, u, ids, dbg=None, t_pad=None, flags=0, xq=None, expert_map="map"):
-        t_pad = t_pad or u.shape[0]
-        rows, perm = self.out_buffers(t_pad)
+    def run(
+        self, u, ids, dbg=None, t_pad=None, flags=0, xq=None, expert_map="map",
+        large=None, gs=None,
+    ):  # fmt: skip
+        """The small-batch op up to 8 tokens, the large-batch one beyond (or when
+        ``large``)."""
+        t = u.shape[0]
+        if large is None:
+            large = t > 8
+        self.last_large = large
         lay = self.layer
+        emap = lay.expert_map if expert_map == "map" else expert_map
+        gs = lay.gs if gs is None else gs
+        if large:
+            assert dbg is None and xq is None and t_pad in (None, t)
+            assert not flags & (FLAG_TWO_LAUNCH | FLAG_CTL_MEMSET)
+            rows, perm = self.out_buffers(t, large=True)
+            torch.ops._muse_C.nvfp4_decode_moe_large(
+                u, ids, emap, self.w13, self.sf13, lay.w2, lay.sf2, lay.prm, gs,
+                self.up_first, rows, perm, self.hq_data, self.hq_sf, self.xq_data,
+                self.xq_sf, self.plan, self.ctl, flags,
+            )  # fmt: skip
+            return rows, perm
+        t_pad = t_pad or t
+        rows, perm = self.out_buffers(t_pad, large=False)
         torch.ops._muse_C.nvfp4_decode_moe(
-            u, ids, lay.expert_map if expert_map == "map" else expert_map,
-            self.w13, self.sf13, lay.w2, lay.sf2, lay.prm, lay.gs, self.up_first,
+            u, ids, emap,
+            self.w13, self.sf13, lay.w2, lay.sf2, lay.prm, gs, self.up_first,
             rows, perm, self.hq_data, self.hq_sf, self.plan, self.ctl, dbg, flags,
             None if xq is None else xq[0], None if xq is None else xq[1],
         )  # fmt: skip
@@ -240,15 +296,18 @@ class _Engine:
         return not bool(self.ctl.any())
 
     def plan_tables(self):
-        p = self.plan[:708].cpu()
+        """The plan of the last launch (shared memory copy of the small-batch
+        kernel, global plan of the large-batch one)."""
+        cap, cols = (LARGE_CAP, LARGE_ENTRY_COLS) if self.last_large else (64, 8)
+        p = self.plan[: 4 + (3 + cols) * cap].cpu()
         n = int(p[0])
         return {
             "n_entries": n,
             "n_cols": int(p[1]),
-            "expert": p[4:68][:n].tolist(),
-            "cnt": p[68:132][:n].tolist(),
-            "col0": p[132:196][:n].tolist(),
-            "route": p[196:708].view(64, 8)[:n].tolist(),
+            "expert": p[4 : 4 + cap][:n].tolist(),
+            "cnt": p[4 + cap : 4 + 2 * cap][:n].tolist(),
+            "col0": p[4 + 2 * cap : 4 + 3 * cap][:n].tolist(),
+            "route": p[4 + 3 * cap : 4 + (3 + cols) * cap].view(cap, cols)[:n].tolist(),
         }
 
     def final_output(self, u, ids, weights):
@@ -315,7 +374,8 @@ def _ids_cases(t: int, seed: int, e_local: int = E_LOCAL):
         # The first and last local expert of the rank.
         "first_last": torch.tensor(
             [
-                [0, e_local - 1] + list(range(e_local + 6 * i, e_local + 6 + 6 * i))
+                [0, e_local - 1]
+                + [e_local + (6 * i + k) % (E_GLOBAL - e_local) for k in range(6)]
                 for i in range(t)
             ],
             dtype=torch.int32,
@@ -351,9 +411,7 @@ def _stock_quant(u: torch.Tensor, gscale: float):
     return q, flat[off]
 
 
-@pytest.mark.parametrize("t", [1, 2, 4, 8])
-@torch.inference_mode()
-def test_activation_quant_is_byte_identical_to_the_stock_op(t: int) -> None:
+def _quant_cases(t: int):
     g = torch.Generator(device="cuda").manual_seed(5)
     base = torch.randn(t, H, device="cuda", generator=g)
     mixed = base.clone()
@@ -377,7 +435,13 @@ def test_activation_quant_is_byte_identical_to_the_stock_op(t: int) -> None:
         "other_scale": (base, 0.37),
     }
     for name, (x, gscale) in cases.items():
-        x = x.to(torch.bfloat16).contiguous()
+        yield name, x.to(torch.bfloat16).contiguous(), gscale
+
+
+@pytest.mark.parametrize("t", [1, 2, 4, 8])
+@torch.inference_mode()
+def test_activation_quant_is_byte_identical_to_the_stock_op(t: int) -> None:
+    for name, x, gscale in _quant_cases(t):
         q_ref, sf_ref = _stock_quant(x, gscale)
         data = torch.empty(t, H // 2, dtype=torch.uint8, device="cuda")
         sf = torch.empty(t, H // 16, dtype=torch.uint8, device="cuda")
@@ -388,6 +452,25 @@ def test_activation_quant_is_byte_identical_to_the_stock_op(t: int) -> None:
         assert torch.equal(sf, sf_ref), name
 
 
+@pytest.mark.parametrize("t", [1, 9, 33, MAX_LARGE_T])
+@torch.inference_mode()
+def test_large_batch_activation_quant_is_byte_identical_to_the_stock_op(
+    layer: _Layer, t: int
+) -> None:
+    """The preparation launch of the large-batch kernel writes the activation
+    scratch the stock op would (codes and linear scales of every token row)."""
+    engine = _Engine(layer)
+    ids = _local_ids(t, 3, 17, layer.e_local)
+    for name, x, gscale in _quant_cases(t):
+        gs = layer.gs.clone()
+        gs[0] = gscale
+        engine.run(x, ids, large=True, gs=gs)
+        q_ref, sf_ref = _stock_quant(x, gscale)
+        assert torch.equal(engine.xq_data[:t], q_ref), name
+        assert torch.equal(engine.xq_sf[:t], sf_ref), name
+        assert engine.counters_are_zero(), name
+
+
 # ------------------------------------------------------------------------------
 # Stages against the CUTLASS composition: with the exact GEMM1 (the gate and up
 # halves as groups of their own), whatever the scales; with the fold of s3 / s1
@@ -395,7 +478,7 @@ def test_activation_quant_is_byte_identical_to_the_stock_op(t: int) -> None:
 # ------------------------------------------------------------------------------
 @pytest.mark.parametrize("exact", [True, False], ids=["exact", "folded"])
 @pytest.mark.parametrize("up_first", [False, True])
-@pytest.mark.parametrize("t", [1, 4, 8])
+@pytest.mark.parametrize("t", [1, 4, 8, 9, 33, MAX_LARGE_T])
 @torch.inference_mode()
 def test_stages_match_the_cutlass_composition(
     layer: _Layer, t: int, up_first: bool, exact: bool
@@ -486,7 +569,7 @@ def test_stages_match_the_cutlass_composition(
 # Accuracy against the exact fake-quantization reference
 # ------------------------------------------------------------------------------
 @pytest.mark.parametrize("up_first", [False, True])
-@pytest.mark.parametrize("t", [1, 2, 4, 8])
+@pytest.mark.parametrize("t", [1, 2, 4, 8, 16, 64])
 @torch.inference_mode()
 def test_output_matches_the_fake_quant_reference(
     layer: _Layer, t: int, up_first: bool
@@ -512,10 +595,10 @@ def test_output_matches_the_fake_quant_reference(
             assert out.abs().max() == 0, name
 
 
+@pytest.mark.parametrize("t", [8, 9, 24, MAX_LARGE_T])
 @torch.inference_mode()
-def test_plan_and_route_map(layer: _Layer) -> None:
+def test_plan_and_route_map(layer: _Layer, t: int) -> None:
     engine = _Engine(layer)
-    t = 8
     u, ids, _ = _routing(t, 21)
     _, perm = engine.run(u, ids)
     local = (layer.expert_map[ids.long()] >= 0).view(-1)
@@ -543,7 +626,7 @@ def _valid(rows: torch.Tensor, perm: torch.Tensor):
     return rows[perm >= 0].clone().view(torch.int16), perm.clone()
 
 
-@pytest.mark.parametrize("t", [1, 2, 4, 8])
+@pytest.mark.parametrize("t", [1, 2, 4, 8, 16, MAX_LARGE_T])
 @torch.inference_mode()
 def test_bitwise_deterministic_eager_and_graph(layer: _Layer, t: int) -> None:
     engine = _Engine(layer)
@@ -658,7 +741,7 @@ def test_fewer_tokens_than_the_padded_count(layer: _Layer, t: int, t_pad: int) -
     assert _rel_l2(out, ref) <= FQ_REL_L2
 
 
-@pytest.mark.parametrize("t", [1, 4])
+@pytest.mark.parametrize("t", [1, 4, 24])
 @torch.inference_mode()
 def test_identity_expert_map(layer: _Layer, t: int) -> None:
     """Without an expert map (TP) the global ids are the local ones."""
@@ -669,21 +752,16 @@ def test_identity_expert_map(layer: _Layer, t: int) -> None:
     ids = torch.where(ids < e_local, ids, ids % e_local).to(torch.int32).contiguous()
     # layer.expert_map is the identity on the local experts.
     with_map = _valid(*engine.run(u, ids))
-    rows, perm = engine.out_buffers(t)
-    torch.ops._muse_C.nvfp4_decode_moe(
-        u, ids, None, engine.w13, engine.sf13, layer.w2, layer.sf2, layer.prm,
-        layer.gs, False, rows, perm, engine.hq_data, engine.hq_sf, engine.plan,
-        engine.ctl, None,
-    )  # fmt: skip
-    without_map = _valid(rows, perm)
+    without_map = _valid(*engine.run(u, ids, expert_map=None))
     assert torch.equal(with_map[0], without_map[0])
     assert torch.equal(with_map[1], without_map[1])
 
 
+@pytest.mark.parametrize("t", [2, 24])
 @torch.inference_mode()
-def test_no_host_synchronization(layer: _Layer) -> None:
+def test_no_host_synchronization(layer: _Layer, t: int) -> None:
     engine = _Engine(layer)
-    u, ids, _ = _routing(2, 100)
+    u, ids, _ = _routing(t, 100)
     engine.run(u, ids)
     torch.cuda.set_sync_debug_mode("error")
     try:
@@ -695,13 +773,7 @@ def test_no_host_synchronization(layer: _Layer) -> None:
 # ------------------------------------------------------------------------------
 # Routes without work, -1 ids, counters, launch variants
 # ------------------------------------------------------------------------------
-FLAG_TWO_LAUNCH = 1
-FLAG_CTL_MEMSET = 2
-FLAG_ZERO_NON_LOCAL = 4
-FLAG_NO_PDL = 8
-
-
-@pytest.mark.parametrize("t", [1, 2, 4, 8])
+@pytest.mark.parametrize("t", [1, 2, 4, 8, 16, MAX_LARGE_T])
 @torch.inference_mode()
 def test_no_local_route_leaves_everything_untouched(layer: _Layer, t: int) -> None:
     """n_entries = 0: the kernel exits early; perm_idx is all -1, no row is
@@ -712,7 +784,7 @@ def test_no_local_route_leaves_everything_untouched(layer: _Layer, t: int) -> No
     rows, perm = engine.out_buffers(t)
     rows.fill_(float("nan"))
     perm.fill_(7)
-    for flags in (0, FLAG_TWO_LAUNCH):
+    for flags in (0, FLAG_TWO_LAUNCH) if t <= 8 else (0,):
         engine.run(u, ids, flags=flags)
         assert bool((perm == -1).all())
         assert bool(torch.isnan(rows.float()).all())
@@ -723,7 +795,7 @@ def test_no_local_route_leaves_everything_untouched(layer: _Layer, t: int) -> No
     assert bool((rows.view(torch.int16) == 0).all())
 
 
-@pytest.mark.parametrize("t", [1, 2, 4, 8])
+@pytest.mark.parametrize("t", [1, 2, 4, 8, 16, MAX_LARGE_T])
 @torch.inference_mode()
 def test_negative_and_unmapped_ids_are_non_local_routes(layer: _Layer, t: int) -> None:
     """Padding routes (-1), ids beyond the map and ids the map sends to -1 give
@@ -751,7 +823,7 @@ def test_negative_and_unmapped_ids_are_non_local_routes(layer: _Layer, t: int) -
     assert engine.counters_are_zero()
 
 
-@pytest.mark.parametrize("t", [1, 2, 4, 8])
+@pytest.mark.parametrize("t", [1, 2, 4, 8, 16, MAX_LARGE_T])
 @torch.inference_mode()
 def test_counters_are_zero_after_every_launch(layer: _Layer, t: int) -> None:
     engine = _Engine(layer)
@@ -762,12 +834,13 @@ def test_counters_are_zero_after_every_launch(layer: _Layer, t: int) -> None:
             assert engine.counters_are_zero(), name
 
 
-@pytest.mark.parametrize("t", [1, 4, 8])
+@pytest.mark.parametrize("t", [1, 4, 8, 24, MAX_LARGE_T])
 @torch.inference_mode()
 def test_launch_variants_are_bitwise_equal(layer: _Layer, t: int) -> None:
     """Plan B (two launches), the memset node, any grid size (so fewer CTAs than
     the work, or than the SMs) and the stock activation quantization all give
-    the persistent kernel's rows."""
+    the persistent kernel's rows (the large-batch kernel has the launches
+    without PDL and the grid sizes)."""
     engine = _Engine(layer)
     u, _, _ = _routing(t, 160)
     gs0 = layer.gs[:1].contiguous()
@@ -776,17 +849,20 @@ def test_launch_variants_are_bitwise_equal(layer: _Layer, t: int) -> None:
     for name, ids in _ids_cases(t, 161, layer.e_local).items():
         ref = _valid(*engine.run(u, ids))
         variants = {
-            "two_launch": dict(flags=FLAG_TWO_LAUNCH),
-            "two_launch_no_pdl": dict(flags=FLAG_TWO_LAUNCH | FLAG_NO_PDL),
             "no_pdl": dict(flags=FLAG_NO_PDL),
-            "memset": dict(flags=FLAG_CTL_MEMSET),
-            "memset_no_pdl": dict(flags=FLAG_CTL_MEMSET | FLAG_NO_PDL),
             "grid_1": dict(flags=1 << 16),
             "grid_7": dict(flags=7 << 16),
             "grid_400": dict(flags=400 << 16),
-            "stock_quant": dict(xq=xq),
-            "stock_quant_two_launch": dict(xq=xq, flags=FLAG_TWO_LAUNCH),
         }
+        if t <= 8:
+            variants |= {
+                "two_launch": dict(flags=FLAG_TWO_LAUNCH),
+                "two_launch_no_pdl": dict(flags=FLAG_TWO_LAUNCH | FLAG_NO_PDL),
+                "memset": dict(flags=FLAG_CTL_MEMSET),
+                "memset_no_pdl": dict(flags=FLAG_CTL_MEMSET | FLAG_NO_PDL),
+                "stock_quant": dict(xq=xq),
+                "stock_quant_two_launch": dict(xq=xq, flags=FLAG_TWO_LAUNCH),
+            }
         for vname, kw in variants.items():
             got = _valid(*engine.run(u, ids, **kw))
             assert torch.equal(got[0], ref[0]), (name, vname)
@@ -804,7 +880,7 @@ def test_launch_variants_are_bitwise_equal(layer: _Layer, t: int) -> None:
             assert bool((rows[perm < 0].view(torch.int16) == 0).all())
 
 
-@pytest.mark.parametrize("t", [1, 2, 4, 8])
+@pytest.mark.parametrize("t", [1, 2, 4, 8, 16, 64])
 @pytest.mark.parametrize("use_graph", [False, True])
 @torch.inference_mode()
 def test_persistent_kernel_waits_for_the_routing_and_the_norm(
@@ -855,3 +931,227 @@ def test_persistent_kernel_waits_for_the_routing_and_the_norm(
             got = _valid(rows, perm)
             assert torch.equal(got[0], ref[0]) and torch.equal(got[1], ref[1])
     assert engine.counters_are_zero()
+
+
+# ------------------------------------------------------------------------------
+# The large-batch kernel (more than 8 tokens): what is specific to it
+# ------------------------------------------------------------------------------
+def _small_batch_rows(engine: _Engine, u: torch.Tensor, ids: torch.Tensor):
+    """Rows and permute map of ``u`` [T, H] from the small-batch kernel, run on
+    chunks of 8 tokens (a token's rows do not depend on the others)."""
+    rows, perms = [], []
+    for c in range(0, u.shape[0], 8):
+        n = min(8, u.shape[0] - c)
+        r, p = engine.run(
+            u[c : c + n].contiguous(), ids[c : c + n].contiguous(), t_pad=8, large=False
+        )
+        rows.append(r[: n * 8].clone())
+        perms.append(p[: n * 8].clone())
+    return torch.cat(rows), torch.cat(perms)
+
+
+def _assert_rows_equal(got, want, what) -> None:
+    (g_rows, g_perm), (w_rows, w_perm) = got, want
+    local = w_perm >= 0
+    # The permute map is the identity on local routes (the chunks' route numbers
+    # are chunk-local, so compare the validity only).
+    assert torch.equal(g_perm >= 0, local), what
+    assert torch.equal(
+        g_rows[local].view(torch.int16), w_rows[local].view(torch.int16)
+    ), what
+
+
+@pytest.mark.parametrize("up_first", [False, True])
+@pytest.mark.parametrize("t", [1, 3, 8, *LARGE_TS])
+@torch.inference_mode()
+def test_large_batch_rows_equal_the_small_batch_kernel(
+    layer: _Layer, t: int, up_first: bool
+) -> None:
+    """Every route's row is the same bit for bit whichever kernel computes it: the
+    entries and columns the routes land in, and the activations coming from global
+    scratch, do not enter the arithmetic (the K split over the four warps is the
+    same). Includes the large-batch kernel on 8 tokens or fewer, and experts whose
+    routes are split over several entries. (The stage test compares both with the
+    CUTLASS composition: equal here because the test layers' sums are exact.)"""
+    engine = _Engine(layer, up_first)
+    u, _, _ = _routing(t, 200)
+    for name, ids in _ids_cases(t, 201, layer.e_local).items():
+        want = _small_batch_rows(engine, u, ids)
+        got = engine.run(u, ids, large=True)
+        _assert_rows_equal(got, want, (name, t))
+        assert engine.counters_are_zero(), (name, t)
+    # Several routes per expert, and several entries for the busiest ones.
+    ids = _local_ids(t, [min(8, 2 + k % 7) for k in range(t)], 202, layer.e_local)
+    want = _small_batch_rows(engine, u, ids)
+    _assert_rows_equal(engine.run(u, ids, large=True), want, ("busy", t))
+
+
+@pytest.mark.parametrize("routes", [1, 7, 8, 9, 15, 16, 17, 24, 31, 33, 48])
+@torch.inference_mode()
+def test_large_batch_experts_at_the_entry_boundaries(layer: _Layer, routes: int) -> None:
+    """An expert with 1..48 routes: one entry, or two (a second column group, then a
+    second entry) from 9, 17 and 33 routes on; the rows are the small-batch kernel's
+    and the entries are as many as the routes need."""
+    t = 48
+    engine = _Engine(layer)
+    u, _, _ = _routing(t, 240)
+    ids = _local_ids(t, 0, 241, layer.e_local)  # every route remote
+    ids[:routes, 0] = 3
+    ids[-6:, 1] = 5  # a second expert with a few routes
+    want = _small_batch_rows(engine, u, ids)
+    got = engine.run(u, ids)
+    _assert_rows_equal(got, want, routes)
+    plan = engine.plan_tables()
+    by_expert = {e: 0 for e in (3, 5)}
+    for g in range(plan["n_entries"]):
+        by_expert[plan["expert"][g]] += 1
+    assert by_expert[3] == -(-routes // LARGE_ENTRY_COLS)
+    assert by_expert[5] == 1
+    assert engine.counters_are_zero()
+
+
+@pytest.mark.parametrize("t", [9, 24, MAX_LARGE_T])
+@torch.inference_mode()
+def test_large_batch_plan_is_a_deterministic_partition_of_the_local_routes(
+    layer: _Layer, t: int
+) -> None:
+    engine = _Engine(layer)
+    u, _, _ = _routing(t, 210)
+    for name, ids in _ids_cases(t, 211, layer.e_local).items():
+        _, perm = engine.run(u, ids)
+        plan = engine.plan_tables()
+        local_ids = layer.expert_map[ids.long()].view(-1)
+        local = local_ids >= 0
+        expected = torch.where(local, torch.arange(t * TOP_K, device="cuda"), -1)
+        assert torch.equal(perm.long(), expected), name
+        assert plan["n_cols"] == int(local.sum()), name
+        n = plan["n_entries"]
+        assert n <= LARGE_CAP
+        col = 0
+        for g in range(n):
+            cnt, expert = plan["cnt"][g], plan["expert"][g]
+            assert 1 <= cnt <= LARGE_ENTRY_COLS, name
+            assert plan["col0"][g] == col, name
+            col += cnt
+            routes = plan["route"][g][:cnt]
+            assert all(int(local_ids[r]) == expert for r in routes), name
+            # The routes of an expert in increasing route order; entries by expert.
+            assert routes == sorted(routes), name
+            if g and plan["expert"][g - 1] == expert:
+                assert plan["cnt"][g - 1] == LARGE_ENTRY_COLS, name
+                assert plan["route"][g - 1][LARGE_ENTRY_COLS - 1] < routes[0], name
+            elif g:
+                assert plan["expert"][g - 1] < expert, name
+        assert col == int(local.sum()), name
+        seen = sorted(r for g in range(n) for r in plan["route"][g][: plan["cnt"][g]])
+        assert seen == local.nonzero().flatten().tolist(), name
+        # The same plan from a second launch, over a poisoned table.
+        engine.plan.fill_(-1)
+        engine.run(u, ids)
+        again = engine.plan_tables()
+        for key in ("n_entries", "n_cols", "expert", "cnt", "col0"):
+            assert again[key] == plan[key], (name, key)
+        for g in range(n):
+            cnt = plan["cnt"][g]
+            assert again["route"][g][:cnt] == plan["route"][g][:cnt], name
+
+
+@torch.inference_mode()
+def test_large_batch_poisoned_scratch_does_not_matter(layer: _Layer) -> None:
+    engine = _Engine(layer)
+    t = 40
+    u, _, _ = _routing(t, 220)
+    ids = _ids_cases(t, 221, layer.e_local)["random"]
+    base = _valid(*engine.run(u, ids))
+    rows, perm = engine.out_buffers(t)
+    rows.fill_(float("nan"))
+    for scratch in (engine.hq_data, engine.hq_sf, engine.xq_data, engine.xq_sf):
+        scratch.fill_(0xFF)
+    engine.plan.fill_(0x7FFFFFFF)
+    engine.run(u, ids)
+    assert torch.isnan(rows[perm < 0].float()).all()  # untouched
+    got = _valid(rows, perm)
+    assert torch.equal(got[0], base[0]) and torch.equal(got[1], base[1])
+    assert engine.counters_are_zero()
+    # The weights of unused experts are never read.
+    used = set(engine.plan_tables()["expert"])
+    saved = {}
+    for e in range(layer.e_local):
+        if e not in used:
+            saved[e] = (
+                layer.w13[e].clone(),
+                layer.w2[e].clone(),
+                engine.sf13[e].clone(),
+                layer.sf2[e].clone(),
+            )
+            layer.w13[e].fill_(0xFF)
+            layer.w2[e].fill_(0xFF)
+            engine.sf13[e].view(torch.uint8).fill_(0xFF)
+            layer.sf2[e].view(torch.uint8).fill_(0xFF)
+    try:
+        got = _valid(*engine.run(u, ids))
+    finally:
+        for e, (a, b, c, d) in saved.items():
+            layer.w13[e].copy_(a)
+            layer.w2[e].copy_(b)
+            engine.sf13[e].copy_(c)
+            layer.sf2[e].copy_(d)
+    assert torch.equal(got[0], base[0])
+
+
+@pytest.fixture(scope="module")
+def layer256() -> _Layer:
+    """A rank that owns every expert (TP only): 256 local experts, no map."""
+    with torch.inference_mode():
+        yield _Layer(diff_s=True, seed=7, e_local=E_GLOBAL)
+
+
+@torch.inference_mode()
+def test_large_batch_with_every_expert_local(layer256: _Layer) -> None:
+    """TP-only layout: 256 local experts and up to 1024 local routes. The plan
+    holds the largest number of entries a batch of 128 tokens can need (304 with one
+    route for some experts and 17 for others), and the rows are the small-batch
+    kernel's."""
+    layer = layer256
+    engine = _Engine(layer)
+    t = MAX_LARGE_T
+    u, ids, _ = _routing(t, 230)
+    want = _small_batch_rows(engine, u, ids)
+    got = engine.run(u, ids)
+    _assert_rows_equal(got, want, "random")
+    assert bool((got[1] >= 0).all())
+    assert engine.counters_are_zero()
+    # Without a map the global ids are the local ones.
+    no_map = engine.run(u, ids, expert_map=None)
+    _assert_rows_equal(no_map, want, "no map")
+    # The busiest plan: 208 experts with one route, 48 with 17 (two entries each).
+    flat = torch.cat(
+        [torch.arange(208), torch.arange(208, E_GLOBAL).repeat_interleave(17)]
+    )
+    assert flat.numel() == t * TOP_K
+    order = torch.randperm(flat.numel(), generator=torch.Generator().manual_seed(3))
+    ids = flat[order].view(t, TOP_K).to(torch.int32).cuda().contiguous()
+    want = _small_batch_rows(engine, u, ids)
+    got = engine.run(u, ids)
+    _assert_rows_equal(got, want, "busiest plan")
+    assert engine.plan_tables()["n_entries"] == 208 + 2 * 48
+    assert engine.counters_are_zero()
+
+
+def test_muse_max_tokens_follows_the_experts_and_the_environment(monkeypatch) -> None:
+    from vllm.models.muse_spark.nvidia.ops.muse_decode_moe import (
+        MUSE_MAX_TOKENS,
+        muse_max_tokens,
+    )
+
+    monkeypatch.delenv("VLLM_MUSE_SPARK_SM120_DECODE_MAX_TOKENS", raising=False)
+    assert muse_max_tokens() == MUSE_MAX_TOKENS == MAX_LARGE_T
+    assert muse_max_tokens(32) == muse_max_tokens(256) == MAX_LARGE_T
+    # More experts than the plan of the large-batch kernel holds: small batches only.
+    assert muse_max_tokens(257) == 8
+    monkeypatch.setenv("VLLM_MUSE_SPARK_SM120_DECODE_MAX_TOKENS", "64")
+    assert muse_max_tokens(32) == 64
+    monkeypatch.setenv("VLLM_MUSE_SPARK_SM120_DECODE_MAX_TOKENS", "1000")
+    assert muse_max_tokens(32) == MAX_LARGE_T
+    monkeypatch.setenv("VLLM_MUSE_SPARK_SM120_DECODE_MAX_TOKENS", "8")
+    assert muse_max_tokens(32) == 8

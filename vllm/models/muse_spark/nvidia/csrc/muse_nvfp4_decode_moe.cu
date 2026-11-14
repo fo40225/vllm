@@ -70,6 +70,24 @@ constexpr int kSfCols = kHidden / 16;  // scale columns of a weight row
 constexpr int kKTiles = kHidden / 64;  // K64 tiles of a row (64 scale words)
 constexpr int kMaxEntries = 64;
 constexpr int kMaxCols = 64;
+// Large-batch engine (k_prep + k_persistent<..., true>): tokens and entries it
+// serves. An entry is one expert and at most kEntryCols routes, so a rank with
+// up to kLargeMaxLocal experts has at most kLargeMaxLocal + kTopK * kLargeMaxTokens /
+// kEntryCols entries. An entry is computed as kEntryCols / 8 column groups of one
+// m16n8k64 MMA each, on kLargeStages ring stages (the B operand slots grow with the
+// columns and share the shared memory with the ring).
+#ifndef MUSE_LARGE_COLS
+#define MUSE_LARGE_COLS 16
+#endif
+#ifndef MUSE_LARGE_STAGES
+#define MUSE_LARGE_STAGES 2
+#endif
+constexpr int kLargeMaxTokens = 128;
+constexpr int kLargeMaxLocal = 256;
+constexpr int kEntryCols = MUSE_LARGE_COLS;  // routes of one expert in one entry
+constexpr int kLargeStages = MUSE_LARGE_STAGES;
+constexpr int kLargeMaxEntries = kLargeMaxLocal + kLargeMaxTokens * kTopK / kEntryCols;
+static_assert(kEntryCols == 8 || kEntryCols == 16, "one or two MMA column groups");
 constexpr int kUnitsPerEntry = 256;    // 4096 / 16 tiles of 16 rows
 
 // Op flags (the upper 16 bits override the grid size, 0 = one CTA per SM).
@@ -123,16 +141,23 @@ constexpr int smem_bytes_k2() {
 // K2 through global memory. An entry is one expert and at most `cmax` routes
 // (a real top-k gives an expert at most T routes, so normally an entry is a
 // distinct expert; more routes of one expert make several entries).
-struct Plan {
+template <int N, int C>
+struct PlanT {
   int n_entries;
   int n_cols;                          // total routes served
   int pad[2];
-  int expert[kMaxEntries];             // local expert id
-  int cnt[kMaxEntries];                // routes of the entry (1..cmax)
-  int col0[kMaxEntries];               // first hq row of the entry
-  int route[kMaxEntries][8];           // route index (token * 8 + k) of column n
+  int expert[N];                       // local expert id
+  int cnt[N];                          // routes of the entry (1..cmax)
+  int col0[N];                         // first hq row of the entry
+  int route[N][C];                     // route index (token * 8 + k) of column n
 };
+// The plan of the small-batch kernels lives in shared memory, that of the
+// large-batch kernels (up to kLargeMaxTokens tokens, built by k_prep) in global
+// memory.
+using Plan = PlanT<kMaxEntries, 8>;
+using PlanLarge = PlanT<kLargeMaxEntries, kEntryCols>;
 static_assert(sizeof(Plan) % 16 == 0, "plan is copied in 16-byte words");
+static_assert(sizeof(PlanLarge) % 16 == 0, "plan is read in 16-byte words");
 
 struct DecodeParams {
   const __nv_bfloat16* hidden;   // [T, 4096]
@@ -150,7 +175,9 @@ struct DecodeParams {
   int* perm_idx;                 // [T_PAD * 8]
   uint8_t* hq_data;              // [64, 2048]
   uint8_t* hq_sf;                // [64, 256]
-  int* plan;                     // Plan, as ints
+  int* plan;                     // Plan (published) / PlanLarge (built by k_prep), as ints
+  uint8_t* xq_buf;               // large batches: quantized activations [T, 2048]
+  uint8_t* xq_sf_buf;            // and their linear scales [T, 256], written by k_prep
   float* dbg_acc;                // optional [units, 2, 16, 8] raw GEMM1 sums
   unsigned* ctl;                 // persistent kernel counters (self-resetting)
   const uint8_t* xq_data;        // optional pre-quantized activations [T, 2048]
@@ -261,6 +288,19 @@ __device__ void publish_plan(const DecodeParams& p, const Plan& plan,
 __device__ void zero_nonlocal_row(const DecodeParams& p, const PlanScratch& s) {
   for (int r = blockIdx.x; r < p.num_perm; r += gridDim.x) {
     if (r < p.T * kTopK && s.lid[r] >= 0) continue;
+    uint4* dst = reinterpret_cast<uint4*>(p.rows + static_cast<size_t>(r) * kHidden);
+    for (int i = threadIdx.x; i < kHidden / 8; i += blockDim.x) {
+      dst[i] = make_uint4(0, 0, 0, 0);
+    }
+  }
+}
+
+// kFlagZeroNonLocal of the large-batch kernel: CTA b zeroes the rows of the
+// non-local routes r = b, b + grid, ..., which it knows from the route -> row map
+// (perm_idx) that k_prep wrote.
+__device__ void zero_nonlocal_row_large(const DecodeParams& p) {
+  for (int r = blockIdx.x; r < p.num_perm; r += gridDim.x) {
+    if (p.perm_idx[r] >= 0) continue;
     uint4* dst = reinterpret_cast<uint4*>(p.rows + static_cast<size_t>(r) * kHidden);
     for (int i = threadIdx.x; i < kHidden / 8; i += blockDim.x) {
       dst[i] = make_uint4(0, 0, 0, 0);
@@ -383,6 +423,16 @@ __device__ __forceinline__ void mma_slice(float (&acc)[4], uint32_t a_addr,
   ldmatrix_x4(a_addr, a0, a1, a2, a3);
   ldmatrix_x2(b_addr, b0, b1);
   mma_nvfp4_m16n8k64(acc, a0, a1, a2, a3, b0, b1, *sfa_ptr, *sfb_ptr);
+}
+
+// mma_slice with the A fragment loaded by the caller (and its scale word read), for
+// the column groups of an entry that share it.
+__device__ __forceinline__ void mma_slice_b(float (&acc)[4], const uint32_t (&a)[4],
+                                            uint32_t sfa, uint32_t b_addr,
+                                            const uint32_t* sfb_ptr) {
+  uint32_t b0, b1;
+  ldmatrix_x2(b_addr, b0, b1);
+  mma_nvfp4_m16n8k64(acc, a[0], a[1], a[2], a[3], b0, b1, sfa, *sfb_ptr);
 }
 
 // ---- K1: routing + activation quant + GEMM1 + SiLU*up + requant ----------------
@@ -806,6 +856,7 @@ __global__ void __launch_bounds__(kBlockThreads, 1)
 }
 
 #include "muse_nvfp4_decode_persist.cuh"
+#include "muse_nvfp4_decode_large.cuh"
 
 // ---- host side -------------------------------------------------------------------
 
@@ -855,10 +906,11 @@ void ensure_smem_checked(K kernel, int dynamic_bytes, std::atomic<int>& done) {
 // stream: it may start before the predecessor has finished, and must execute
 // griddepcontrol.wait before it reads anything the predecessor writes.
 void launch_dependent(void (*kernel)(const DecodeParams), const DecodeParams& p,
-                      int grid, int smem, cudaStream_t stream) {
+                      int grid, int smem, cudaStream_t stream,
+                      int block = kBlockThreads) {
   cudaLaunchConfig_t cfg{};
   cfg.gridDim = dim3(grid);
-  cfg.blockDim = dim3(kBlockThreads);
+  cfg.blockDim = dim3(block);
   cfg.dynamicSmemBytes = smem;
   cfg.stream = stream;
   cudaLaunchAttribute attr[1];
@@ -872,15 +924,32 @@ void launch_dependent(void (*kernel)(const DecodeParams), const DecodeParams& p,
 template <int T_PAD>
 void launch_persistent(const DecodeParams& p, int grid, cudaStream_t stream) {
   static std::atomic<int> attr{0};
-  constexpr int kSmem = smem_bytes_persist<T_PAD>();
-  ensure_smem_checked(k_persistent<T_PAD>, kSmem, attr);
+  constexpr int kSmem = smem_bytes_persist<T_PAD, false>();
+  ensure_smem_checked(k_persistent<T_PAD, false>, kSmem, attr);
   if (p.flags & kFlagCtlMemset) {
     C10_CUDA_CHECK(cudaMemsetAsync(p.ctl, 0, kCtlWords * sizeof(unsigned), stream));
   }
   if (!(p.flags & kFlagNoPdl)) {
-    launch_dependent(k_persistent<T_PAD>, p, grid, kSmem, stream);
+    launch_dependent(k_persistent<T_PAD, false>, p, grid, kSmem, stream);
   } else {
-    k_persistent<T_PAD><<<grid, kBlockThreads, kSmem, stream>>>(p);
+    k_persistent<T_PAD, false><<<grid, kBlockThreads, kSmem, stream>>>(p);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+}
+
+// Large batches: k_prep, then the persistent kernel as its programmatic dependent.
+void launch_large(const DecodeParams& p, int grid, cudaStream_t stream) {
+  static std::atomic<int> attr{0};
+  constexpr int kSmem = smem_bytes_persist<kLargeMaxTokens, true>();
+  ensure_smem_checked(k_persistent<kLargeMaxTokens, true>, kSmem, attr);
+  const int prep_grid = 1 + (p.T + kPrepRowsPerCta - 1) / kPrepRowsPerCta;
+  if (!(p.flags & kFlagNoPdl)) {
+    launch_dependent(k_prep, p, prep_grid, 0, stream, kPrepThreads);
+    launch_dependent(k_persistent<kLargeMaxTokens, true>, p, grid, kSmem, stream);
+  } else {
+    k_prep<<<prep_grid, kPrepThreads, 0, stream>>>(p);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    k_persistent<kLargeMaxTokens, true><<<grid, kBlockThreads, kSmem, stream>>>(p);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
 }
@@ -946,8 +1015,10 @@ void nvfp4_decode_moe(at::Tensor const& hidden, at::Tensor const& topk_ids,
   check_tensor(gs, at::kFloat, "gs", {2});
   check_tensor(perm_idx, at::kInt, "perm_idx", {-1});
   check_tensor(rows, at::kBFloat16, "rows", {num_perm, kHidden});
-  check_tensor(hq_data, at::kByte, "hq_data", {kMaxCols, kRowBytes});
-  check_tensor(hq_sf, at::kByte, "hq_sf", {kMaxCols, kSfCols});
+  check_tensor(hq_data, at::kByte, "hq_data", {-1, kRowBytes});
+  check_tensor(hq_sf, at::kByte, "hq_sf", {-1, kSfCols});
+  TORCH_CHECK(hq_data.size(0) >= kMaxCols && hq_sf.size(0) >= kMaxCols,
+              "hq scratch must hold ", kMaxCols, " rows");
   check_tensor(plan, at::kInt, "plan", {-1});
   TORCH_CHECK(plan.numel() * 4 >= static_cast<int64_t>(sizeof(Plan)),
               "plan scratch is too small");
@@ -1017,6 +1088,90 @@ void nvfp4_decode_moe(at::Tensor const& hidden, at::Tensor const& topk_ids,
     default:
       TORCH_CHECK(false, "the padded token count must be 1, 2, 4 or 8, got ", t_pad);
   }
+}
+
+void nvfp4_decode_moe_large(
+    at::Tensor const& hidden, at::Tensor const& topk_ids,
+    std::optional<at::Tensor> const& expert_map, at::Tensor const& w13,
+    at::Tensor const& sf13, at::Tensor const& w2, at::Tensor const& sf2,
+    at::Tensor const& prm, at::Tensor const& gs, bool up_first, at::Tensor& rows,
+    at::Tensor& perm_idx, at::Tensor& hq_data, at::Tensor& hq_sf,
+    at::Tensor& xq_data, at::Tensor& xq_sf, at::Tensor& plan, at::Tensor& ctl,
+    int64_t flags) {
+  const int64_t T = hidden.size(0);
+  const int64_t num_routes = T * kTopK;
+  check_tensor(hidden, at::kBFloat16, "hidden", {-1, kHidden});
+  check_tensor(topk_ids, at::kInt, "topk_ids", {T, kTopK});
+  TORCH_CHECK(T >= 1 && T <= kLargeMaxTokens, "token count ", T,
+              " is outside 1..", kLargeMaxTokens);
+  const int64_t num_local = w13.size(0);
+  TORCH_CHECK(num_local >= 1 && num_local <= kLargeMaxLocal, "w13 holds ", num_local,
+              " experts, the large-batch kernel takes 1..", kLargeMaxLocal);
+  check_tensor(w13, at::kByte, "w13", {num_local, kW13Rows, kRowBytes});
+  check_tensor(sf13, at::kFloat8_e4m3fn, "sf13", {num_local, kW13Rows, kSfCols});
+  check_tensor(w2, at::kByte, "w2", {num_local, kHidden, kRowBytes});
+  check_tensor(sf2, at::kFloat8_e4m3fn, "sf2", {num_local, kHidden, kSfCols});
+  check_tensor(prm, at::kFloat, "prm", {num_local, 4});
+  check_tensor(gs, at::kFloat, "gs", {2});
+  // The outputs and the scratch hold the largest batch; a smaller one uses
+  // their leading rows.
+  check_tensor(rows, at::kBFloat16, "rows", {num_routes, kHidden});
+  check_tensor(perm_idx, at::kInt, "perm_idx", {num_routes});
+  check_tensor(hq_data, at::kByte, "hq_data", {-1, kRowBytes});
+  check_tensor(hq_sf, at::kByte, "hq_sf", {-1, kSfCols});
+  TORCH_CHECK(hq_data.size(0) >= num_routes && hq_sf.size(0) >= num_routes,
+              "hq scratch must hold one row per route");
+  check_tensor(xq_data, at::kByte, "xq_data", {-1, kRowBytes});
+  check_tensor(xq_sf, at::kByte, "xq_sf", {-1, kSfCols});
+  TORCH_CHECK(xq_data.size(0) >= T && xq_sf.size(0) >= T,
+              "activation scratch must hold one row per token");
+  check_tensor(plan, at::kInt, "plan", {-1});
+  TORCH_CHECK(plan.numel() * 4 >= static_cast<int64_t>(sizeof(PlanLarge)),
+              "plan scratch is too small");
+  check_tensor(ctl, at::kInt, "ctl", {-1});
+  TORCH_CHECK(ctl.numel() >= kCtlWordsLarge, "ctl must hold ", kCtlWordsLarge,
+              " words");
+
+  DecodeParams p{};
+  p.hidden = reinterpret_cast<const __nv_bfloat16*>(hidden.data_ptr());
+  p.topk_ids = reinterpret_cast<const int*>(topk_ids.data_ptr());
+  p.expert_map = nullptr;
+  p.num_global = 0;
+  if (expert_map.has_value()) {
+    check_tensor(*expert_map, at::kInt, "expert_map", {-1});
+    p.expert_map = reinterpret_cast<const int*>(expert_map->data_ptr());
+    p.num_global = static_cast<int>(expert_map->size(0));
+  }
+  p.num_local = static_cast<int>(num_local);
+  p.w13 = reinterpret_cast<const uint8_t*>(w13.data_ptr());
+  p.sf13 = reinterpret_cast<const uint8_t*>(sf13.data_ptr());
+  p.w2 = reinterpret_cast<const uint8_t*>(w2.data_ptr());
+  p.sf2 = reinterpret_cast<const uint8_t*>(sf2.data_ptr());
+  p.prm = reinterpret_cast<const float*>(prm.data_ptr());
+  p.gs = reinterpret_cast<const float*>(gs.data_ptr());
+  p.rows = reinterpret_cast<__nv_bfloat16*>(rows.data_ptr());
+  p.perm_idx = reinterpret_cast<int*>(perm_idx.data_ptr());
+  p.hq_data = reinterpret_cast<uint8_t*>(hq_data.data_ptr());
+  p.hq_sf = reinterpret_cast<uint8_t*>(hq_sf.data_ptr());
+  p.plan = reinterpret_cast<int*>(plan.data_ptr());
+  p.xq_buf = reinterpret_cast<uint8_t*>(xq_data.data_ptr());
+  p.xq_sf_buf = reinterpret_cast<uint8_t*>(xq_sf.data_ptr());
+  p.dbg_acc = nullptr;
+  p.ctl = reinterpret_cast<unsigned*>(ctl.data_ptr());
+  p.xq_data = nullptr;
+  p.xq_sf = nullptr;
+  p.flags = static_cast<int>(flags & 0xffff);
+  p.T = static_cast<int>(T);
+  p.num_perm = static_cast<int>(num_routes);
+  p.up_first = up_first ? 1 : 0;
+
+  const c10::cuda::OptionalCUDAGuard guard(hidden.device());
+  int grid = static_cast<int>(flags >> 16);
+  if (grid <= 0) {
+    grid = MUSE_DECODE_GRID > 0 ? MUSE_DECODE_GRID : sm_count(hidden.get_device());
+  }
+  cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+  launch_large(p, grid, stream);
 }
 
 void nvfp4_decode_act_quant(at::Tensor const& hidden, at::Tensor const& gs,

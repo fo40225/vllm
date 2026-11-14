@@ -79,9 +79,9 @@ from vllm.models.muse_spark.nvidia.ops.mnnvl_fusions import (
     maybe_create_moe_finalize_all_reduce,
     tp_group_spans_nodes,
 )
+from vllm.models.muse_spark.nvidia.ops.muse_decode_moe import muse_max_tokens
 from vllm.models.muse_spark.nvidia.sm120_nvfp4_moe import (
     B12X_MAX_TOKENS,
-    MUSE_MAX_TOKENS,
     MuseSparkSm120NvFp4Experts,
     check_sm120_nvfp4_supported,
     fold_sm120_nvfp4_scales,
@@ -712,7 +712,7 @@ class MuseSparkModelOptNvFp4FusedMoE(ModelOptNvFp4FusedMoE):
         logger.info_once(
             "MuseSpark NVFP4: native FP4 MoE on SM120 with %s.",
             {
-                "muse": f"the muse decode kernel for up to {MUSE_MAX_TOKENS} padded "
+                "muse": f"the muse decode kernel for up to {muse_max_tokens()} padded "
                 "tokens in CUDA graphs and CUTLASS grouped GEMMs otherwise",
                 "b12x": f"b12x for up to {B12X_MAX_TOKENS} padded tokens in CUDA "
                 "graphs and CUTLASS grouped GEMMs otherwise",

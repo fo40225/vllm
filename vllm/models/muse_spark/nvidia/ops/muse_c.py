@@ -424,6 +424,30 @@ def _register_decode_fakes() -> None:
     ) -> None:
         return None
 
+    @torch.library.register_fake("_muse_C::nvfp4_decode_moe_large")
+    def _nvfp4_decode_moe_large_fake(
+        hidden: torch.Tensor,
+        topk_ids: torch.Tensor,
+        expert_map: torch.Tensor | None,
+        w13: torch.Tensor,
+        sf13: torch.Tensor,
+        w2: torch.Tensor,
+        sf2: torch.Tensor,
+        prm: torch.Tensor,
+        gs: torch.Tensor,
+        up_first: bool,
+        rows: torch.Tensor,
+        perm_idx: torch.Tensor,
+        hq_data: torch.Tensor,
+        hq_sf: torch.Tensor,
+        xq_data: torch.Tensor,
+        xq_sf: torch.Tensor,
+        plan: torch.Tensor,
+        ctl: torch.Tensor,
+        flags: int = 0,
+    ) -> None:
+        return None
+
     @torch.library.register_fake("_muse_C::nvfp4_decode_act_quant")
     def _nvfp4_decode_act_quant_fake(
         hidden: torch.Tensor, gs: torch.Tensor, data: torch.Tensor, sf: torch.Tensor

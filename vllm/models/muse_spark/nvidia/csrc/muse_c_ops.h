@@ -114,6 +114,29 @@ void nvfp4_decode_moe(at::Tensor const& hidden, at::Tensor const& topk_ids,
                       int64_t flags, std::optional<at::Tensor> const& xq_data,
                       std::optional<at::Tensor> const& xq_sf);
 
+// Large-batch variant of nvfp4_decode_moe for 1..128 tokens and up to 256 local
+// experts (muse_nvfp4_decode_large.cuh, the persistent kernel with LARGE): the
+// same expert computation, bit for bit the rows of nvfp4_decode_moe, with the
+// activations quantized and the plan built by a first launch into global scratch
+// instead of in every CTA.
+//   hidden [T, 4096] bf16, topk_ids [T, 8] int32, expert_map, w13 .. gs, up_first
+//   as above. rows [T * 8, 4096] bf16 and perm_idx [T * 8] int32 are the outputs
+//   (leading rows of the caller's static buffers), hq_data [>= T * 8, 2048] u8 and
+//   hq_sf [>= T * 8, 256] u8 the intermediate, xq_data [>= T, 2048] u8 and xq_sf
+//   [>= T, 256] u8 the quantized activations (scratch, written by the first
+//   launch), plan (int32, >= 6084 entries) and ctl (int32, >= 322 entries, zero it
+//   once, every launch leaves it zero) as above. flags: 4 = zero the rows
+//   of non-local routes, 8 = no programmatic dependent launches; bits 16..
+//   override the grid size of the persistent kernel.
+void nvfp4_decode_moe_large(
+    at::Tensor const& hidden, at::Tensor const& topk_ids,
+    std::optional<at::Tensor> const& expert_map, at::Tensor const& w13,
+    at::Tensor const& sf13, at::Tensor const& w2, at::Tensor const& sf2,
+    at::Tensor const& prm, at::Tensor const& gs, bool up_first, at::Tensor& rows,
+    at::Tensor& perm_idx, at::Tensor& hq_data, at::Tensor& hq_sf,
+    at::Tensor& xq_data, at::Tensor& xq_sf, at::Tensor& plan, at::Tensor& ctl,
+    int64_t flags);
+
 // The in-kernel activation quantization of nvfp4_decode_moe on its own, for
 // tests: hidden [T, 4096] bf16 -> codes [T, 2048] u8 and linear e4m3 scales
 // [T, 256] u8, gs[0] = 1 / a13.

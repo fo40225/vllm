@@ -84,8 +84,10 @@ ENGINE_ENV = "VLLM_MUSE_SPARK_SM120_DECODE_ENGINE"
 # GEMM1 keeping the gate and up scales apart like the kernel does, so only a few
 # intermediate codes flip.
 REPLAY_REL_L2 = 3e-3
-# The muse engine and the exact CUTLASS path compute the same rows bit for bit;
-# what is left between the two layer outputs is the finalizer's.
+# On the layers of these tests the muse engine and the exact CUTLASS path compute
+# the same rows bit for bit (real expert weights included, see muse_decode_moe.py);
+# what is left between the two layer outputs is the finalizer's. End to end on the
+# real model the two engines differ at the rounding level.
 ENGINE_AGREEMENT_REL_L2 = 1e-6
 
 
@@ -321,24 +323,50 @@ class _Engine:
 @torch.inference_mode()
 def test_engine_serves_every_padded_token_count(layer: _Layer) -> None:
     engine = _Engine(layer)
-    ids_all = _ids_cases(8, 5)["random"]
-    u_all = _routing(8, 5)[0]
-    rows8, perm8 = engine.run(u_all, ids_all)
-    assert rows8.shape == (8 * TOP_K, H) and perm8.shape == (8 * TOP_K,)
-    rows8, perm8 = rows8.clone(), perm8.clone()
+    assert engine.engine.max_tokens == MUSE_MAX_TOKENS
+    ids_all = _ids_cases(MUSE_MAX_TOKENS, 5)["random"]
+    u_all = _routing(MUSE_MAX_TOKENS, 5)[0]
+    rows_all, perm_all = engine.run(u_all, ids_all)
+    n_routes = MUSE_MAX_TOKENS * TOP_K
+    assert rows_all.shape == (n_routes, H) and perm_all.shape == (n_routes,)
+    rows_all, perm_all = rows_all.clone(), perm_all.clone()
     for t in range(1, MUSE_MAX_TOKENS + 1):
         rows, perm = engine.run(u_all[:t], ids_all[:t])
         assert rows.shape == (t * TOP_K, H) and perm.shape == (t * TOP_K,)
         assert rows.dtype == torch.bfloat16 and perm.dtype == torch.int32
         assert rows.is_contiguous() and perm.is_contiguous()
         # A token's rows do not depend on the other tokens of the batch, nor on
-        # the padding to 1, 2, 4 or 8.
-        assert torch.equal(perm, perm8[: t * TOP_K])
+        # the padding to 1, 2, 4 or 8, nor on which kernel (small batch up to 8
+        # tokens, large batch beyond) computes them.
+        assert torch.equal(perm, perm_all[: t * TOP_K])
         got = rows[perm >= 0].view(torch.int16)
-        want = rows8[: t * TOP_K][perm >= 0].view(torch.int16)
+        want = rows_all[: t * TOP_K][perm >= 0].view(torch.int16)
         assert torch.equal(got, want), t
+    with pytest.raises(RuntimeError, match=f"1..{MUSE_MAX_TOKENS}"):
+        engine.run(
+            torch.zeros(MUSE_MAX_TOKENS + 1, H, dtype=torch.bfloat16, device="cuda"),
+            torch.zeros(MUSE_MAX_TOKENS + 1, TOP_K, dtype=torch.int32, device="cuda"),
+        )
+
+
+@torch.inference_mode()
+def test_engine_limit_follows_the_environment(layer: _Layer, monkeypatch) -> None:
+    """VLLM_MUSE_SPARK_SM120_DECODE_MAX_TOKENS lowers the largest served batch
+    (8: the small-batch kernel only, which then never launches the large one)."""
+    monkeypatch.setenv("VLLM_MUSE_SPARK_SM120_DECODE_MAX_TOKENS", "8")
+    engine = _Engine(layer)
+    assert engine.engine.max_tokens == 8
+    u = _routing(9, 6)[0]
+    ids = _ids_cases(9, 6)["random"]
+    engine.run(u[:8], ids[:8])
     with pytest.raises(RuntimeError, match="1..8"):
-        engine.run(torch.zeros(9, H, dtype=torch.bfloat16, device="cuda"), ids_all)
+        engine.run(u, ids)
+    monkeypatch.setenv("VLLM_MUSE_SPARK_SM120_DECODE_MAX_TOKENS", "24")
+    engine = _Engine(layer)
+    assert engine.engine.max_tokens == 24
+    engine.run(_routing(24, 6)[0], _ids_cases(24, 6)["random"])
+    with pytest.raises(RuntimeError, match="1..24"):
+        engine.run(_routing(25, 6)[0], _ids_cases(25, 6)["random"])
 
 
 @torch.inference_mode()
@@ -370,16 +398,21 @@ def test_engine_rejects_other_shapes(layer: _Layer) -> None:
     assert muse_decode_moe.muse_shape_mismatch(H, H, TOP_K, 0) is not None
 
 
+@pytest.mark.parametrize("t", [4, 24])
 @torch.inference_mode()
-def test_engine_zeroes_remote_rows_on_request(layer: _Layer) -> None:
+def test_engine_zeroes_remote_rows_on_request(layer: _Layer, t: int) -> None:
     """Rows that are all-reduced before the norm must be zero where a route is
     remote; otherwise they are not written."""
-    u = _routing(4, 9)[0]
-    ids = _local_ids(4, [0, 2, 5, 8], 9)
+    u = _routing(t, 9)[0]
+    ids = _local_ids(t, [0, 2, 5, 8] * (t // 4), 9)
     for zero in (False, True):
         engine = _Engine(layer, zero_non_local=zero)
         # Poison the shared rows first.
-        outputs = muse_decode_moe._get_outputs(layer.w13.device, 4)
+        outputs = (
+            muse_decode_moe._get_outputs(layer.w13.device, 4)
+            if t <= 8
+            else muse_decode_moe._get_large_outputs(layer.w13.device)
+        )
         outputs.rows.fill_(float("nan"))
         rows, perm = engine.run(u, ids)
         remote = perm < 0
@@ -549,7 +582,7 @@ def handed_over(monkeypatch) -> list[SimpleNamespace]:
     return seen
 
 
-@pytest.mark.parametrize("t", [1, 2, 3, 4, 8])
+@pytest.mark.parametrize("t", [1, 2, 3, 4, 8, 9, 24, 64])
 @torch.inference_mode()
 def test_experts_match_the_reference_and_hand_over_route_major_rows(
     experts: _Experts, handed_over, t: int
@@ -671,7 +704,7 @@ def test_every_finalize_variant_consumes_the_rows(
     assert _rel_l2(fused, out) <= 1e-2
 
 
-@pytest.mark.parametrize("t", [1, 3, 8])
+@pytest.mark.parametrize("t", [1, 3, 8, 16, 64])
 @torch.inference_mode()
 def test_experts_eager_and_graph_are_bitwise_equal(experts: _Experts, t: int) -> None:
     layer = experts.layer
@@ -780,7 +813,7 @@ def _inputs(num_tokens: int, seed: int):
     return x, logits
 
 
-@pytest.mark.parametrize("num_tokens", [1, 3, 8, 16])
+@pytest.mark.parametrize("num_tokens", [1, 3, 8, 16, 33, 128])
 @torch.inference_mode()
 def test_layer_runs_the_muse_engine_in_graphs(
     dist_init,
@@ -832,8 +865,8 @@ def test_layer_runs_the_muse_engine_in_graphs(
     ref = _finalize(rows_ref, topk_weights, layer.gamma, valid)
     assert _rel_l2(out_eager, ref) <= REPLAY_REL_L2
 
-    # The captured graph runs the muse engine for up to eight tokens (it replays
-    # no Python), and CUTLASS beyond that, and is checked against the eager run:
+    # The captured graph runs the muse engine up to its limit (it replays no
+    # Python; every size here is below it) and is checked against the eager run:
     # the engine and the CUTLASS path agree, whatever the scales.
     uses_muse = num_tokens <= MUSE_MAX_TOKENS
     x2, logits2 = _inputs(num_tokens, 2)

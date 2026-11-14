@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """MuseSpark1x native-FP4 (NVFP4 W4A4) MoE experts for SM120.
 
-Three engines on the FP4 tensor cores: grouped CUTLASS GEMMs, and for a few
-tokens inside CUDA graphs either the muse decode kernel of the ``_muse_C``
+Three engines on the FP4 tensor cores: grouped CUTLASS GEMMs, and for decode
+batches inside CUDA graphs either the muse decode kernel of the ``_muse_C``
 extension (``ops/muse_decode_moe.py``) or the fused b12x decode kernel
 (``ops/b12x_decode_moe.py``). ``VLLM_MUSE_SPARK_SM120_DECODE_ENGINE`` picks the
 decode engine of a layer when it is constructed (see ``select_decode_engine``).
@@ -86,7 +86,6 @@ from vllm.models.muse_spark.nvidia.ops.b12x_decode_moe import (
 from vllm.models.muse_spark.nvidia.ops.expert_prefetch import EXPERT_PREFETCH_CTAS
 from vllm.models.muse_spark.nvidia.ops.muse_decode_moe import (
     EXPERT_PREFETCH_MAX_TOKENS,
-    MUSE_MAX_TOKENS,
     MuseDecodeMoE,
     mark_muse_setup_failed,
     muse_shape_mismatch,
@@ -327,8 +326,9 @@ def select_decode_engine(moe_backend: str, moe_config: FusedMoEConfig) -> str:
     * ``cutlass``: neither decode engine.
 
     Batch-invariant mode excludes both engines (CUTLASS at every batch size).
-    Whatever the choice, the engines only serve padded batches of up to eight
-    tokens inside CUDA graphs, so a deployment without CUDA graphs (or with
+    Whatever the choice, the engines only serve padded batches inside CUDA graphs
+    (the muse kernel up to ``VLLM_MUSE_SPARK_SM120_DECODE_MAX_TOKENS`` = 128
+    tokens, b12x up to eight), so a deployment without CUDA graphs (or with
     ``--moe-backend cutlass``) gets CUTLASS, and eager passes and larger batches
     always run the CUTLASS grouped GEMMs.
     """
@@ -769,7 +769,7 @@ class MuseSparkSm120NvFp4Experts(mk.FusedMoEExpertsModular):
             use_muse = (
                 self.muse is not None
                 and capturing
-                and hidden_states.shape[0] <= MUSE_MAX_TOKENS
+                and hidden_states.shape[0] <= self.muse.max_tokens
             )
         elif self.use_b12x_decode:
             capturing = _capturing()
@@ -812,7 +812,8 @@ class MuseSparkSm120NvFp4Experts(mk.FusedMoEExpertsModular):
             self.use_muse_decode
             and self.muse is not None
             and _capturing()
-            and topk_ids.shape[0] <= min(MUSE_MAX_TOKENS, EXPERT_PREFETCH_MAX_TOKENS)
+            and topk_ids.shape[0]
+            <= min(self.muse.max_tokens, EXPERT_PREFETCH_MAX_TOKENS)
         ):
             return False
         self.muse.prefetch(
@@ -843,7 +844,7 @@ class MuseSparkSm120NvFp4Experts(mk.FusedMoEExpertsModular):
         logger.info_once(
             "MuseSpark SM120 MoE: running the muse decode engine for up to %d "
             "padded tokens.",
-            MUSE_MAX_TOKENS,
+            self.muse.max_tokens,
         )
         num_tokens, top_k = topk_ids.shape
         rows, perm_idx = self.muse.run(hidden_states, topk_ids, expert_map)

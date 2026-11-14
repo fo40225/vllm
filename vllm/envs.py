@@ -144,6 +144,7 @@ if TYPE_CHECKING:
     VLLM_MUSE_SPARK_SM120_DECODE_ENGINE: Literal["auto", "muse", "b12x", "cutlass"] = (
         "auto"
     )
+    VLLM_MUSE_SPARK_SM120_DECODE_MAX_TOKENS: int = 128
     VLLM_MUSE_SPARK_SM120_EXACT_GEMM1: bool = True
     VLLM_MUSE_SPARK_SM120_PREFILL_LOCAL_ROWS: bool = True
     VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL: bool | None = None
@@ -1312,8 +1313,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MUSE_SPARK_SM120_PDL": lambda: bool(
         int(os.getenv("VLLM_MUSE_SPARK_SM120_PDL", "1"))
     ),
-    # Muse Spark on SM120: the engine of the NVFP4 MoE for a few tokens (padded
-    # batches of up to 8 inside CUDA graphs). "auto" picks the _muse_C decode
+    # Muse Spark on SM120: the engine of the NVFP4 MoE for decode batches (padded
+    # batches of up to VLLM_MUSE_SPARK_SM120_DECODE_MAX_TOKENS inside CUDA graphs,
+    # b12x: up to 8). "auto" picks the _muse_C decode
     # kernel when the extension builds and the layer has its shapes, else b12x
     # when usable, else the CUTLASS grouped GEMMs. "muse" and "b12x" force that
     # engine (falling back with a warning if it cannot be used); "cutlass" turns
@@ -1325,6 +1327,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "auto",
         ["auto", "muse", "b12x", "cutlass"],
         case_sensitive=False,
+    ),
+    # Muse Spark on SM120: the largest padded batch (in tokens, inside CUDA graphs)
+    # that the _muse_C decode kernel serves; larger decode batches run the CUTLASS
+    # grouped GEMMs. The kernel serves up to 128 tokens (batches of up to 8 with
+    # its small-batch variant, 9..128 with the large-batch one, which first
+    # quantizes the activations and builds the plan in a launch of its own). The
+    # rows are the small-batch kernel's, bit for bit, and equal the exact CUTLASS
+    # rows in the unit probes (real weights included); end to end on the real model
+    # the two engines differ at the rounding level, reproducibly (as they already do
+    # at 8 tokens or fewer). The kernel is deterministic and batch invariant. 8
+    # restores the former limit (CUTLASS above 8 tokens). Read once, when a layer's
+    # decode engine is prepared, so it must not change between a CUDA graph capture
+    # and its replay.
+    "VLLM_MUSE_SPARK_SM120_DECODE_MAX_TOKENS": lambda: int(
+        os.getenv("VLLM_MUSE_SPARK_SM120_DECODE_MAX_TOKENS", "128")
     ),
     # Muse Spark on SM120: run GEMM1 of the CUTLASS grouped-GEMM NVFP4 MoE with
     # the gate and up global weight scales apart (one group per half, and the

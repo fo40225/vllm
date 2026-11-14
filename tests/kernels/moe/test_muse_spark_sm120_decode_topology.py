@@ -35,7 +35,10 @@ from vllm.config import set_current_vllm_config
 from vllm.forward_context import set_forward_context
 from vllm.models.muse_spark.common.ops.fused_rmsnorm import fused_rmsnorm_fwd
 from vllm.models.muse_spark.nvidia.ops import muse_c
-from vllm.models.muse_spark.nvidia.ops.muse_decode_moe import MUSE_MAX_TOKENS
+from vllm.models.muse_spark.nvidia.ops.muse_decode_moe import (
+    MUSE_MAX_TOKENS,
+    MUSE_SMALL_MAX_TOKENS,
+)
 from vllm.platforms import current_platform
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 
@@ -123,7 +126,7 @@ def test_aux_stream_routing_graph_with_the_muse_engine_replays_like_a_serial_gra
         return graph, out
 
     with set_current_vllm_config(vllm_config), set_forward_context(None, vllm_config):
-        for num_tokens in (1, 2, 4, MUSE_MAX_TOKENS):
+        for num_tokens in (1, 2, 4, MUSE_SMALL_MAX_TOKENS, 24, MUSE_MAX_TOKENS):
             x_serial = _random_input(num_tokens, generator)
             x_aux = x_serial.clone()
             serial_graph, serial_out = capture(serial, x_serial)

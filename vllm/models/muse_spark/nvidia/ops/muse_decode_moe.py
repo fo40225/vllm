@@ -10,12 +10,27 @@ route-major, plus the permute map the post-GEMM2 hook needs: ``perm_idx[r]`` is
 ``r`` for a route whose expert is local to this rank and -1 otherwise (the rows
 of the latter are not written).
 
+Batches of 9 to 128 tokens (the CUDA graph sizes of larger decode batches and the
+verification batches of speculative decoding) run ``nvfp4_decode_moe_large``: a
+small preparation launch quantizes the activations into global scratch and builds
+the plan, then the same persistent kernel reads the activations of every stage
+from that scratch instead of keeping them in shared memory. The rows are the
+same bit for bit as those of the small-batch kernel for every route. Against the
+CUTLASS grouped GEMMs (which the batches above 8 tokens used before) the
+quantization points, scales and roundings are the same, and the rows are equal bit
+for bit in the unit probes (random layers and real expert weights with gaussian,
+per-channel scaled and outlier activations); the fp32 accumulation order over K
+differs (the kernel adds four partial sums, CUTLASS runs one chain), and end to end
+on the real model the two engines differ at the rounding level, reproducibly, as
+they already do for 8 tokens or fewer. The cause has not been isolated.
+
 Every shape is static: the launch parameters depend on the padded token count
-only (1, 2, 4 or 8; a batch of 3 runs as 4), the routing is data on the device.
-The output buffers and the scratch are static tensors shared by all layers,
-which run one after another on one stream; the rows stay valid until the next
-call. The kernel is deterministic (fixed reduction order, no float atomics), so
-the engine is also valid in batch-invariant mode.
+only (1, 2, 4 or 8; a batch of 3 runs as 4; the large-batch kernel takes the
+count as is), the routing is data on the device. The output buffers and the
+scratch are static tensors shared by all layers, which run one after another on
+one stream; the rows stay valid until the next call. The kernel is deterministic
+(fixed reduction order, no float atomics), so the engine is also valid in
+batch-invariant mode.
 
 The engine is optional: ``muse_unusable_reason`` and ``muse_shape_mismatch`` say
 whether the host and a layer can use it, and callers that cannot stay on their
@@ -26,27 +41,51 @@ from dataclasses import dataclass
 
 import torch
 
+from vllm import envs
 from vllm.logger import init_logger
 from vllm.models.muse_spark.common.ops import muse_pdl_enabled
 from vllm.models.muse_spark.nvidia.ops import muse_c
 
 logger = init_logger(__name__)
 
-# Padded token counts 1..MUSE_MAX_TOKENS are served (as 1, 2, 4 or 8).
-MUSE_MAX_TOKENS = 8
+# Token counts 1..MUSE_MAX_TOKENS are served: up to MUSE_SMALL_MAX_TOKENS by the
+# small-batch kernel (padded to 1, 2, 4 or 8), the rest by the large-batch one.
+MUSE_MAX_TOKENS = 128
+MUSE_SMALL_MAX_TOKENS = 8
 _T_PADS = (1, 2, 4, 8)
 # The expert prefetch maps the routes of up to this many tokens (64 routes) in one CTA.
 EXPERT_PREFETCH_MAX_TOKENS = 8
+# The large-batch kernel keeps its plan in 384 entries (an expert with up to 8
+# routes is one entry): 256 local experts plus the experts split over entries.
+MUSE_LARGE_MAX_LOCAL_EXPERTS = 256
 # The fixed problem of the kernel, apart from the number of local experts.
 MUSE_HIDDEN = 4096
 MUSE_INTERMEDIATE = 4096
 MUSE_TOP_K = 8
-# Flags of the op, see muse_c_ops.h.
+# Flags of the ops, see muse_c_ops.h.
 _FLAG_ZERO_NON_LOCAL = 4
 _FLAG_NO_PDL = 8
+# Scratch of the large-batch kernel: one row per route of the largest batch.
+_MAX_ROUTES = MUSE_MAX_TOKENS * MUSE_TOP_K
 
 # Set once an engine could not be set up: the other layers would fail alike.
 _setup_failure: str | None = None
+
+
+def muse_max_tokens(num_local_experts: int | None = None) -> int:
+    """The largest token count the muse engine serves.
+
+    ``VLLM_MUSE_SPARK_SM120_DECODE_MAX_TOKENS`` lowers it (the CUTLASS grouped
+    GEMMs serve the larger batches); a rank with more local experts than the
+    large-batch kernel's plan holds is limited to the small-batch kernel.
+    """
+    limit = min(MUSE_MAX_TOKENS, envs.VLLM_MUSE_SPARK_SM120_DECODE_MAX_TOKENS)
+    if (
+        num_local_experts is not None
+        and num_local_experts > MUSE_LARGE_MAX_LOCAL_EXPERTS
+    ):
+        limit = min(limit, MUSE_SMALL_MAX_TOKENS)
+    return max(limit, 0)
 
 
 def muse_unusable_reason() -> str | None:
@@ -87,6 +126,9 @@ class _Scratch:
     plan: torch.Tensor
     # Counters of the persistent kernel: zero once, every launch leaves them zero.
     ctl: torch.Tensor
+    # Large batches: the quantized activations (codes, linear scales).
+    xq_data: torch.Tensor
+    xq_sf: torch.Tensor
 
 
 @dataclass
@@ -106,10 +148,16 @@ def _get_scratch(device: torch.device) -> _Scratch:
     if scratch is None:
         half = MUSE_INTERMEDIATE // 2
         scratch = _scratch[device] = _Scratch(
-            hq_data=torch.zeros(64, half, dtype=torch.uint8, device=device),
-            hq_sf=torch.zeros(64, half // 8, dtype=torch.uint8, device=device),
-            plan=torch.zeros(1024, dtype=torch.int32, device=device),
-            ctl=torch.zeros(128, dtype=torch.int32, device=device),
+            hq_data=torch.zeros(_MAX_ROUTES, half, dtype=torch.uint8, device=device),
+            hq_sf=torch.zeros(_MAX_ROUTES, half // 8, dtype=torch.uint8, device=device),
+            plan=torch.zeros(8192, dtype=torch.int32, device=device),
+            ctl=torch.zeros(512, dtype=torch.int32, device=device),
+            xq_data=torch.zeros(
+                MUSE_MAX_TOKENS, half, dtype=torch.uint8, device=device
+            ),
+            xq_sf=torch.zeros(
+                MUSE_MAX_TOKENS, half // 8, dtype=torch.uint8, device=device
+            ),
         )
     return scratch
 
@@ -129,12 +177,27 @@ def _get_outputs(device: torch.device, t_pad: int) -> _Outputs:
     return outputs
 
 
+def _get_large_outputs(device: torch.device) -> _Outputs:
+    """The outputs of the large-batch kernel: a batch uses their leading rows."""
+    key = (device, 0)
+    outputs = _outputs.get(key)
+    if outputs is None:
+        outputs = _outputs[key] = _Outputs(
+            rows=torch.zeros(
+                _MAX_ROUTES, MUSE_HIDDEN, dtype=torch.bfloat16, device=device
+            ),
+            perm_idx=torch.full((_MAX_ROUTES,), -1, dtype=torch.int32, device=device),
+        )
+    return outputs
+
+
 def _padded_tokens(num_tokens: int) -> int:
     for t_pad in _T_PADS:
         if num_tokens <= t_pad:
             return t_pad
     raise RuntimeError(
-        f"The muse decode engine serves 1..{MUSE_MAX_TOKENS} tokens, got {num_tokens}."
+        f"The small-batch muse decode kernel serves 1..{MUSE_SMALL_MAX_TOKENS} "
+        f"tokens, got {num_tokens}."
     )
 
 
@@ -169,6 +232,7 @@ class MuseDecodeMoE:
         if mismatch is not None:
             raise ValueError(mismatch)
         self.num_local_experts = num_local
+        self.max_tokens = muse_max_tokens(num_local)
         self.device = w1.device
         self._w1, self._w1_scale = w1, w1_scale
         self._w2, self._w2_scale = w2, w2_scale
@@ -183,6 +247,8 @@ class MuseDecodeMoE:
         self._scratch = _get_scratch(self.device)
         for t_pad in _T_PADS:
             _get_outputs(self.device, t_pad)
+        if self.max_tokens > MUSE_SMALL_MAX_TOKENS:
+            _get_large_outputs(self.device)
         self._warm_up()
 
     @staticmethod
@@ -204,7 +270,11 @@ class MuseDecodeMoE:
         expert_map = torch.arange(
             self.num_local_experts, dtype=torch.int32, device=self.device
         )
-        for t_pad in _T_PADS:
+        warm_up = list(_T_PADS)
+        if self.max_tokens > MUSE_SMALL_MAX_TOKENS:
+            # One launch sets up the large-batch kernel for every token count.
+            warm_up.append(MUSE_SMALL_MAX_TOKENS + 1)
+        for t_pad in warm_up:
             hidden = torch.zeros(
                 t_pad, MUSE_HIDDEN, dtype=torch.bfloat16, device=self.device
             )
@@ -259,7 +329,7 @@ class MuseDecodeMoE:
         topk_ids: torch.Tensor,
         expert_map: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """``(rows, perm_idx)`` of ``hidden_states`` [T, hidden]; T is 1 to 8.
+        """``(rows, perm_idx)`` of ``hidden_states`` [T, hidden], T = 1..``max_tokens``.
 
         The rows [T * 8, hidden] are the unweighted GEMM2 output, route-major:
         row ``t * 8 + k`` belongs to route ``(t, k)``, and ``perm_idx`` [T * 8]
@@ -270,9 +340,48 @@ class MuseDecodeMoE:
         until the next call.
         """
         num_tokens = hidden_states.shape[0]
+        if num_tokens > self.max_tokens:
+            raise RuntimeError(
+                f"The muse decode engine serves 1..{self.max_tokens} tokens, "
+                f"got {num_tokens}."
+            )
+        # Launched as a programmatic dependent of the kernel before it in the
+        # stream (the routing kernel, or the pre-expert norm when the routing
+        # runs on the aux stream and joins by an event). It waits for it before
+        # it reads the ids and the activations. Plain launch if PDL is off.
+        flags = self._flags | (0 if muse_pdl_enabled() else _FLAG_NO_PDL)
+        scratch = self._scratch
+        num_routes = num_tokens * MUSE_TOP_K
+        if num_tokens > MUSE_SMALL_MAX_TOKENS:
+            outputs = _get_large_outputs(self.device)
+            rows = outputs.rows[:num_routes]
+            perm_idx = outputs.perm_idx[:num_routes]
+            torch.ops._muse_C.nvfp4_decode_moe_large(
+                hidden_states.contiguous(),
+                topk_ids.to(torch.int32).contiguous(),
+                None
+                if expert_map is None
+                else expert_map.to(torch.int32).contiguous(),
+                self._w1,
+                self._w1_scale,
+                self._w2,
+                self._w2_scale,
+                self._prm,
+                self._gs,
+                self._up_first,
+                rows,
+                perm_idx,
+                scratch.hq_data,
+                scratch.hq_sf,
+                scratch.xq_data,
+                scratch.xq_sf,
+                scratch.plan,
+                scratch.ctl,
+                flags,
+            )
+            return rows, perm_idx
         t_pad = _padded_tokens(num_tokens)
         outputs = _get_outputs(self.device, t_pad)
-        scratch = self._scratch
         torch.ops._muse_C.nvfp4_decode_moe(
             hidden_states.contiguous(),
             topk_ids.to(torch.int32).contiguous(),
@@ -293,13 +402,8 @@ class MuseDecodeMoE:
             scratch.plan,
             scratch.ctl,
             None,
-            # Launched as a programmatic dependent of the kernel before it in the
-            # stream (the routing kernel, or the pre-expert norm when the routing
-            # runs on the aux stream and joins by an event). It waits for it before
-            # it reads the ids and the activations. Plain launch if PDL is off.
-            self._flags | (0 if muse_pdl_enabled() else _FLAG_NO_PDL),
+            flags,
             None,
             None,
         )
-        num_routes = num_tokens * MUSE_TOP_K
         return outputs.rows[:num_routes], outputs.perm_idx[:num_routes]
