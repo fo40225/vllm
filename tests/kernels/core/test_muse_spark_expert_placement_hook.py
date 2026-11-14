@@ -164,11 +164,13 @@ def flag_on(monkeypatch) -> None:
     monkeypatch.setenv("VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT", "1")
 
 
-def test_flag_is_off_by_default(monkeypatch) -> None:
+def test_flag_is_on_by_default(monkeypatch) -> None:
     monkeypatch.delenv("VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT", raising=False)
     monkeypatch.delenv("VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT_TABLE", raising=False)
-    assert envs.VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT is False
+    assert envs.VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT is True
     assert envs.VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT_TABLE is None
+    monkeypatch.setenv("VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT", "0")
+    assert envs.VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT is False
     monkeypatch.setenv("VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT", "1")
     monkeypatch.setenv(
         "VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT_TABLE", "/some/table.json"
@@ -424,7 +426,11 @@ def test_the_ep_weight_filter_is_off_under_a_placement(monkeypatch) -> None:
     from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 
     monkeypatch.setattr(distributed, "get_tensor_model_parallel_rank", lambda: 3)
-    model_config = SimpleNamespace(is_moe=True, get_num_experts=lambda: 256)
+    model_config = SimpleNamespace(
+        is_moe=True,
+        get_num_experts=lambda: 256,
+        architectures=["MuseSparkForConditionalGeneration"],
+    )
     parallel = SimpleNamespace(
         tensor_parallel_size=8,
         data_parallel_size=1,
@@ -449,6 +455,9 @@ def test_the_ep_weight_filter_is_off_under_a_placement(monkeypatch) -> None:
     assert local_experts() == set(range(96, 128))
     monkeypatch.setenv("VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT", "1")
     assert local_experts() is None
+    # The flag is on by default: another model keeps the filter.
+    model_config.architectures = ["DeepseekV3ForCausalLM"]
+    assert local_experts() == set(range(96, 128))
 
 
 # ------------------------------------------------------------------------------

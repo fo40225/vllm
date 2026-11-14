@@ -168,7 +168,7 @@ if TYPE_CHECKING:
     VLLM_MUSE_SPARK_SM120_TOPK_LOGITS: bool = True
     VLLM_MUSE_SPARK_SM120_TOPK_LOGITS_K: int = 64
     VLLM_MUSE_SPARK_SM120_TOPK_LOGITS_MIN_TOKENS: int = 2
-    VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT: bool = False
+    VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT: bool = True
     VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT_TABLE: str | None = None
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
     VLLM_ROCM_USE_AITER_LINEAR_HIPBMM: bool = False
@@ -1711,13 +1711,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # placement with a warning. Not with EPLB. The routing, its ids and the model's
     # function stay as they are; the experts of a rank are summed in another grouping,
     # so the outputs differ at the rounding level (deterministically). A weight reload
-    # keeps the placement. Default off. Read once, when the model is constructed.
+    # keeps the placement. Default on (0 keeps the linear placement). Read once, when
+    # the model is constructed.
     "VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT": lambda: bool(
-        int(os.getenv("VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT", "0"))
+        int(os.getenv("VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT", "1"))
     ),
     # Muse Spark on SM120: path of an expert placement table to use instead of the
-    # packaged one (VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT=1). It is used whatever it
-    # is named; a snapshot that cannot be read from the model is trusted.
+    # packaged one (VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT on, the default). It is used
+    # whatever it is named; a snapshot that cannot be read from the model is trusted.
     "VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT_TABLE": lambda: (
         os.getenv("VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT_TABLE") or None
     ),

@@ -452,8 +452,11 @@ class DefaultModelLoader(BaseModelLoader):
 
         # A static expert placement (Muse Spark on SM120) puts experts on ranks that
         # the linear / round-robin strategy does not: the set computed below would drop
-        # the per-expert tensors of the experts a rank owns under the placement.
-        if envs.VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT:
+        # the per-expert tensors of the experts a rank owns under the placement. The
+        # flag is on by default, so only the Muse Spark models give up the filter.
+        if envs.VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT and any(
+            arch.startswith("MuseSpark") for arch in model_config.architectures
+        ):
             return
 
         num_experts = model_config.get_num_experts()
