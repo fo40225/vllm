@@ -261,6 +261,7 @@ def _model_with_launchable_hooks() -> model_ops.MuseSpark1xModel:
     """``_model_with_layers`` plus the weights that the hooks hand to the launch."""
     model = _model_with_layers(hookable=True)
     for layer in model.layers:
+        layer.sequence_parallel_active = lambda num_tokens: False
         layer.feed_forward.sharded_weights = lambda num_tokens, op: []
         layer.feed_forward.pooler = layer.feed_forward.unpooler = None
         layer.feed_forward.router = SimpleNamespace(
@@ -365,6 +366,7 @@ def _named_model(hookable=HOOKABLE) -> model_ops.MuseSpark1xModel:
             SimpleNamespace(
                 feed_forward=moe,
                 fuses_unpooler_gemv=lambda num_tokens: num_tokens <= 4,
+                sequence_parallel_active=lambda num_tokens: False,
                 self_attn=SimpleNamespace(
                     qkv_proj=SimpleNamespace(
                         weight=SimpleNamespace(data=weight(f"qkv{idx}"))
@@ -378,11 +380,12 @@ def _named_model(hookable=HOOKABLE) -> model_ops.MuseSpark1xModel:
     return model
 
 
-def _hook_lists(monkeypatch, layer, num_tokens, order=None, ctas=C):
+def _hook_lists(monkeypatch, layer, num_tokens, order=None, ctas=C, sharded=False):
     """What the two hooks of ``layer`` launch for a decode batch of ``num_tokens``: the
     weights by name in launch order and the CTA count (None: the prefetcher's own),
     behind the experts and then behind the QKV projection. ``order`` and ``ctas``
-    set their knobs (None: unset)."""
+    set their knobs (None: unset). ``sharded``: the layer runs the batch on the
+    sequence-parallel stream."""
     for knob, value in ((ORDER_KNOB, order), (CTAS_KNOB, ctas)):
         if value is None:
             monkeypatch.delenv(knob, raising=False)
@@ -390,6 +393,8 @@ def _hook_lists(monkeypatch, layer, num_tokens, order=None, ctas=C):
             monkeypatch.setenv(knob, str(value))
     monkeypatch.setattr(muse_c, "preflight", lambda: None)
     model = _named_model()
+    for model_layer in model.layers:
+        model_layer.sequence_parallel_active = lambda num_tokens: sharded
     launches = []
 
     def launch(self, tensors, num_ctas=None):
@@ -500,13 +505,28 @@ def test_every_order_pulls_each_weight_the_shipped_order_pulls(
                 names += launch
         return names
 
-    attention = [
-        name for name in pulled(order) if name.startswith(("qkv", "o"))
-    ]
+    attention = [name for name in pulled(order) if name.startswith(("qkv", "o"))]
     assert sorted(attention) == sorted(
         name for name in pulled(0) if name.startswith(("qkv", "o"))
     )
     assert sorted(attention) == ["o2", "o3", "o4", "qkv2", "qkv3", "qkv4"]
+
+
+@pytest.mark.parametrize("order", [0, 1, 2, 3, 4])
+@pytest.mark.parametrize("rows", [1, 8, 17, 32])
+def test_the_sharded_stream_warms_no_slice_of_the_projections(monkeypatch, order, rows):
+    """On the sequence-parallel stream (a decode graph above the graph floor) the
+    pooler and the unpooler run whole on this rank's rows: the column slices
+    ``sharded_weights`` returns are not read there, so no hook launches them.
+    Everything else (QKV, O, the router) is warmed as on the replicated stream."""
+    whole = _hook_lists(monkeypatch, 2, rows, order=order, sharded=False)
+    sharded = _hook_lists(monkeypatch, 2, rows, order=order, sharded=True)
+    assert sharded == [
+        ([name for name in names if name not in ("u2", "p2")], ctas)
+        for names, ctas in whole
+    ]
+    pulled = [name for names, _ in whole for name in names]
+    assert "p2" in pulled, "the replicated stream does warm the pooler slice"
 
 
 @pytest.mark.parametrize("order", [0, 3])
@@ -543,6 +563,7 @@ def test_the_hooks_do_nothing_outside_a_capture(monkeypatch):
 
     for layer in model.layers:
         layer.fuses_unpooler_gemv = ask
+        layer.sequence_parallel_active = ask
         layer.feed_forward.sharded_weights = lambda num_tokens, op: ask(num_tokens)
     model._configure_l2_prefetch()
     for layer in model.layers[1:4]:

@@ -773,12 +773,19 @@ def _sequence_parallel_graph_floor(graph_min_tokens: int | None) -> Iterator[Non
 
 
 def sm120_sequence_parallel_min_tokens(vllm_config: VllmConfig) -> int:
-    """Smallest batch (in tokens) that shards the stream.
+    """Smallest batch (in tokens) that shards the stream, the floor of every batch
+    that is not the warm-up or the capture pass of a FULL decode graph.
 
-    Never a batch that may run in a CUDA graph (every size up to the largest
-    captured one: the dispatcher pads into a graph only up to that size and runs
-    larger batches eagerly) or with the fused decode-sized all-reduce and the
-    sharded projections (up to ``_SHARDED_PROJECTION_MAX_TOKENS``).
+    Never a batch that may run in a PIECEWISE graph or eagerly next to the captured
+    sizes (every size up to the largest captured one: the dispatcher pads into a
+    graph only up to that size and runs larger batches eagerly) or with the fused
+    decode-sized all-reduce and the sharded projections (up to
+    ``_SHARDED_PROJECTION_MAX_TOKENS``). The FULL decode graphs have their own floor
+    when ``VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_GRAPH_MIN_TOKENS`` is set
+    (``sm120_sequence_parallel_graph_min_tokens``). A capture list above 256 tokens
+    moves this floor to the capture size + 1: mixed batches of 257 .. cap tokens then
+    run in replicated PIECEWISE graphs, and a mixed batch of exactly cap tokens, which
+    sharded when the list ended at 256, no longer does.
     """
     # 0 without CUDA graphs (enforce-eager or cudagraph mode NONE).
     max_graph_tokens = vllm_config.compilation_config.max_cudagraph_capture_size or 0
@@ -787,6 +794,12 @@ def sm120_sequence_parallel_min_tokens(vllm_config: VllmConfig) -> int:
         _SHARDED_PROJECTION_MAX_TOKENS + 1,
         max_graph_tokens + 1,
     )
+
+
+def _decode_engine_max_tokens() -> int:
+    """The largest batch the decode MoE engines serve; they cannot take the packed
+    rows of the sharded stream, so the sharded batches of a graph start above it."""
+    return max(muse_max_tokens(), B12X_MAX_TOKENS)
 
 
 def sm120_sequence_parallel_graph_min_tokens(vllm_config: VllmConfig) -> int | None:
@@ -811,7 +824,7 @@ def sm120_sequence_parallel_graph_min_tokens(vllm_config: VllmConfig) -> int | N
             requested,
         )
         return None
-    engine_max = max(muse_max_tokens(), B12X_MAX_TOKENS)
+    engine_max = _decode_engine_max_tokens()
     if requested <= engine_max:
         logger.warning_once(
             "VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_GRAPH_MIN_TOKENS=%d is raised to "
@@ -1398,7 +1411,9 @@ class MuseSpark1xMoE(nn.Module):
             shard, norm.weight, norm.variance_epsilon, norm.fused_gain_center
         )
 
-    def _fused_all_gather_rmsnorm_nvfp4(self, shard: torch.Tensor) -> torch.Tensor | None:
+    def _fused_all_gather_rmsnorm_nvfp4(
+        self, shard: torch.Tensor
+    ) -> torch.Tensor | None:
         """The pooler gather, the pre-expert norm and the NVFP4 quantization of its output
         (for the muse large-batch kernel) as one communicator kernel.
 
@@ -1550,7 +1565,9 @@ class MuseSpark1xMoE(nn.Module):
             and self.experts.has_muse_decode_engine
         )
 
-    def _norm_quant_decode_input(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+    def _norm_quant_decode_input(
+        self, hidden_states: torch.Tensor
+    ) -> torch.Tensor | None:
         if not self._quantizes_in_norm(hidden_states.shape[0]):
             return None
         norm = self.pre_expert_norm
@@ -2845,6 +2862,16 @@ class MuseSpark1xDecoderLayer(nn.Module):
             connection=self.add_ffn,
         )
 
+    def sequence_parallel_active(self, num_tokens: int) -> bool:
+        """Whether this layer runs a batch of ``num_tokens`` on the sharded stream
+        (the decision of ``forward``, for the callers outside it)."""
+        return _sequence_parallel_active(
+            self.is_sequence_parallel,
+            num_tokens,
+            self.sp_min_tokens,
+            self.sp_row_gate,
+        )
+
     def _defers_all_reduce(self, num_tokens: int, sp_active: bool) -> bool:
         """Whether the attention-output all-reduce is left to the boundary after it.
 
@@ -2990,9 +3017,11 @@ class MuseSpark1xModel(LlamaModel):
                     "MuseSpark SM120: sequence parallel inside FULL decode CUDA graphs "
                     "for batches of at least %d tokens "
                     "(VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_GRAPH_MIN_TOKENS=%d; "
+                    "decode MoE engines serve up to %d tokens; "
                     "eager, mixed and PIECEWISE batches keep the floor of %d tokens).",
                     self.sp_graph_min_tokens,
                     envs.VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_GRAPH_MIN_TOKENS,
+                    _decode_engine_max_tokens(),
                     self.sp_min_tokens,
                 )
         self.make_empty_intermediate_tensors = self._make_empty_intermediate_tensors
@@ -3357,7 +3386,14 @@ class MuseSpark1xModel(LlamaModel):
             def hook(num_tokens: int) -> None:
                 if num_tokens > L2_PREFETCH_MAX_TOKENS or not prefetcher.active():
                     return
-                unpooler = moe.sharded_weights(num_tokens, moe.unpooler)
+                # On the sharded stream (a decode graph above the graph floor) the
+                # unpooler runs whole on this rank's rows: its column slice is not
+                # what it reads, and the whole weight is too much for the L2.
+                unpooler = (
+                    []
+                    if layer.sequence_parallel_active(num_tokens)
+                    else moe.sharded_weights(num_tokens, moe.unpooler)
+                )
                 if order.skip_fused_unpooler and layer.fuses_unpooler_gemv(num_tokens):
                     unpooler = []
                 qkv = [next_attn.qkv_proj.weight.data]
@@ -3381,10 +3417,16 @@ class MuseSpark1xModel(LlamaModel):
                 # The O GEMM follows the attention: its weight leads the launch, and
                 # the launch is as fast as the one behind the experts.
                 o = [attn.o_proj.weight.data] if o_here else []
+                # Likewise the pooler: whole on the sharded stream, no slice to warm.
+                pooler = (
+                    []
+                    if layer.sequence_parallel_active(num_tokens)
+                    else moe.sharded_weights(num_tokens, moe.pooler)
+                )
                 prefetcher.launch(
                     [
                         *o,
-                        *moe.sharded_weights(num_tokens, moe.pooler),
+                        *pooler,
                         moe.router.weight.data,
                     ],
                     num_ctas=after_experts_ctas if o_here else None,

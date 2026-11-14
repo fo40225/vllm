@@ -300,6 +300,11 @@ class MuseSparkMegaMoEExperts(nn.Module):
         is_padding = get_forward_context().is_padding
         if is_padding is None:
             return None
+        # NOTE: this decision uses the default floor (the TP size), not the floor of
+        # the Muse Spark model (sm120_sequence_parallel_min_tokens, or the floor of a
+        # FULL decode graph). MegaMoE is not the SM120 NVFP4 path and no launch of this
+        # branch enables it together with the sequence-parallel floors; route it
+        # through the model's decision before it does.
         if is_sequence_parallel_active(self.is_sequence_parallel, is_padding.shape[0]):
             return _shard_padding_mask(is_padding, num_tokens)
         return is_padding[:num_tokens]
