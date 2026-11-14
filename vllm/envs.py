@@ -172,7 +172,7 @@ if TYPE_CHECKING:
     VLLM_MUSE_SPARK_SM120_TOPK_LOGITS_MIN_TOKENS: int = 2
     VLLM_MUSE_SPARK_SM120_VERIFY_TOPK_LOGITS: int = 3
     VLLM_MUSE_SPARK_SM120_DRAFT_FC_SHARD: int = 2
-    VLLM_MUSE_SPARK_SM120_FI_HOST_LENS: int = 0
+    VLLM_MUSE_SPARK_SM120_FI_HOST_LENS: int = 2
     VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT: bool = True
     VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT_TABLE: str | None = None
     VLLM_MUSE_SPARK_SM120_DENSE_Q: bool = True
@@ -1856,7 +1856,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # in a prefill step, every attention group of the target. The sync makes the worker
     # wait for all queued GPU work, so everything the host does after it (the draft
     # launch, then the next step's input and metadata preparation) is exposed as GPU
-    # idle time. 0 = as before. 1 = fetch only when a row takes a path that reads host
+    # idle time. Default 2. 0 = as before. 1 = fetch only when a row takes a path that reads host
     # lengths (XQA / trtllm decode and trtllm prefill never do). 2 = as 1, and the host
     # upper bound replaces the fetch when only prefill rows read host lengths: the bound
     # of a prefilling request is exact (num_computed_tokens plus the scheduled chunk, no
@@ -1877,7 +1877,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # gone; an event per wrapper keeps the order. Values other than 0, 1 and 2 are
     # rejected when the builder is constructed (the value is read there, once).
     "VLLM_MUSE_SPARK_SM120_FI_HOST_LENS": lambda: int(
-        os.getenv("VLLM_MUSE_SPARK_SM120_FI_HOST_LENS", "0")
+        os.getenv("VLLM_MUSE_SPARK_SM120_FI_HOST_LENS", "2")
     ),
     # Muse Spark on SM120: place the experts of every MoE layer on the EP ranks by the
     # table of the model snapshot (vllm/models/muse_spark/nvidia/data/
