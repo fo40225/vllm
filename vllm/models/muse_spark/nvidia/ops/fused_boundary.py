@@ -1,0 +1,95 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Residual boundaries that the TP device communicator fuses into its collectives.
+
+A Muse Spark decode layer has three collective -> element-wise kernel pairs on its
+critical path: the attention-output all-reduce followed by the residual boundary
+(post-norm, gated residual, next pre-norm), the unpooler all-gather followed by the
+next boundary, and the pooler all-gather followed by the pre-expert RMSNorm. Each
+pair costs a launch and a round trip of the collective's result through memory.
+
+A device communicator that can run the element-wise part as the epilogue of its
+collective implements the optional interface below (a host plugin does it for its
+machine; nothing here depends on one). The communicator must reproduce, bit for
+bit, what the model's own kernels compute from the collective's result, so that
+taking this path changes no output: ``fused_norm_residual_norm_fwd`` for the
+boundaries and ``fused_rmsnorm_fwd`` for the RMSNorm
+(``vllm/models/muse_spark/common/ops/fused_rmsnorm.py``). The collective itself keeps
+the arithmetic of the communicator's own ``all_reduce`` / ``all_gather``.
+
+Interface (all optional; the model calls a method only after
+``supports_fused_residual_boundary`` approved the batch size, and handles a ``None``
+result by running the two steps itself)::
+
+    supports_fused_residual_boundary(kind, num_tokens) -> bool
+        kind: "all_reduce_boundary" | "all_gather_boundary" | "all_gather_rmsnorm".
+        Depends on the batch size only, identically on every rank of the group.
+    all_reduce_residual_boundary(branch, stream, *, alpha, beta, pre_weight,
+            post_weight, post_eps, pre_eps, post_gain_center, pre_gain_center,
+            out_fp32=None) -> (out, new_stream) | None
+        branch: this rank's partial sum, bf16 [T, D]; stream: fp32 [T, D].
+        Returns ``fused_norm_residual_norm_fwd(all_reduce(branch), stream, ...)`` with
+        ``out_dtype=bfloat16`` and ``post_input_scale = post_weight is not None``.
+    all_gather_residual_boundary(shard, stream, *, <same keywords>)
+        -> (out, new_stream) | None
+        shard: this rank's column block, bf16 [T, D / tp]; the branch is the column
+        concatenation of the shards.
+    all_gather_rmsnorm(shard, weight, eps, gain_center) -> Tensor | None
+        ``fused_rmsnorm_fwd(all_gather(shard, -1), weight, eps, gain_center=...)``.
+
+The decode CUDA graphs capture whatever the communicator launches.
+"""
+
+from typing import Any
+
+import torch
+
+from vllm.distributed import get_tp_group
+
+KIND_ALL_REDUCE_BOUNDARY = "all_reduce_boundary"
+KIND_ALL_GATHER_BOUNDARY = "all_gather_boundary"
+KIND_ALL_GATHER_RMSNORM = "all_gather_rmsnorm"
+
+
+def _communicator() -> Any | None:
+    communicator = get_tp_group().device_communicator
+    if communicator is None or not hasattr(
+        communicator, "supports_fused_residual_boundary"
+    ):
+        return None
+    return communicator
+
+
+def supports_fused_boundary(kind: str, num_tokens: int) -> bool:
+    """Whether the TP communicator fuses ``kind`` for a batch of ``num_tokens``."""
+    communicator = _communicator()
+    return communicator is not None and bool(
+        communicator.supports_fused_residual_boundary(kind, num_tokens)
+    )
+
+
+def all_reduce_residual_boundary(
+    branch: torch.Tensor, stream: torch.Tensor, **kwargs: Any
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    communicator = _communicator()
+    if communicator is None:
+        return None
+    return communicator.all_reduce_residual_boundary(branch, stream, **kwargs)
+
+
+def all_gather_residual_boundary(
+    shard: torch.Tensor, stream: torch.Tensor, **kwargs: Any
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    communicator = _communicator()
+    if communicator is None:
+        return None
+    return communicator.all_gather_residual_boundary(shard, stream, **kwargs)
+
+
+def all_gather_rmsnorm(
+    shard: torch.Tensor, weight: torch.Tensor, eps: float, gain_center: float
+) -> torch.Tensor | None:
+    communicator = _communicator()
+    if communicator is None:
+        return None
+    return communicator.all_gather_rmsnorm(shard, weight, eps, gain_center)

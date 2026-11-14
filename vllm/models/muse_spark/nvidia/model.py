@@ -118,7 +118,7 @@ from vllm.models.muse_spark.nvidia.muse_moe_runner import (
     MuseSparkMoEConfig,
     MuseSparkRoutedExperts,
 )
-from vllm.models.muse_spark.nvidia.ops import muse_c
+from vllm.models.muse_spark.nvidia.ops import fused_boundary, muse_c
 from vllm.models.muse_spark.nvidia.ops.cute_dsl.qk_norm import (
     qk_norm,
     supports_qk_norm,
@@ -189,6 +189,150 @@ class MuseSpark1xColumnShardedStream(MuseSpark1xResidualStream):
             post_norm=self.post_norm,
             connection=self.connection,
         )
+
+
+@dataclass(slots=True)
+class MuseSpark1xPartialSumStream(MuseSpark1xResidualStream):
+    """A deferred boundary whose branch is still this rank's partial sum.
+
+    The all-reduce of the branch is left to the boundary, so that a TP communicator
+    which fuses the two (``ops/fused_boundary.py``) can run it as one kernel.
+    """
+
+    def materialize(self) -> MuseSpark1xResidualStream:
+        return MuseSpark1xResidualStream(
+            stream=self.stream,
+            branch=tensor_model_parallel_all_reduce(self.branch),
+            post_norm=self.post_norm,
+            connection=self.connection,
+        )
+
+
+def _triton_boundary_kwargs(
+    stream: torch.Tensor,
+    post_norm: MuseSpark1xRMSNorm,
+    connection: MuseSpark1xResidualConnection,
+    pre_norm: MuseSpark1xRMSNorm,
+    branch_shape: tuple[int, ...],
+    out_dtype: torch.dtype,
+    router_input: torch.Tensor | None,
+) -> dict[str, Any] | None:
+    """Arguments of a communicator-fused boundary, None if it cannot stand in.
+
+    The communicator reproduces the Triton boundary kernel
+    (``fused_norm_residual_norm_fwd``) bit for bit, so it may only stand in where
+    ``norm_residual_then_norm`` would run exactly that kernel: bf16 output, the
+    gated residual of this model with its per-channel fp32 coefficients, an
+    unweighted or weight-first post-norm, a weight-last pre-norm with a weight,
+    and no unrounded fp32 router input (another kernel computes that). The branch
+    is a contiguous bf16 tensor of ``branch_shape``, which need not exist yet.
+    """
+    alpha = getattr(connection, "alpha", None)
+    beta = getattr(connection, "beta", None)
+    if not (
+        router_input is None
+        and out_dtype == torch.bfloat16
+        and isinstance(connection, MuseSpark1xNormPreservingResidualConnection)
+        and getattr(connection, "_coefficients_ready", False)
+        and len(branch_shape) == 2
+        and stream.is_cuda
+        and stream.dtype == torch.float32
+        and stream.is_contiguous()
+        and tuple(stream.shape) == tuple(branch_shape)
+        and post_norm.variance_size_override is None
+        and pre_norm.variance_size_override is None
+        and post_norm.hidden_size == pre_norm.hidden_size == branch_shape[-1]
+        # Where FlashInfer's dual-norm kernel could run the boundary, the Triton
+        # one does not: leave that to the two-step path.
+        and (
+            gated_residual_next_rmsnorm is None
+            or not _uses_flashinfer_dual_norm(
+                post_norm, connection, pre_norm, out_dtype
+            )
+        )
+        and pre_norm.has_weight
+        and not pre_norm.applies_weight_before_norm
+        and (not post_norm.has_weight or post_norm.applies_weight_before_norm)
+        and isinstance(alpha, torch.Tensor)
+        and isinstance(beta, torch.Tensor)
+        and alpha.dtype == beta.dtype == torch.float32
+        and alpha.shape == beta.shape == (branch_shape[-1],)
+    ):
+        return None
+    return {
+        "alpha": alpha,
+        "beta": beta,
+        "pre_weight": pre_norm.weight,
+        "post_weight": post_norm.weight if post_norm.has_weight else None,
+        "post_eps": post_norm.variance_epsilon,
+        "pre_eps": pre_norm.variance_epsilon,
+        "post_gain_center": post_norm.fused_gain_center,
+        "pre_gain_center": pre_norm.fused_gain_center,
+    }
+
+
+def _all_reduce_norm_residual_then_norm(
+    x: MuseSpark1xPartialSumStream,
+    pre_norm: MuseSpark1xRMSNorm,
+    out_dtype: torch.dtype,
+    router_input: torch.Tensor | None,
+    out_fp32: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """The TP all-reduce of the branch and the boundary in one communicator kernel."""
+    if not fused_boundary.supports_fused_boundary(
+        fused_boundary.KIND_ALL_REDUCE_BOUNDARY, x.branch.shape[0]
+    ):
+        return None
+    kwargs = _triton_boundary_kwargs(
+        x.stream,
+        x.post_norm,
+        x.connection,
+        pre_norm,
+        tuple(x.branch.shape),
+        out_dtype,
+        router_input,
+    )
+    if (
+        kwargs is None
+        or x.branch.dtype != torch.bfloat16
+        or not x.branch.is_contiguous()
+    ):
+        return None
+    return fused_boundary.all_reduce_residual_boundary(
+        x.branch, x.stream, out_fp32=out_fp32, **kwargs
+    )
+
+
+def _communicator_all_gather_norm_residual_then_norm(
+    x: MuseSpark1xColumnShardedStream,
+    pre_norm: MuseSpark1xRMSNorm,
+    out_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """The column gather of the unpooler shards and the boundary in one kernel.
+
+    ``x.branch`` is this rank's column block; the branch of the boundary would be
+    ``gather_columns`` of it.
+    """
+    shard = x.branch
+    num_tokens, width = shard.shape
+    if not fused_boundary.supports_fused_boundary(
+        fused_boundary.KIND_ALL_GATHER_BOUNDARY, num_tokens
+    ):
+        return None
+    kwargs = _triton_boundary_kwargs(
+        x.stream,
+        x.post_norm,
+        x.connection,
+        pre_norm,
+        (num_tokens, width * get_tensor_model_parallel_world_size()),
+        out_dtype,
+        None,
+    )
+    if kwargs is None or shard.dtype != torch.bfloat16 or not shard.is_contiguous():
+        return None
+    return fused_boundary.all_gather_residual_boundary(
+        shard, x.stream, out_fp32=None, **kwargs
+    )
 
 
 def _uses_flashinfer_dual_norm(
@@ -276,11 +420,25 @@ def norm_residual_then_norm(
     the returned tensor; the Triton boundary writes it without a cast kernel.
     """
     assert router_input is None or out_fp32 is None
-    if isinstance(x, MuseSpark1xColumnShardedStream):
-        if router_input is None and out_fp32 is None and (
-            fused := _all_gather_norm_residual_then_norm(x, pre_norm, out_dtype)
-        ):
+    if isinstance(x, MuseSpark1xPartialSumStream):
+        if (
+            fused := _all_reduce_norm_residual_then_norm(
+                x, pre_norm, out_dtype, router_input, out_fp32
+            )
+        ) is not None:
             return fused
+        x = x.materialize()
+    if isinstance(x, MuseSpark1xColumnShardedStream):
+        if router_input is None and out_fp32 is None:
+            fused = (
+                _all_gather_norm_residual_then_norm(x, pre_norm, out_dtype)
+                if x.all_gather is not None
+                else _communicator_all_gather_norm_residual_then_norm(
+                    x, pre_norm, out_dtype
+                )
+            )
+            if fused:
+                return fused
         x = x.materialize()
     post_norm, connection = x.post_norm, x.connection
     branch, stream = x.branch, x.stream
@@ -783,6 +941,11 @@ class MuseSpark1xMoE(nn.Module):
             config, "muse_spark_tep_aux_stream_routing", tep_default
         )
         self.all_gather_norm_quant: Any | None = None
+        # Whether the TP communicator may run the pre-expert norm as the epilogue
+        # of the pooler all-gather (ops/fused_boundary.py).
+        self.fuses_boundary_collectives = (
+            envs.VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY and _on_sm120()
+        )
         if self.use_mega_moe and self.tp_size > 1 and not self.is_sequence_parallel:
             raise NotImplementedError(
                 "MuseSpark1x MegaMoE needs the sequence-parallel stream when "
@@ -923,11 +1086,35 @@ class MuseSpark1xMoE(nn.Module):
             return gather_columns(self._project_local_columns(layer, x))
         return layer(x)[0]
 
+    def _fused_all_gather_rmsnorm(self, shard: torch.Tensor) -> torch.Tensor | None:
+        """The pooler gather and the pre-expert norm as one communicator kernel."""
+        norm = self.pre_expert_norm
+        if not (
+            self.fuses_boundary_collectives
+            and norm is not None
+            and norm.has_weight
+            and not norm.applies_weight_before_norm
+            and norm.variance_size_override is None
+            and shard.dtype == torch.bfloat16
+            and shard.is_contiguous()
+            and fused_boundary.supports_fused_boundary(
+                fused_boundary.KIND_ALL_GATHER_RMSNORM, shard.shape[0]
+            )
+        ):
+            return None
+        return fused_boundary.all_gather_rmsnorm(
+            shard, norm.weight, norm.variance_epsilon, norm.fused_gain_center
+        )
+
     def _pool_and_norm(self, hidden_states: torch.Tensor) -> torch.Tensor:
         assert self.pooler is not None
-        hidden_states = self._project(
-            self.pooler, hidden_states, self.shards_pooler(hidden_states.shape[0])
-        )
+        if self.shards_pooler(hidden_states.shape[0]):
+            shard = self._project_local_columns(self.pooler, hidden_states)
+            if (fused := self._fused_all_gather_rmsnorm(shard)) is not None:
+                return fused
+            hidden_states = gather_columns(shard)
+        else:
+            hidden_states = self.pooler(hidden_states)[0]
         if self.pre_expert_norm is not None:
             hidden_states = self.pre_expert_norm(hidden_states)
         return hidden_states
@@ -1660,8 +1847,13 @@ class MuseSpark1xAttention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        defer_all_reduce: bool = False,
     ) -> torch.Tensor:
-        """Attention over an input the caller has already normalized."""
+        """Attention over an input the caller has already normalized.
+
+        With ``defer_all_reduce`` the output is this rank's partial sum: the caller
+        reduces it (together with the residual boundary, where it can).
+        """
         qkv, _ = self.qkv_proj(hidden_states)
         if self.after_qkv_hook is not None:
             self.after_qkv_hook(qkv.shape[0])
@@ -1703,15 +1895,25 @@ class MuseSpark1xAttention(nn.Module):
                 attn_output = og.sigmoid() * attn_output
 
         attn_output = attn_output.view(-1, self.num_heads * self.head_dim)
-        return self._project_output(attn_output)
+        return self._project_output(attn_output, defer_all_reduce)
 
-    def _project_output(self, attn_output: torch.Tensor) -> torch.Tensor:
+    def _project_output(
+        self, attn_output: torch.Tensor, defer_all_reduce: bool = False
+    ) -> torch.Tensor:
         sp_active = _sequence_parallel_active(
             self.is_sequence_parallel_output,
             attn_output.shape[0],
             self.sp_min_tokens,
             self.sp_row_gate,
         )
+        if defer_all_reduce and not sp_active:
+            reduce_results = self.o_proj.reduce_results
+            self.o_proj.reduce_results = False
+            try:
+                output, _ = self.o_proj(attn_output)
+            finally:
+                self.o_proj.reduce_results = reduce_results
+            return output
         if (
             sp_active
             and self.gemm_rs is not None
@@ -1836,6 +2038,20 @@ class MuseSpark1xDecoderLayer(nn.Module):
         self.default_dtype = torch.get_default_dtype()
         # Set by the model when the next boundary may consume unpooler shards.
         self.all_gather_dual_norm: Any | None = None
+        # Whether the TP communicator may run the boundaries as the epilogue of its
+        # collectives (ops/fused_boundary.py).
+        self.fuses_boundary_collectives = (
+            envs.VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY and _on_sm120()
+        )
+        # The unpooler shard travels to the next boundary, like the one of the
+        # FlashInfer gather: only where the layers fuse across (no pipeline
+        # parallelism, see MuseSpark1xModel.fuse_across_layers), and not where the
+        # checkpoint's config turns that fusion off.
+        self.fuses_column_gather = (
+            self.fuses_boundary_collectives
+            and get_pp_group().world_size == 1
+            and getattr(config, "muse_spark_tep_fused_boundary", True)
+        )
 
         self.sm120_sequence_parallel = (
             self.is_moe_layer and is_sm120_sequence_parallel_enabled(vllm_config)
@@ -1903,7 +2119,12 @@ class MuseSpark1xDecoderLayer(nn.Module):
         if sp_active and self.is_sequence_parallel_input:
             # Positions carries the unpadded length of the gathered sequence.
             attn_input = sp_all_gather(attn_input)[: positions.shape[0]]
-        attn_out = self.self_attn(positions=positions, hidden_states=attn_input)
+        defer_all_reduce = self._defers_all_reduce(positions.shape[0], sp_active)
+        attn_out = self.self_attn(
+            positions=positions,
+            hidden_states=attn_input,
+            defer_all_reduce=defer_all_reduce,
+        )
         if sp_active and not self.is_sequence_parallel_input:
             stream = sp_shard(stream)
         router_input = None
@@ -1916,8 +2137,13 @@ class MuseSpark1xDecoderLayer(nn.Module):
             elif self.feed_forward.wants_cast_router_input(attn_out.shape[0]):
                 router_input = torch.empty_like(attn_out, dtype=torch.float32)
                 cast_router_input = True
+        attn_boundary_cls = (
+            MuseSpark1xPartialSumStream
+            if defer_all_reduce
+            else MuseSpark1xResidualStream
+        )
         ffn_in, stream = norm_residual_then_norm(
-            MuseSpark1xResidualStream(
+            attn_boundary_cls(
                 stream=stream,
                 branch=attn_out,
                 post_norm=self.post_attn_norm,
@@ -1960,11 +2186,36 @@ class MuseSpark1xDecoderLayer(nn.Module):
             connection=self.add_ffn,
         )
 
+    def _defers_all_reduce(self, num_tokens: int, sp_active: bool) -> bool:
+        """Whether the attention-output all-reduce is left to the boundary after it.
+
+        True where the TP communicator fuses the two. Not where the boundary also
+        writes the unrounded fp32 router input: another kernel computes that.
+        """
+        if not self.fuses_boundary_collectives or sp_active:
+            return False
+        if isinstance(
+            self.feed_forward, MuseSpark1xMoE
+        ) and self.feed_forward.wants_fp32_router_input(num_tokens):
+            return False
+        return fused_boundary.supports_fused_boundary(
+            fused_boundary.KIND_ALL_REDUCE_BOUNDARY, num_tokens
+        )
+
     def _defers_column_gather(self, num_tokens: int) -> bool:
-        # Only sharded MoE layers get a workspace (see _configure_column_gather).
-        return self.all_gather_dual_norm is not None and cast(
-            MuseSpark1xMoE, self.feed_forward
-        ).shards_unpooler(num_tokens)
+        if not isinstance(self.feed_forward, MuseSpark1xMoE):
+            return False
+        if self.all_gather_dual_norm is not None:
+            # Only sharded MoE layers get a workspace (see _configure_column_gather).
+            return self.feed_forward.shards_unpooler(num_tokens)
+        # The TP communicator may gather the columns inside the next boundary.
+        return (
+            self.fuses_column_gather
+            and self.feed_forward.shards_unpooler(num_tokens)
+            and fused_boundary.supports_fused_boundary(
+                fused_boundary.KIND_ALL_GATHER_BOUNDARY, num_tokens
+            )
+        )
 
 
 # Runs uncompiled under breakable cudagraphs; drop LlamaModel's torch.compile.

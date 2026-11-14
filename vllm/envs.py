@@ -152,6 +152,7 @@ if TYPE_CHECKING:
     VLLM_MUSE_SPARK_SM120_L2_PREFETCH: bool = True
     VLLM_MUSE_SPARK_SM120_L2_PREFETCH_AFTER_EXPERTS_CTAS: int = 4
     VLLM_MUSE_SPARK_SM120_EXPERT_PREFETCH: bool = True
+    VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY: bool = True
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
     VLLM_ROCM_USE_AITER_LINEAR_HIPBMM: bool = False
     VLLM_ROCM_USE_AITER_MOE: bool = True
@@ -1447,6 +1448,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Read once, when the model is constructed.
     "VLLM_MUSE_SPARK_SM120_EXPERT_PREFETCH": lambda: bool(
         int(os.getenv("VLLM_MUSE_SPARK_SM120_EXPERT_PREFETCH", "1"))
+    ),
+    # Muse Spark on SM120: let the TP device communicator run the residual
+    # boundary of a decode batch inside its collective, when it offers that (see
+    # vllm/models/muse_spark/nvidia/ops/fused_boundary.py): the attention-output
+    # all-reduce with the post-norm / gated residual / next pre-norm, the unpooler
+    # all-gather with the boundary, and the pooler all-gather with the
+    # pre-expert norm. The communicator has to reproduce the Triton boundary
+    # kernels bit for bit, so the outputs do not change; a communicator that does
+    # not offer it (NCCL) leaves the model on the two-step path. Set to 0 to get
+    # the two-step path back, e.g. for A/B tests. Read once, when the model is
+    # constructed.
+    "VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY": lambda: bool(
+        int(os.getenv("VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY", "1"))
     ),
     # use aiter linear op if aiter ops are enabled
     # The following list of related ops
