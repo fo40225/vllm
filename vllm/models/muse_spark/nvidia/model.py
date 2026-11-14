@@ -170,6 +170,8 @@ _SHARDED_PROJECTION_MAX_TOKENS = 256
 # more than the smaller unpooler GEMM saves.
 _MULTI_NODE_SHARDED_UNPOOLER_MIN_TOKENS = 32
 _PREPARED_NVFP4_MAX_TOKENS = 256
+# The most tokens the router GEMV of _muse_C serves (_muse_C::router_gemv).
+_ROUTER_GEMV_MAX_TOKENS = 8
 
 
 def gather_columns(shard: torch.Tensor) -> torch.Tensor:
@@ -1064,6 +1066,8 @@ class MuseSpark1xMoE(nn.Module):
         self.fuses_gemv_gather = (
             self.fuses_boundary_collectives and envs.VLLM_MUSE_SPARK_SM120_FUSED_GEMV
         )
+        # Set by the model once the _muse_C extension is loaded (_configure_router_gemv).
+        self.router_gemv_ready = False
         if self.use_mega_moe and self.tp_size > 1 and not self.is_sequence_parallel:
             raise NotImplementedError(
                 "MuseSpark1x MegaMoE needs the sequence-parallel stream when "
@@ -1365,6 +1369,54 @@ class MuseSpark1xMoE(nn.Module):
             and cast(MuseMoERunner, self.experts).has_muse_decode_engine
         )
 
+    def _router_logits(self, router_input: torch.Tensor) -> torch.Tensor:
+        """The router logits: the decode GEMV of ``_muse_C`` where it serves the batch."""
+        weight = self.router.weight
+        if (
+            self.router_gemv_ready
+            and router_input.dtype == torch.float32
+            and router_input.is_contiguous()
+            and router_input.dim() == 2
+            and router_input.shape[0] <= _ROUTER_GEMV_MAX_TOKENS
+            and weight.dtype == torch.float32
+            and weight.is_contiguous()
+            and tuple(weight.shape) == (self.n_logical_experts, router_input.shape[1])
+            and router_input.shape[1] == 8192
+        ):
+            logits = torch.empty(
+                router_input.shape[0],
+                weight.shape[0],
+                dtype=torch.float32,
+                device=router_input.device,
+            )
+            torch.ops._muse_C.router_gemv(router_input, weight, logits, False)
+            return logits
+        self._note_router_gemv_unused(router_input)
+        return self.router(router_input)[0]
+
+    def _note_router_gemv_unused(self, router_input: torch.Tensor) -> None:
+        """Say once that a decode graph routes on cuBLAS for want of the FP32 input.
+
+        Only a capture of a layer on the muse decode kernel can tell: that is where the
+        boundary kernel writes the FP32 router input (``wants_cast_router_input``), and
+        it does so beside the pooler only with the expert prefetch. The eager forwards
+        and the BF16 layers always route from the BF16 input, which is no news.
+        """
+        if (
+            self.router_gemv_ready
+            and router_input.dtype != torch.float32
+            and router_input.dim() == 2
+            and router_input.shape[0] <= _ROUTER_GEMV_MAX_TOKENS
+            and torch.cuda.is_current_stream_capturing()
+            and getattr(self.experts, "has_muse_decode_engine", False)
+        ):
+            logger.warning_once(
+                "VLLM_MUSE_SPARK_SM120_ROUTER_GEMV=1, but the decode graphs route on "
+                "cuBLAS: the router GEMV needs the FP32 router input, which the "
+                "boundary kernel writes only with the expert prefetch "
+                "(VLLM_MUSE_SPARK_SM120_EXPERT_PREFETCH=1) active in the layer."
+            )
+
     def _route_and_pool(
         self, hidden_states: torch.Tensor, router_input: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1380,7 +1432,7 @@ class MuseSpark1xMoE(nn.Module):
         )
         pooled, router_logits = maybe_execute_in_parallel(
             lambda: self._pool_and_norm(hidden_states),
-            lambda: self.router(router_input)[0],
+            lambda: self._router_logits(router_input),
             self._router_events[0],
             self._router_events[1],
             aux_stream_or_none,
@@ -1393,7 +1445,7 @@ class MuseSpark1xMoE(nn.Module):
         """Overlap the full routing chain with the expert input projection."""
 
         def route() -> tuple[torch.Tensor, torch.Tensor]:
-            logits, _ = self.router(router_input)
+            logits = self._router_logits(router_input)
             if self.use_mega_moe:
                 return self.moe_router._compute_routing(
                     hidden_states, logits, torch.int32
@@ -2527,6 +2579,7 @@ class MuseSpark1xModel(LlamaModel):
         self._configure_replicated_prefix()
         self._configure_column_gather()
         self._configure_pooler_gather()
+        self._configure_router_gemv()
         if sm120_sp and sm120_sequence_parallel_is_gated():
             self._configure_sequence_parallel_row_gate()
         self._l2_prefetcher: L2Prefetcher | None = None
@@ -2647,6 +2700,40 @@ class MuseSpark1xModel(LlamaModel):
             all_gather.compile(
                 eps=norm.variance_epsilon, gain_center=norm.fused_gain_center
             )
+
+    def _configure_router_gemv(self) -> None:
+        """Let the decode router of the MoE layers run as ``_muse_C::router_gemv``."""
+        if not (envs.VLLM_MUSE_SPARK_SM120_ROUTER_GEMV and _on_sm120()):
+            return
+        moes = [
+            layer.feed_forward
+            for layer in islice(self.layers, self.start_layer, self.end_layer)
+            if isinstance(layer.feed_forward, MuseSpark1xMoE)
+        ]
+        if not moes:
+            return
+        if (reason := muse_c.preflight()) is not None:
+            logger.info_once("The router GEMV is off: %s", reason)
+            return
+        try:
+            # Never build inside a forward pass or a capture.
+            muse_c.load()
+        except Exception as e:
+            logger.warning_once(
+                "The router GEMV is off: the _muse_C extension could not be built "
+                "(%s: %s).",
+                type(e).__name__,
+                e,
+            )
+            return
+        for moe in moes:
+            moe.router_gemv_ready = True
+        logger.info_once(
+            "MuseSpark: router GEMV of _muse_C for decode batches of up to %d tokens "
+            "in %d layers.",
+            _ROUTER_GEMV_MAX_TOKENS,
+            len(moes),
+        )
 
     def _configure_expert_prefetch(self) -> None:
         """Prefetch the routed experts of a decode layer into L2 (see

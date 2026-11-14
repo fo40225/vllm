@@ -213,4 +213,11 @@ void expert_prefetch(at::Tensor const& topk_ids,
                      int64_t num_ctas, int64_t budget_bytes, bool pdl,
                      std::optional<at::Tensor> const& dump);
 
+// Router GEMV of the decode layer (muse_spark_router_gemv.cu): out [T, N] =
+// x [T, 8192] . w [N, 8192]^T in float32 for 1 <= T <= 8, in a fixed order that
+// does not depend on T. With pdl it is launched as a programmatic dependent
+// and loads the weights before it waits for the kernel in front of it.
+void router_gemv(at::Tensor const& x, at::Tensor const& w, at::Tensor& out,
+                 bool pdl);
+
 }  // namespace muse_spark

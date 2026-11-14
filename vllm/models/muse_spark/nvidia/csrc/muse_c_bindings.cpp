@@ -80,6 +80,9 @@ TORCH_LIBRARY(_muse_C, m) {
       "Tensor sf13, Tensor w2, Tensor sf2, bool up_first, int num_ctas, "
       "int budget_bytes, bool pdl, Tensor!? dump=None) -> ()");
 
+  // Router GEMV of the decode layer, see muse_c_ops.h.
+  m.def("router_gemv(Tensor x, Tensor w, Tensor! out, bool pdl) -> ()");
+
   // Muse Spark attention ops of vllm-project/vllm#62132; the schemas are those
   // of the stock torch.ops._C ops.
   m.def(
@@ -111,6 +114,7 @@ TORCH_LIBRARY_IMPL(_muse_C, CUDA, m) {
   m.impl("nvfp4_decode_act_quant", &muse_spark::nvfp4_decode_act_quant);
   m.impl("l2_prefetch", &muse_spark::l2_prefetch);
   m.impl("expert_prefetch", &muse_spark::expert_prefetch);
+  m.impl("router_gemv", &muse_spark::router_gemv);
   m.impl("muse_spark_mul_tanh_soft_cap",
          &muse_spark::muse_spark_mul_tanh_soft_cap);
   m.impl("fused_muse_spark_qknorm_rope_kv_insert",

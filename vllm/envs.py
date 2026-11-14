@@ -155,6 +155,7 @@ if TYPE_CHECKING:
     VLLM_MUSE_SPARK_SM120_EXPERT_PREFETCH: bool = True
     VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY: bool = True
     VLLM_MUSE_SPARK_SM120_FUSED_GEMV: bool = True
+    VLLM_MUSE_SPARK_SM120_ROUTER_GEMV: bool = True
     VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP: bool = True
     VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_MIN_TOKENS: int = 2048
     VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_UBATCHES: int = 2
@@ -1499,6 +1500,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # once, when the model is constructed.
     "VLLM_MUSE_SPARK_SM120_FUSED_GEMV": lambda: bool(
         int(os.getenv("VLLM_MUSE_SPARK_SM120_FUSED_GEMV", "1"))
+    ),
+    # Muse Spark on SM120: compute the router logits of a decode batch (up to 8 tokens,
+    # FP32 input) with the `_muse_C::router_gemv` kernel instead of cuBLAS: one kernel
+    # that reads the FP32 router weights once, in a fixed summation order that does not
+    # depend on the batch size (cuBLAS runs a dot-product kernel plus a reduction, or a
+    # SIMT sgemm plus a split-K reduction). The logits differ from the cuBLAS ones in
+    # the last bits, deterministically. The kernel also lets the routing kernel behind it
+    # start early. Needs the _muse_C extension and the FP32 router input, which the
+    # boundary kernel writes in the decode CUDA graphs (the router runs beside the
+    # pooler there) only with the expert prefetch (VLLM_MUSE_SPARK_SM120_EXPERT_PREFETCH=1);
+    # without it the router stays on cuBLAS (logged once at capture). Set to 0 for the
+    # cuBLAS router. Read once, when the model is constructed.
+    "VLLM_MUSE_SPARK_SM120_ROUTER_GEMV": lambda: bool(
+        int(os.getenv("VLLM_MUSE_SPARK_SM120_ROUTER_GEMV", "1"))
     ),
     # Muse Spark on SM120: split every eager batch of at least
     # VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_MIN_TOKENS tokens into two microbatches
