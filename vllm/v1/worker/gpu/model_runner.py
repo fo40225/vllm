@@ -1026,14 +1026,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def warmup_microbatches(self) -> None:
         """Run the largest microbatched step once, ahead of the first real one.
 
-        Every microbatch has a workspace slot of its own (the workspace manager keys
-        them by microbatch id) that grows to what its step needs the first time it
-        runs, and the workspace is locked once the CUDA graphs are captured. The
-        memory profile never splits its batch (it has no attention metadata) and
-        the other warm-ups run on CUDA graph sizes, so without this the second slot
-        would be first sized by the first long prompt: after the lock, which fails
-        the step. (The FlashInfer autotune dummy run happens to split, but it can be
-        switched off.)
+        The workspace is locked once the CUDA graphs are captured. The memory profile
+        never splits its batch (it has no attention metadata) and the other warm-ups
+        run on CUDA graph sizes, so without this the first kernel scratch a split
+        batch needs (and, where each microbatch has a workspace slot of its own, the
+        second slot) would be first sized by the first long prompt: after the lock,
+        which fails the step. (The FlashInfer autotune dummy run happens to split,
+        but it can be switched off.)
         """
         if (
             self.ubatch_runner is None

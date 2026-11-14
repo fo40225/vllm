@@ -1388,6 +1388,17 @@ class FusedMoEKernelModularImpl:
         elif use_output_alias:
             fused_out = output_alias
 
+        if (
+            dbo_enabled()
+            and current_workspace_manager().shares_ubatch_slots
+            and not fused_out_is_specialized
+            and fused_out is not output_alias
+        ):
+            # Microbatches that share one workspace slot hand off while their
+            # output is still in use (the collective that sums it): it must not
+            # live in the scratch the other microbatch's experts overwrite.
+            fused_out = torch.empty_like(fused_out)
+
         unfinalized = self.fused_experts.apply(
             output=fused_out,
             hidden_states=a1q,

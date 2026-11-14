@@ -120,6 +120,16 @@ from .utils import request_memory
 logger = init_logger(__name__)
 
 
+def _num_workspace_ubatches(vllm_config: VllmConfig) -> int:
+    """Workspace slots: one per microbatch, or one where the microbatches only
+    overlap tensor-parallel collectives (their scratch is never live across a
+    hand-off, see ``WorkspaceManager``)."""
+    pc = vllm_config.parallel_config
+    if pc.ubatch_overlap_tp_collectives:
+        return 1
+    return get_num_ubatches(pc)
+
+
 def _num_workspace_lanes(vllm_config: VllmConfig, use_v2_model_runner: bool) -> int:
     spec_config = vllm_config.speculative_config
     return (
@@ -555,7 +565,7 @@ class Worker(WorkerBase):
     def _init_workspace_and_model_runner(self) -> None:
         """Set up the workspace manager, build the model runner, report usage."""
         # DSpark target and draft CUDA graphs retain workspace views concurrently.
-        num_ubatches = get_num_ubatches(self.vllm_config.parallel_config)
+        num_ubatches = _num_workspace_ubatches(self.vllm_config)
         init_workspace_manager(
             self.device,
             num_ubatches,

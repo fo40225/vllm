@@ -51,6 +51,11 @@ class WorkspaceManager:
 
     Manages shared scratch and keyed persistent resources per ``(ubatch, lane)``.
     Can be locked to prevent growth or new resources during execution.
+
+    With one ubatch slot every microbatch uses it (``shares_ubatch_slots``). That is
+    for microbatches that only overlap tensor-parallel collectives: their compute
+    runs strictly one after the other on one stream, and scratch is never live across
+    a hand-off, so a slot per microbatch would only hold memory twice.
     """
 
     def __init__(
@@ -127,7 +132,13 @@ class WorkspaceManager:
                 f"Workspace lane {lane} is not configured; manager has "
                 f"{self._num_lanes} lane(s)."
             )
-        return dbo_current_ubatch_id() * self._num_lanes + lane
+        ubatch = dbo_current_ubatch_id() if self._num_ubatches > 1 else 0
+        return ubatch * self._num_lanes + lane
+
+    @property
+    def shares_ubatch_slots(self) -> bool:
+        """Whether all microbatches of a step use the same scratch."""
+        return self._num_ubatches == 1
 
     def get_persistent_resource(self, key: Hashable, factory: Callable[[], T]) -> T:
         """Return the resource cached for ``key`` in the current ubatch and lane.
