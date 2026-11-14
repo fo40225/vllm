@@ -1,23 +1,34 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-// Router GEMV of a Muse Spark decode layer: out[t][n] = sum_k x[t][k] * w[n][k] for up to 8 token rows, fp32 activations x [T, 8192] and fp32
-// weights w [N, 8192] (N a multiple of the rows per CTA), fp32 out [T, N]. The router of the model is a [T, 8192] x [8192, 256] fp32 product
-// that cuBLAS runs as a dot-product kernel plus a reduction (T = 1: 3.7 + 1.2 us with the weights in L2) or as a SIMT sgemm plus a split-K
-// reduction (T = 2 .. 8: 6.5 + 2.6 .. 3.3 us), and that the routing kernel waits for; here it is one kernel that reads the 8 MiB of
-// weights once, with all of its loads in flight.
+// Router GEMV of a Muse Spark decode layer: out[t][n] = sum_k x[t][k] * w[n][k]
+// for up to 8 token rows, fp32 activations x [T, 8192] and fp32 weights w [N,
+// 8192] (N a multiple of the rows per CTA), fp32 out [T, N]. The router of the
+// model is a [T, 8192] x [8192, 256] fp32 product that cuBLAS runs as a dot-
+// product kernel plus a reduction (T = 1: 3.7 + 1.2 us with the weights in L2)
+// or as a SIMT sgemm plus a split-K reduction (T = 2 .. 8: 6.5 + 2.6 .. 3.3
+// us), and that the routing kernel waits for; here it is one kernel that reads
+// the 8 MiB of weights once, with all of its loads in flight.
 //
-// Decomposition: a CTA of W warps owns W / WPR output rows; WPR warps share a row, warp `wr` takes the slice [wr * K / WPR, (wr + 1) * K / WPR)
-// of it, lane l of a warp loads the 16-byte chunks l, l + 32, ... of its slice (a warp instruction reads 512 contiguous bytes). The weights
-// do not depend on any earlier kernel: a launch as a programmatic dependent loads them before griddepcontrol.wait and holds them in registers.
+// Decomposition: a CTA of W warps owns W / WPR output rows; WPR warps share a
+// row, warp `wr` takes the slice [wr * K / WPR, (wr + 1) * K / WPR) of it, lane
+// l of a warp loads the 16-byte chunks l, l + 32, ... of its slice (a warp
+// instruction reads 512 contiguous bytes). The weights do not depend on any
+// earlier kernel: a launch as a programmatic dependent (pdl) loads them before
+// griddepcontrol.wait and holds them in registers; the model launches it
+// without (pdl = false) today, because its predecessor on the aux stream (the
+// previous layer's expert prefetch) does not trigger early.
 //
-// Order of the additions of one output element (row n, token t), fixed and independent of T, the grid and the run:
-//   thread: four accumulators a[e], e = element position inside the chunk; chunks in ascending j; a[e] = fma(w, x, a[e]);
-//           thread value (a0 + a1) + (a2 + a3)
+// Order of the additions of one output element (row n, token t), fixed and
+// independent of T, the grid and the run:
+//   thread: four accumulators a[e], e = element position inside the chunk;
+//     chunks in ascending j; a[e] = fma(w, x, a[e]); thread value (a0 + a1) +
+//     (a2 + a3)
 //   warp:   xor butterfly over the 32 lanes (16, 8, 4, 2, 1)
 //   row:    the WPR warp values added in ascending warp order.
-// This is not the order of cuBLAS: the logits differ from the cuBLAS ones in the last bits (deterministic; accuracy as good as the fp32
-// dot product of cuBLAS, see tests/kernels/core/test_muse_spark_router_gemv.py).
+// This is not the order of cuBLAS: the logits differ from the cuBLAS ones in
+// the last bits (deterministic; accuracy as good as the fp32 dot product of
+// cuBLAS, see tests/kernels/core/test_muse_spark_router_gemv.py).
 
 // Only c10 headers: <ATen/cuda/CUDAContext.h> needs cusparse.h and
 // cusolverDn.h, which the stock runtime images do not ship.
@@ -36,7 +47,8 @@ namespace rgemv {
 
 constexpr int kHidden = 8192;
 
-// Weights: streamed once, no L1 allocation. A plain load (not ld.global.nc): ptxas moves a .nc load below griddepcontrol.wait.
+// Weights: streamed once, no L1 allocation. A plain load (not ld.global.nc):
+// ptxas moves a .nc load below griddepcontrol.wait.
 __device__ __forceinline__ float4 ld_w(const float* p) {
   float4 v;
   asm volatile("ld.global.L1::no_allocate.v4.f32 {%0, %1, %2, %3}, [%4];"
@@ -45,7 +57,8 @@ __device__ __forceinline__ float4 ld_w(const float* p) {
                : "memory");
   return v;
 }
-// Activations: written by the kernel in front of this one; a plain load that stays behind griddepcontrol.wait.
+// Activations: written by the kernel in front of this one; a plain load that
+// stays behind griddepcontrol.wait.
 __device__ __forceinline__ float4 ld_x(const float* p) {
   float4 v;
   asm("ld.global.v4.f32 {%0, %1, %2, %3}, [%4];"
@@ -74,8 +87,9 @@ __global__ void __launch_bounds__(W * 32)
   const float* wp = w + static_cast<int64_t>(row) * K + 4 * (wr * SLICE + lane);
 #pragma unroll
   for (int j = 0; j < LPL; ++j) wv[j] = ld_w(wp + 4 * 32 * j);
-  // The routing kernel after this one (Triton, a programmatic dependent that waits for this grid to finish) may be launched now; without
-  // a dependent this does nothing.
+  // The routing kernel after this one (Triton, a programmatic dependent that
+  // waits for this grid to finish) may be launched now; without a dependent
+  // this does nothing.
   asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
   asm volatile("griddepcontrol.wait;" ::: "memory");
 
@@ -100,7 +114,8 @@ __global__ void __launch_bounds__(W * 32)
   for (int t = 0; t < T; ++t) {
     float v = (acc[t][0] + acc[t][1]) + (acc[t][2] + acc[t][3]);
 #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xffffffffu, v, off);
+    for (int off = 16; off > 0; off >>= 1)
+      v += __shfl_xor_sync(0xffffffffu, v, off);
     acc[t][0] = v;
   }
   if (lane < T) {

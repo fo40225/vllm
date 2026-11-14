@@ -170,8 +170,10 @@ _SHARDED_PROJECTION_MAX_TOKENS = 256
 # more than the smaller unpooler GEMM saves.
 _MULTI_NODE_SHARDED_UNPOOLER_MIN_TOKENS = 32
 _PREPARED_NVFP4_MAX_TOKENS = 256
-# The most tokens the router GEMV of _muse_C serves (_muse_C::router_gemv).
+# The most tokens the router GEMV of _muse_C serves (_muse_C::router_gemv), and the
+# multiple of experts that its CTAs cover (2 rows for 1-2 tokens, 4 for more).
 _ROUTER_GEMV_MAX_TOKENS = 8
+_ROUTER_GEMV_ROW_MULTIPLE = 4
 
 
 def gather_columns(shard: torch.Tensor) -> torch.Tensor:
@@ -381,7 +383,7 @@ def _communicator_gemv_all_gather_norm_residual_then_norm(
     pre_norm: MuseSpark1xRMSNorm,
     out_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
-    """The unpooler GEMV, the column gather and the boundary as one communicator call."""
+    """The unpooler GEMV, the column gather and the boundary as one call."""
     num_tokens = x.branch.shape[0]
     if not fused_boundary.supports_fused_boundary(
         fused_boundary.KIND_GEMV_ALL_GATHER_BOUNDARY, num_tokens
@@ -1066,7 +1068,8 @@ class MuseSpark1xMoE(nn.Module):
         self.fuses_gemv_gather = (
             self.fuses_boundary_collectives and envs.VLLM_MUSE_SPARK_SM120_FUSED_GEMV
         )
-        # Set by the model once the _muse_C extension is loaded (_configure_router_gemv).
+        # Set by the model once the _muse_C extension is loaded
+        # (_configure_router_gemv).
         self.router_gemv_ready = False
         if self.use_mega_moe and self.tp_size > 1 and not self.is_sequence_parallel:
             raise NotImplementedError(
@@ -1174,7 +1177,7 @@ class MuseSpark1xMoE(nn.Module):
         )
 
     def _local_weight_rows(self, layer: ReplicatedLinear) -> torch.Tensor:
-        """This rank's rows of the projection weight: its block of the output columns."""
+        """This rank's rows of the projection weight (its block of output columns)."""
         shard_size = layer.output_size // self.tp_size
         return layer.weight.narrow(0, self.tp_rank * shard_size, shard_size)
 
@@ -1285,7 +1288,8 @@ class MuseSpark1xMoE(nn.Module):
     def _pool_and_norm(self, hidden_states: torch.Tensor) -> torch.Tensor:
         assert self.pooler is not None
         if self.shards_pooler(hidden_states.shape[0]):
-            if (fused := self._fused_gemv_all_gather_rmsnorm(hidden_states)) is not None:
+            fused = self._fused_gemv_all_gather_rmsnorm(hidden_states)
+            if fused is not None:
                 return fused
             shard = self._project_local_columns(self.pooler, hidden_states)
             if (fused := self._fused_all_gather_rmsnorm(shard)) is not None:
@@ -1370,18 +1374,20 @@ class MuseSpark1xMoE(nn.Module):
         )
 
     def _router_logits(self, router_input: torch.Tensor) -> torch.Tensor:
-        """The router logits: the decode GEMV of ``_muse_C`` where it serves the batch."""
+        """The router logits: the ``_muse_C`` decode GEMV where it serves the batch."""
         weight = self.router.weight
         if (
             self.router_gemv_ready
             and router_input.dtype == torch.float32
             and router_input.is_contiguous()
             and router_input.dim() == 2
-            and router_input.shape[0] <= _ROUTER_GEMV_MAX_TOKENS
+            and 1 <= router_input.shape[0] <= _ROUTER_GEMV_MAX_TOKENS
             and weight.dtype == torch.float32
             and weight.is_contiguous()
             and tuple(weight.shape) == (self.n_logical_experts, router_input.shape[1])
             and router_input.shape[1] == 8192
+            # The kernel owns 2 or 4 rows of the weight per CTA.
+            and weight.shape[0] % _ROUTER_GEMV_ROW_MULTIPLE == 0
         ):
             logits = torch.empty(
                 router_input.shape[0],
@@ -2579,7 +2585,6 @@ class MuseSpark1xModel(LlamaModel):
         self._configure_replicated_prefix()
         self._configure_column_gather()
         self._configure_pooler_gather()
-        self._configure_router_gemv()
         if sm120_sp and sm120_sequence_parallel_is_gated():
             self._configure_sequence_parallel_row_gate()
         self._l2_prefetcher: L2Prefetcher | None = None
@@ -2588,6 +2593,8 @@ class MuseSpark1xModel(LlamaModel):
         self._expert_prefetch: ExpertPrefetch | None = None
         if envs.VLLM_MUSE_SPARK_SM120_EXPERT_PREFETCH and _on_sm120():
             self._configure_expert_prefetch()
+        # After the expert prefetch: the router GEMV needs the layers that queue it.
+        self._configure_router_gemv()
         if self.is_sequence_parallel:
             from vllm.models.muse_spark.nvidia.ops.gemm_rs import (
                 maybe_create_gemm_rs,
@@ -2702,7 +2709,14 @@ class MuseSpark1xModel(LlamaModel):
             )
 
     def _configure_router_gemv(self) -> None:
-        """Let the decode router of the MoE layers run as ``_muse_C::router_gemv``."""
+        """Let the decode router of the MoE layers run as ``_muse_C::router_gemv``.
+
+        The kernel reads the FP32 router input, which the boundary kernel writes in
+        the decode graphs only for the layers that queue the expert prefetch
+        (``wants_cast_router_input``); the other layers keep cuBLAS, so only these
+        are marked, and without any of them nothing is built. Must run after
+        ``_configure_expert_prefetch``.
+        """
         if not (envs.VLLM_MUSE_SPARK_SM120_ROUTER_GEMV and _on_sm120()):
             return
         moes = [
@@ -2711,6 +2725,14 @@ class MuseSpark1xModel(LlamaModel):
             if isinstance(layer.feed_forward, MuseSpark1xMoE)
         ]
         if not moes:
+            return
+        moes = [moe for moe in moes if moe.expert_prefetch is not None]
+        if not moes:
+            logger.info_once(
+                "The router GEMV is off: the decode graphs get its FP32 input only "
+                "from the boundary kernel beside the expert prefetch, which no layer "
+                "queues (VLLM_MUSE_SPARK_SM120_EXPERT_PREFETCH=0)."
+            )
             return
         if (reason := muse_c.preflight()) is not None:
             logger.info_once("The router GEMV is off: %s", reason)
