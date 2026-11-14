@@ -268,12 +268,14 @@ def _model_with_launchable_hooks() -> model_ops.MuseSpark1xModel:
 
 
 def _launches_of_the_hooks(monkeypatch) -> list[tuple[int, int | None]]:
-    """What the two hooks of layer 0 launch: (tensors, CTA count or None)."""
+    """What the two hooks of layer 0 launch, with the lists of order 0: (number of
+    tensors, CTA count or None)."""
     launches = []
 
     def launch(self, tensors, num_ctas=None):
         launches.append((len(tensors), num_ctas))
 
+    monkeypatch.setenv(ORDER_KNOB, "0")
     monkeypatch.setattr(muse_c, "preflight", lambda: None)
     monkeypatch.setattr(L2Prefetcher, "launch", launch)
     model = _model_with_launchable_hooks()
@@ -388,15 +390,34 @@ def _hook_lists(monkeypatch, layer, num_tokens, order=None, ctas=C):
     return launches
 
 
-def test_the_default_order_is_the_shipped_one(monkeypatch):
-    """No knob: behind the experts of a layer the unpooler, QKV and O weights of the
-    next one (the default CTA count of the experts knob), behind the QKV projection the
-    pooler and router of the layer itself."""
+def test_the_default_order_is_order_4(monkeypatch):
+    """No knob: behind the experts of a layer only the QKV weight of the next one
+    (where the communicator runs the unpooler GEMV itself, otherwise the unpooler shards
+    too, as the decode batches above its row limit have it), with the default CTA count
+    of the experts knob; behind the QKV projection the O weight, the pooler and the
+    router of the layer itself, with the same CTA count."""
     assert _hook_lists(monkeypatch, 2, 2, order=None, ctas=None) == [
+        (["qkv3"], 4),
+        (["o2", "p2", "r2"], 4),
+    ]
+    assert _hook_lists(monkeypatch, 2, 8, order=None, ctas=None) == [
+        (["u2", "qkv3"], 4),
+        (["o2", "p2", "r2"], 4),
+    ]
+    assert envs.VLLM_MUSE_SPARK_SM120_L2_PREFETCH_ORDER == 4
+    assert _hook_lists(monkeypatch, 2, 2, order=None, ctas=None) == _hook_lists(
+        monkeypatch, 2, 2, order=4, ctas=None
+    )
+
+
+def test_order_0_keeps_the_lists_of_earlier_versions(monkeypatch):
+    """Behind the experts the unpooler, QKV and O weights of the next layer (the QKV
+    first only in order 1), behind the QKV projection the pooler and the router, which
+    keeps the prefetcher's own CTA count."""
+    assert _hook_lists(monkeypatch, 2, 2, order=0, ctas=None) == [
         (["u2", "qkv3", "o3"], 4),
         (["p2", "r2"], None),
     ]
-    assert envs.VLLM_MUSE_SPARK_SM120_L2_PREFETCH_ORDER == 0
 
 
 # (order, rows) -> the launches of layer 2, which is hooked, follows a hooked layer

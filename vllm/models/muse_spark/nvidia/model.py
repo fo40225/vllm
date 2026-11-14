@@ -2860,17 +2860,21 @@ class MuseSpark1xModel(LlamaModel):
         """Prefetch weights into L2 behind the collectives of the layer before.
 
         Decode only, inside the CUDA graph, on a side stream (see
-        ``ops/l2_prefetch.py``). Behind the experts of layer ``i``, which are
-        followed by the MoE all-reduce, it pulls the unpooler of layer ``i`` and
-        the QKV and O weights of layer ``i + 1``; behind the QKV projection of
-        layer ``i`` (the attention reads little from HBM there), the pooler and
-        router weights of layer ``i``. The weights are looked up when the graph
-        is captured, after they are final.
+        ``ops/l2_prefetch.py``). By default (order 4 of
+        ``VLLM_MUSE_SPARK_SM120_L2_PREFETCH_ORDER``): behind the experts of layer ``i``,
+        which are followed by the MoE all-reduce, the QKV weight of layer ``i + 1`` and,
+        where the communicator does not run the unpooler GEMV itself (its kernel loads
+        those weights by itself), the unpooler of layer ``i``; behind the QKV projection
+        of layer ``i`` (the attention reads little from HBM there), the O weight, the
+        pooler and the router weights of layer ``i``. The weights are looked up when the
+        graph is captured, after they are final.
 
-        ``VLLM_MUSE_SPARK_SM120_L2_PREFETCH_ORDER`` selects other lists (QKV first,
-        no unpooler shards where the communicator's GEMV + gather kernel loads them
-        itself, the O weight behind the QKV projection of its own layer; see
-        ``L2PrefetchOrder``); the default is the lists above.
+        The other orders are the lists of earlier versions (0: behind the experts the
+        unpooler of layer ``i`` and the QKV and O weights of layer ``i + 1``, behind the
+        QKV projection the pooler and router) and the steps between (QKV first, no
+        unpooler shards where the communicator's GEMV + gather kernel loads them itself,
+        the O weight behind the QKV projection of its own layer; see
+        ``L2PrefetchOrder``).
 
         A hint that changes no output, so a host that cannot build the ``_muse_C``
         extension, and a model without the SM120 native NVFP4 experts, run without it.
@@ -2972,10 +2976,10 @@ class MuseSpark1xModel(LlamaModel):
             self._l2_prefetcher = prefetcher
             logger.info_once(
                 "MuseSpark: L2 prefetch of the weights of the next decode ops in %d "
-                "layers (%d CTAs behind the experts%s).",
+                "layers (%d CTAs behind the experts, prefetch order %d).",
                 hook_count,
                 after_experts_ctas,
-                f", prefetch order {order_id}" if order_id else "",
+                order_id,
             )
 
     def _make_empty_intermediate_tensors(

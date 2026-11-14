@@ -22,7 +22,13 @@ but it must also be done before its readers. The launches share one stream, so a
 prefetch still running when the next one is due delays that one: with the host
 collectives (a layer of 160 us instead of 296 us) the pooler and router weights,
 queued behind the attention weights, arrived after their GEMVs in half of the layers
-when the launch took 113 us (4 CTAs).
+when the launch took 113 us (4 CTAs). The same holds for the QKV GEMM that follows the
+launch behind the experts: on the rank with the most local experts (which ends its MoE
+last and has no straggler wait to hide the tail) the 46 MB burst of 53 to 57 us was
+still running when QKV started and the GEMM took 22 us instead of 13 us. The default
+lists (``L2PrefetchOrder``, order 4) put only the QKV weight behind the experts and
+move the O weight with the pooler and router to the launch behind the QKV GEMM of the
+layer itself.
 """
 
 from collections.abc import Sequence
@@ -59,9 +65,10 @@ L2_PREFETCH_ORDERS = (0, 1, 2, 3, 4)
 class L2PrefetchOrder:
     """What one value of ``VLLM_MUSE_SPARK_SM120_L2_PREFETCH_ORDER`` changes.
 
-    Order 0 is the shipped one: behind the experts of a layer the unpooler shards,
-    then the QKV and O weights of the next layer; behind the QKV projection the
-    pooler shards and the router.
+    Order 0 is the list of earlier versions: behind the experts of a layer the unpooler
+    shards, then the QKV and O weights of the next layer; behind the QKV projection the
+    pooler shards and the router. The default, order 4, sets ``skip_fused_unpooler`` and
+    ``o_after_qkv``.
     """
 
     # The QKV weight leads the launch behind the experts (the launch pulls the tensors
