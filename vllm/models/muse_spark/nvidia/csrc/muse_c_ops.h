@@ -151,8 +151,13 @@ void nvfp4_decode_moe(at::Tensor const& hidden, at::Tensor const& topk_ids,
 //   build, MUSE_LARGE_COLS=8, needs 4228 and 386). flags: 4 = zero the rows
 //   of non-local routes, 8 = no programmatic dependent launches, 16 = the loader
 //   warp fetches the B operand with bulk copies (the scratch above must be 16-byte
-//   aligned, as it is for every launch); the upper 16 bits (flags >> 16) override
-//   the grid size of the persistent kernel.
+//   aligned, as it is for every launch), 32 = the plan and perm_idx were built by
+//   nvfp4_decode_moe_plan for these ids (the preparation launch skips them), 64 =
+//   xq_data / xq_sf already hold the quantized activations (the preparation launch
+//   skips them; hidden is then not read); with both there is no preparation launch
+//   and the persistent kernel is the programmatic dependent of the kernel before
+//   it. The upper 16 bits (flags >> 16) override the grid size of the persistent
+//   kernel.
 void nvfp4_decode_moe_large(
     at::Tensor const& hidden, at::Tensor const& topk_ids,
     std::optional<at::Tensor> const& expert_map, at::Tensor const& w13,
@@ -162,11 +167,32 @@ void nvfp4_decode_moe_large(
     at::Tensor& xq_data, at::Tensor& xq_sf, at::Tensor& plan, at::Tensor& ctl,
     int64_t flags);
 
-// The in-kernel activation quantization of nvfp4_decode_moe on its own, for
-// tests: hidden [T, 4096] bf16 -> codes [T, 2048] u8 and linear e4m3 scales
-// [T, 256] u8, gs[0] = 1 / a13.
+// The plan of nvfp4_decode_moe_large on its own: the first CTA of its preparation
+// launch, which reads the top-k ids (and expert_map) only. topk_ids [T, 8] int32
+// (T = 1..128), perm_idx [T * 8] int32 (the leading rows of the buffer the large
+// op is given) and plan (the large op's scratch, 16-byte aligned) receive what the
+// preparation launch would have written; num_local = the experts of the rank
+// (w13.size(0)). The large op that follows takes flag 32 (external plan) and must
+// run on the same topk_ids / expert_map / perm_idx / plan after this launch has
+// completed (any stream, ordered by an event or a graph edge). flags: 8 = no
+// programmatic dependent launch (the launch is then a plain one; otherwise it is
+// a programmatic dependent of the kernel before it, which waits for it before it
+// reads the ids).
+void nvfp4_decode_moe_plan(at::Tensor const& topk_ids,
+                           std::optional<at::Tensor> const& expert_map,
+                           int64_t num_local, at::Tensor& perm_idx,
+                           at::Tensor& plan, int64_t flags);
+
+// The in-kernel activation quantization of nvfp4_decode_moe on its own:
+// hidden [T, 4096] bf16 -> codes [T, 2048] u8 and linear e4m3 scales [T, 256] u8,
+// gs[0] = 1 / a13, T = 1..128. Up to 8 tokens it is the small-batch kernel's
+// quantization, beyond that the one of the large-batch preparation launch (the same
+// bytes). The result is what nvfp4_decode_moe_large takes with flag 64 (external
+// xq) in its xq_data / xq_sf scratch. pdl: launch as a programmatic dependent of the
+// kernel before it in the stream (more than 8 tokens only); the large-batch kernel
+// that follows then waits for this launch as for its own preparation launch.
 void nvfp4_decode_act_quant(at::Tensor const& hidden, at::Tensor const& gs,
-                            at::Tensor& data, at::Tensor& sf);
+                            at::Tensor& data, at::Tensor& sf, bool pdl);
 
 // Muse Spark attention-side ops, ported from vllm-project/vllm#62132 (the
 // stock `torch.ops._C` versions of the same ops). Schemas are identical.

@@ -172,6 +172,8 @@ if TYPE_CHECKING:
     VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT_TABLE: str | None = None
     VLLM_MUSE_SPARK_SM120_DENSE_Q: bool = True
     VLLM_MUSE_SPARK_SM120_DECODE_GEMM: bool = True
+    VLLM_MUSE_SPARK_SM120_AUX_PLAN: bool = False
+    VLLM_MUSE_SPARK_SM120_AUX_PLAN_MAX_TOKENS: int = 64
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
     VLLM_ROCM_USE_AITER_LINEAR_HIPBMM: bool = False
     VLLM_ROCM_USE_AITER_MOE: bool = True
@@ -1741,6 +1743,31 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # model is constructed.
     "VLLM_MUSE_SPARK_SM120_DENSE_Q": lambda: bool(
         int(os.getenv("VLLM_MUSE_SPARK_SM120_DENSE_Q", "1"))
+    ),
+    # Muse Spark on SM120: build the plan of the large-batch decode kernel (padded decode
+    # batches of 9 to 128 rows) on the router's aux stream. Its preparation launch
+    # (``k_prep``, 8 us per layer at 64 rows) has one CTA that turns the top-k ids into the
+    # expert plan and the route -> row map, and one CTA per 32 rows that quantizes the
+    # pooled latent to NVFP4. The plan depends on the ids alone, so it is built right
+    # behind the top-k on the aux stream, beside the pooler, its all-gather and the
+    # pre-expert norm; the launch in front of the experts then only quantizes. The bytes of
+    # the plan and of the map are the ones the preparation launch writes, so the output does
+    # not change. Only where the routing already runs on the aux stream (CUDA graph
+    # capture, ``_routes_on_aux_stream``). Default off. Read when a decode graph is
+    # captured, so it must not change between a capture and its replay.
+    "VLLM_MUSE_SPARK_SM120_AUX_PLAN": lambda: bool(
+        int(os.getenv("VLLM_MUSE_SPARK_SM120_AUX_PLAN", "0"))
+    ),
+    # Muse Spark on SM120: the largest padded decode batch whose plan is built on the aux
+    # stream (VLLM_MUSE_SPARK_SM120_AUX_PLAN=1); larger batches keep the preparation launch
+    # of the kernel. Beyond 64 rows the router GEMM (fp32, SIMT: 15 us at 64 rows and
+    # growing) is about as long as the pooler chain it overlaps, so the plan (3.5 us)
+    # behind it is no longer hidden: in the layer benchmark
+    # (benchmarks/kernels/benchmark_muse_spark_aux_plan.py) the plan on the aux stream gains
+    # 1.5 us per layer at 24 to 64 rows next to the fused norm + quantization launch and
+    # loses 0.1 to 1 us at 96 and 128 rows.
+    "VLLM_MUSE_SPARK_SM120_AUX_PLAN_MAX_TOKENS": lambda: int(
+        os.getenv("VLLM_MUSE_SPARK_SM120_AUX_PLAN_MAX_TOKENS", "64")
     ),
     # Muse Spark on SM120: run the QKV projection and the sharded pooler / unpooler of up
     # to 64 rows (padded decode batches) as one kernel, ``_muse_C::decode_gemm``, instead

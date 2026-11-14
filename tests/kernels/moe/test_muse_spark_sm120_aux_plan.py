@@ -1,0 +1,697 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""The plan of the large-batch muse decode kernel on the router's aux stream
+(``VLLM_MUSE_SPARK_SM120_AUX_PLAN``), and its activations quantized by another launch.
+
+The preparation launch of ``nvfp4_decode_moe_large`` (``k_prep``) has one CTA that
+builds the plan and the route -> row map from the top-k ids, and one CTA per 32 rows
+that quantizes the activations. Both halves can be left out of it: the plan by
+``nvfp4_decode_moe_plan`` (flag 32 of the large-batch op), the quantization by
+``nvfp4_decode_act_quant`` or any producer that writes the same bytes (flag 64). The
+kernels of the tests below are required to give the same bytes in every combination, for
+every token count of the large-batch kernel, and to wait for what they read.
+"""
+
+import contextlib
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+import vllm.envs as envs
+import vllm.models.muse_spark.nvidia.model as model_ops
+from tests.kernels.moe.test_muse_spark_sm120_decode_moe import (
+    FLAG_NO_PDL,
+    LARGE_DEFAULT_FLAGS,
+    LARGE_TS,
+    LOADERS,
+    MAX_LARGE_T,
+    TOP_K,
+    H,
+    _Engine,
+    _ids_cases,
+    _Layer,
+    _quant_cases,
+    _routing,
+    _stock_quant,
+    _valid,
+    _zipf_ids,
+)
+from tests.kernels.muse_spark_pdl_utils import slow_copy, synchronize_or_exit
+from vllm.models.muse_spark.nvidia import sm120_nvfp4_moe
+from vllm.models.muse_spark.nvidia.muse_moe_runner import (
+    MuseSparkModelOptNvFp4FusedMoE,
+)
+from vllm.models.muse_spark.nvidia.ops import muse_c, muse_decode_moe
+from vllm.models.muse_spark.nvidia.ops.muse_decode_moe import (
+    MUSE_SMALL_MAX_TOKENS,
+    MuseDecodeMoE,
+)
+from vllm.models.muse_spark.nvidia.sm120_nvfp4_moe import MuseSparkSm120NvFp4Experts
+from vllm.platforms import current_platform
+
+if not current_platform.is_device_capability_family(120):
+    pytest.skip("Requires an SM120 GPU", allow_module_level=True)
+
+_unusable = muse_c.preflight()
+if _unusable is not None:
+    pytest.skip(
+        f"The _muse_C extension cannot be built: {_unusable}", allow_module_level=True
+    )
+
+FLAG_EXTERNAL_PLAN = 32
+FLAG_EXTERNAL_XQ = 64
+ALL_LARGE_TS = list(range(MUSE_SMALL_MAX_TOKENS + 1, MAX_LARGE_T + 1))
+DEVICE = torch.device("cuda")
+E_LOCAL_SMALL = 8
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _extension() -> None:
+    muse_c.load()
+
+
+@pytest.fixture(
+    scope="module",
+    params=[(True, 32), (False, 64)],
+    ids=lambda p: f"{'diff_s' if p[0] else 'same_s'}-e{p[1]}",
+)
+def layer(request) -> _Layer:
+    diff_s, e_local = request.param
+    with torch.inference_mode():
+        yield _Layer(diff_s=diff_s, e_local=e_local)
+
+
+def _all_ids(t: int, seed: int, e_local: int) -> dict[str, torch.Tensor]:
+    cases = _ids_cases(t, seed, e_local)
+    # Hot experts: more routes than one entry holds, several entries per expert.
+    cases["zipf_1"] = _zipf_ids(t, seed, e_local, 1.0)
+    cases["zipf_2"] = _zipf_ids(t, seed + 1, e_local, 2.0, n_local=5)
+    return cases
+
+
+def _plan_region(engine: _Engine) -> torch.Tensor:
+    return engine.plan.clone()
+
+
+def _poison(engine: _Engine, t: int) -> None:
+    engine.plan.fill_(0x5A5A5A5A)
+    engine.large_perm.fill_(-7)
+    for scratch in (engine.xq_data, engine.xq_sf):
+        scratch.fill_(0xFF)
+
+
+def _plan_op(engine: _Engine, ids: torch.Tensor, flags: int = 0) -> None:
+    t = ids.shape[0]
+    torch.ops._muse_C.nvfp4_decode_moe_plan(
+        ids,
+        engine.layer.expert_map,
+        engine.layer.e_local,
+        engine.large_perm[: t * TOP_K],
+        engine.plan,
+        flags,
+    )
+
+
+# ------------------------------------------------------------------------------
+# The plan launch: the bytes of the preparation launch's plan, for every token count
+# ------------------------------------------------------------------------------
+@torch.inference_mode()
+def test_plan_launch_writes_the_plan_and_the_route_map_of_the_prep_launch(
+    layer: _Layer,
+) -> None:
+    engine = _Engine(layer)
+    for t in ALL_LARGE_TS:
+        u, _, _ = _routing(t, 300 + t)
+        for name, ids in _all_ids(t, 301 + t, layer.e_local).items():
+            _poison(engine, t)
+            _, perm = engine.run(u, ids)
+            ref_plan, ref_perm = _plan_region(engine), perm.clone()
+            for flags in (0, FLAG_NO_PDL):
+                _poison(engine, t)
+                _plan_op(engine, ids, flags)
+                got_plan = _plan_region(engine)
+                got_perm = engine.large_perm[: t * TOP_K]
+                assert torch.equal(got_plan, ref_plan), (t, name, flags)
+                assert torch.equal(got_perm, ref_perm), (t, name, flags)
+
+
+@torch.inference_mode()
+def test_plan_launch_rejects_bad_arguments(layer: _Layer) -> None:
+    engine = _Engine(layer)
+    t = 12
+    ids = _all_ids(t, 5, layer.e_local)["random"]
+    perm = engine.large_perm[: t * TOP_K]
+    emap = layer.expert_map
+    op = torch.ops._muse_C.nvfp4_decode_moe_plan
+    op(ids, emap, layer.e_local, perm, engine.plan, 0)
+    with pytest.raises(RuntimeError):  # more tokens than the kernel serves
+        big = _all_ids(MAX_LARGE_T + 1, 6, layer.e_local)["random"]
+        op(big, emap, layer.e_local, engine.large_perm[: big.numel()], engine.plan, 0)
+    with pytest.raises(RuntimeError):  # perm_idx of another size
+        op(ids, emap, layer.e_local, engine.large_perm[: t * TOP_K - 8], engine.plan, 0)
+    with pytest.raises(RuntimeError):  # too many experts for the plan
+        op(ids, emap, 257, perm, engine.plan, 0)
+    with pytest.raises(RuntimeError):  # no experts
+        op(ids, emap, 0, perm, engine.plan, 0)
+    with pytest.raises(RuntimeError):  # plan scratch too small
+        op(ids, emap, layer.e_local, perm, engine.plan[:1024], 0)
+    with pytest.raises(RuntimeError):  # ids of another dtype
+        op(ids.long(), emap, layer.e_local, perm, engine.plan, 0)
+
+
+# ------------------------------------------------------------------------------
+# The large-batch kernel on an external plan and / or external activations
+# ------------------------------------------------------------------------------
+def _combo(engine: _Engine, u, ids, loader, plan, xq, *, flags=0, pdl_xq=False):
+    """One large-batch launch with the plan and / or the quantization done by their own
+    launches, on poisoned scratch."""
+    t = u.shape[0]
+    _poison(engine, t)
+    engine.out_buffers(t)[0].fill_(float("nan"))
+    if plan:
+        _plan_op(engine, ids, flags & FLAG_NO_PDL)
+    if xq:
+        torch.ops._muse_C.nvfp4_decode_act_quant(
+            u, engine.layer.gs, engine.xq_data[:t], engine.xq_sf[:t], pdl_xq
+        )
+    extra = (FLAG_EXTERNAL_PLAN if plan else 0) | (FLAG_EXTERNAL_XQ if xq else 0)
+    # An external quantization means ``u`` is not read: hand over other activations.
+    hidden = torch.full_like(u, float("nan")) if xq else u
+    return engine.run(hidden, ids, flags=flags | extra, loader=loader)
+
+
+@pytest.mark.parametrize("pdl", [True, False], ids=["pdl", "no_pdl"])
+@LOADERS
+@torch.inference_mode()
+def test_rows_do_not_depend_on_who_built_the_plan_and_the_quantization(
+    layer: _Layer, loader: int, pdl: bool
+) -> None:
+    engine = _Engine(layer)
+    base = 0 if pdl else FLAG_NO_PDL
+    for t in sorted({*LARGE_TS, 10, 17, 40, 96, 127}):
+        u, _, _ = _routing(t, 320 + t)
+        for name, ids in _all_ids(t, 321 + t, layer.e_local).items():
+            ref = _valid(*engine.run(u, ids, flags=FLAG_NO_PDL, loader=loader))
+            engine.xq_data.fill_(0xFF)
+            for plan, xq in (
+                (False, False),
+                (True, False),
+                (False, True),
+                (True, True),
+            ):
+                got = _valid(
+                    *_combo(engine, u, ids, loader, plan, xq, flags=base, pdl_xq=pdl)
+                )
+                assert torch.equal(got[0], ref[0]), (t, name, plan, xq)
+                assert torch.equal(got[1], ref[1]), (t, name, plan, xq)
+            assert engine.counters_are_zero(), (t, name)
+
+
+@torch.inference_mode()
+def test_every_token_count_takes_an_external_plan_and_quantization(
+    layer: _Layer,
+) -> None:
+    """The whole range 9..128, one routing per count (the graph sizes in between are
+    the ones that production captures)."""
+    engine = _Engine(layer)
+    for t in ALL_LARGE_TS:
+        u, ids, _ = _routing(t, 340 + t)
+        ref = _valid(*engine.run(u, ids))
+        got = _valid(*_combo(engine, u, ids, LARGE_DEFAULT_FLAGS, True, True))
+        assert torch.equal(got[0], ref[0]), t
+        assert torch.equal(got[1], ref[1]), t
+
+
+# ------------------------------------------------------------------------------
+# The quantization launch: the bytes of the stock op and of the preparation launch
+# ------------------------------------------------------------------------------
+@pytest.mark.parametrize("t", [9, 10, 16, 31, 32, 33, 64, 100, MAX_LARGE_T])
+@torch.inference_mode()
+def test_act_quant_beyond_8_tokens_is_the_stock_op_and_the_prep_launch(
+    layer: _Layer, t: int
+) -> None:
+    engine = _Engine(layer)
+    ids = _all_ids(t, 3, layer.e_local)["random"]
+    for name, x, gscale in _quant_cases(t):
+        gs = layer.gs.clone()
+        gs[0] = gscale
+        q_ref, sf_ref = _stock_quant(x, gscale)
+        for pdl in (False, True):
+            data = torch.full((t, H // 2), 0xFF, dtype=torch.uint8, device=DEVICE)
+            sf = torch.full((t, H // 16), 0xFF, dtype=torch.uint8, device=DEVICE)
+            torch.ops._muse_C.nvfp4_decode_act_quant(x, gs, data, sf, pdl)
+            assert torch.equal(data, q_ref), (name, pdl)
+            assert torch.equal(sf, sf_ref), (name, pdl)
+        # What the preparation launch of the large-batch op writes into its scratch.
+        engine.run(x, ids, large=True, gs=gs)
+        assert torch.equal(engine.xq_data[:t], data), name
+        assert torch.equal(engine.xq_sf[:t], sf), name
+
+
+@torch.inference_mode()
+def test_act_quant_serves_every_token_count_up_to_128(layer: _Layer) -> None:
+    for t in range(1, MAX_LARGE_T + 1):
+        x = _routing(t, 360 + t)[0]
+        gscale = float(layer.gs[0])
+        q_ref, sf_ref = _stock_quant(x, gscale)
+        data = torch.zeros(t, H // 2, dtype=torch.uint8, device=DEVICE)
+        sf = torch.zeros(t, H // 16, dtype=torch.uint8, device=DEVICE)
+        torch.ops._muse_C.nvfp4_decode_act_quant(x, layer.gs, data, sf)
+        assert torch.equal(data, q_ref), t
+        assert torch.equal(sf, sf_ref), t
+    x = _routing(MAX_LARGE_T + 1, 5)[0]
+    with pytest.raises(RuntimeError):
+        torch.ops._muse_C.nvfp4_decode_act_quant(
+            x,
+            layer.gs,
+            torch.zeros(x.shape[0], H // 2, dtype=torch.uint8, device=DEVICE),
+            torch.zeros(x.shape[0], H // 16, dtype=torch.uint8, device=DEVICE),
+        )
+    with pytest.raises(RuntimeError):  # no programmatic launch of the small kernel
+        torch.ops._muse_C.nvfp4_decode_act_quant(
+            x[:4],
+            layer.gs,
+            torch.zeros(4, H // 2, dtype=torch.uint8, device=DEVICE),
+            torch.zeros(4, H // 16, dtype=torch.uint8, device=DEVICE),
+            True,
+        )
+
+
+# ------------------------------------------------------------------------------
+# The kernels wait for what they read: slow producers of the ids and the activations
+# ------------------------------------------------------------------------------
+@pytest.mark.parametrize("t", [9, 33, 64, MAX_LARGE_T])
+@pytest.mark.parametrize("use_graph", [False, True])
+@torch.inference_mode()
+def test_plan_and_quantization_wait_for_their_producers_on_two_streams(
+    layer: _Layer, t: int, use_graph: bool, capfd
+) -> None:
+    """The routing stand-in on the aux stream writes the ids late (``slow_copy`` lets
+    its dependents launch at once) and the plan launch is its programmatic dependent;
+    the norm stand-in on the main stream writes the activations late and the
+    quantization is its dependent; the large-batch kernel is the dependent of the
+    quantization on the main stream and joins the aux stream by an event. Stale ids and
+    activations stand in the buffers until the producers overwrite them."""
+    engine = _Engine(layer)
+    u, _, _ = _routing(t, 380 + t)
+    ids = _all_ids(t, 381 + t, layer.e_local)["three_local"]
+    ref = _valid(*engine.run(u, ids, flags=FLAG_NO_PDL))
+    stale_u, _, _ = _routing(t, 382 + t)
+    stale_ids = _all_ids(t, 383 + t, layer.e_local)["all_local"]
+    u_in, ids_in = stale_u.clone(), stale_ids.clone()
+    side = torch.cuda.Stream()
+    fork, join = torch.cuda.Event(), torch.cuda.Event()
+    gs = layer.gs
+
+    def step():
+        fork.record()
+        with torch.cuda.stream(side):
+            fork.wait()
+            slow_copy((ids_in, ids))
+            _plan_op(engine, ids_in)
+            join.record(side)
+        slow_copy((u_in, u))
+        torch.ops._muse_C.nvfp4_decode_act_quant(
+            u_in, gs, engine.xq_data[:t], engine.xq_sf[:t], True
+        )
+        join.wait()
+        return engine.run(
+            u_in,
+            ids_in,
+            flags=FLAG_EXTERNAL_PLAN | FLAG_EXTERNAL_XQ | LARGE_DEFAULT_FLAGS,
+        )
+
+    def restore():
+        u_in.copy_(stale_u)
+        ids_in.copy_(stale_ids)
+
+    restore()
+    step()  # compiles the Triton producer
+    synchronize_or_exit("the first launch", capfd)
+    if use_graph:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            rows, perm = step()
+        for _ in range(4):
+            restore()
+            _poison(engine, t)
+            graph.replay()
+            synchronize_or_exit("a graph replay", capfd)
+            got = _valid(rows, perm)
+            assert torch.equal(got[0], ref[0]) and torch.equal(got[1], ref[1])
+    else:
+        for _ in range(4):
+            restore()
+            _poison(engine, t)
+            rows, perm = step()
+            synchronize_or_exit("a launch", capfd)
+            got = _valid(rows, perm)
+            assert torch.equal(got[0], ref[0]) and torch.equal(got[1], ref[1])
+    assert engine.counters_are_zero()
+
+
+# ------------------------------------------------------------------------------
+# The engine: the plan and the quantization are taken for the very ids / activations
+# ------------------------------------------------------------------------------
+def _engine(layer: _Layer) -> MuseDecodeMoE:
+    return MuseDecodeMoE(
+        layer.w13, layer.sf13, layer.w2, layer.sf2, prm=layer.prm, gs=layer.gs
+    )
+
+
+class _Spy:
+    """Records the flags of the large-batch launches of the engine."""
+
+    def __init__(self, monkeypatch):
+        self.flags: list[int] = []
+        original = torch.ops._muse_C.nvfp4_decode_moe_large
+
+        def spy(*args):
+            self.flags.append(args[-1])
+            return original(*args)
+
+        monkeypatch.setattr(torch.ops._muse_C, "nvfp4_decode_moe_large", spy)
+
+
+@pytest.mark.parametrize("t", [9, 24, MAX_LARGE_T])
+@torch.inference_mode()
+def test_engine_takes_a_prepared_plan_once(layer: _Layer, t: int, monkeypatch) -> None:
+    engine = _engine(layer)
+    spy = _Spy(monkeypatch)
+    u, ids, _ = _routing(t, 400 + t)
+    ref = _valid(*engine.run(u, ids, layer.expert_map))
+    engine.build_plan(ids, layer.expert_map)
+    got = _valid(*engine.run(u, ids, layer.expert_map))
+    # The plan is for one call: the next one builds its own.
+    again = _valid(*engine.run(u, ids, layer.expert_map))
+    assert [bool(f & FLAG_EXTERNAL_PLAN) for f in spy.flags] == [False, True, False]
+    for x in (got, again):
+        assert torch.equal(x[0], ref[0]) and torch.equal(x[1], ref[1])
+
+
+@torch.inference_mode()
+def test_engine_ignores_a_plan_built_for_other_ids(layer: _Layer, monkeypatch) -> None:
+    engine = _engine(layer)
+    spy = _Spy(monkeypatch)
+    t = 20
+    u, ids, _ = _routing(t, 420)
+    other = _routing(t, 421)[1]
+    ref = _valid(*engine.run(u, ids, layer.expert_map))
+    engine.build_plan(other, layer.expert_map)
+    got = _valid(*engine.run(u, ids, layer.expert_map))  # ids of another buffer
+    assert not spy.flags[-1] & FLAG_EXTERNAL_PLAN
+    assert torch.equal(got[0], ref[0]) and torch.equal(got[1], ref[1])
+    # Another map, or none, is another plan as well.
+    engine.build_plan(ids, layer.expert_map)
+    engine.run(u, ids, None)
+    assert not spy.flags[-1] & FLAG_EXTERNAL_PLAN
+    engine.build_plan(ids, layer.expert_map)
+    engine.discard_plan()
+    engine.run(u, ids, layer.expert_map)
+    assert not spy.flags[-1] & FLAG_EXTERNAL_PLAN
+
+
+@torch.inference_mode()
+def test_engine_plan_serves_the_large_batch_kernel_only(layer: _Layer) -> None:
+    engine = _engine(layer)
+    for t in (1, 4, MUSE_SMALL_MAX_TOKENS):
+        ids = _routing(t, 430)[1]
+        with pytest.raises(RuntimeError):
+            engine.build_plan(ids, layer.expert_map)
+    ids = _routing(MAX_LARGE_T + 1, 431)[1]
+    with pytest.raises(RuntimeError):
+        engine.build_plan(ids, layer.expert_map)
+    # A small batch run does not consume nor choke on a stale plan of a large one.
+    engine.build_plan(_routing(12, 432)[1], layer.expert_map)
+    u, ids, _ = _routing(4, 433)
+    engine.run(u, ids, layer.expert_map)
+    assert engine._plan_key is None
+
+
+@pytest.mark.parametrize("t", [9, 33, MAX_LARGE_T])
+@torch.inference_mode()
+def test_engine_takes_activations_quantized_ahead(
+    layer: _Layer, t: int, monkeypatch
+) -> None:
+    engine = _engine(layer)
+    spy = _Spy(monkeypatch)
+    u, ids, _ = _routing(t, 440 + t)
+    ref = _valid(*engine.run(u, ids, layer.expert_map))
+    engine.quantize_input(u)
+    engine.build_plan(ids, layer.expert_map)
+    got = _valid(*engine.run(u, ids, layer.expert_map))
+    assert spy.flags[-1] & FLAG_EXTERNAL_XQ and spy.flags[-1] & FLAG_EXTERNAL_PLAN
+    assert torch.equal(got[0], ref[0]) and torch.equal(got[1], ref[1])
+    # Other activations than the ones quantized: the kernel quantizes its own.
+    v = _routing(t, 441 + t)[0]
+    ref_v = _valid(*engine.run(v, ids, layer.expert_map))
+    engine.quantize_input(u)
+    got_v = _valid(*engine.run(v, ids, layer.expert_map))
+    assert not spy.flags[-1] & FLAG_EXTERNAL_XQ
+    assert torch.equal(got_v[0], ref_v[0]) and torch.equal(got_v[1], ref_v[1])
+    engine.quantize_input(u)
+    engine.discard_input()
+    engine.run(u, ids, layer.expert_map)
+    assert not spy.flags[-1] & FLAG_EXTERNAL_XQ
+
+
+@torch.inference_mode()
+def test_engine_input_scratch_is_the_large_batch_scratch(layer: _Layer) -> None:
+    engine = _engine(layer)
+    data, sf = engine.input_scratch(40)
+    assert data.shape == (40, H // 2) and sf.shape == (40, H // 16)
+    assert data.dtype == sf.dtype == torch.uint8
+    assert engine.input_scale.shape == (2,)
+    for t in (1, MUSE_SMALL_MAX_TOKENS, MAX_LARGE_T + 1):
+        with pytest.raises(RuntimeError):
+            engine.input_scratch(t)
+
+
+@pytest.mark.parametrize("pdl", [True, False], ids=["pdl", "no_pdl"])
+@pytest.mark.parametrize("t", [9, 16, 33, 64, MAX_LARGE_T])
+@torch.inference_mode()
+def test_engine_aux_stream_plan_in_a_graph_changes_nothing(
+    layer: _Layer, t: int, pdl: bool, monkeypatch
+) -> None:
+    """The plan queued on a side stream behind a routing stand-in, joined by an event,
+    as the model captures it: the replays give the rows of the plain launch."""
+    monkeypatch.setattr(muse_decode_moe, "muse_pdl_enabled", lambda: pdl)
+    engine = _engine(layer)
+    u = _routing(t, 450 + t)[0]
+    ids = _all_ids(t, 451 + t, layer.e_local)["three_local"]
+    ref = _valid(*engine.run(u, ids, layer.expert_map))
+    side = torch.cuda.Stream()
+    fork, join = torch.cuda.Event(), torch.cuda.Event()
+    routed = torch.empty_like(ids)
+
+    def body():
+        fork.record()
+        with torch.cuda.stream(side):
+            fork.wait()
+            routed.copy_(ids)  # the routing stand-in
+            engine.build_plan(routed, layer.expert_map)
+            join.record(side)
+        join.wait()
+        return engine.run(u, routed, layer.expert_map)
+
+    warm = torch.cuda.Stream()
+    warm.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warm):
+        body()
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        rows, perm = body()
+    for _ in range(4):
+        engine._scratch.plan.fill_(0x5A5A5A5A)
+        rows.zero_()
+        perm.fill_(-2)
+        graph.replay()
+        torch.accelerator.synchronize()
+        got = _valid(rows, perm)
+        assert torch.equal(got[0], ref[0]) and torch.equal(got[1], ref[1])
+
+
+# ------------------------------------------------------------------------------
+# The model and the runner: where the plan is built, and what drops it
+# ------------------------------------------------------------------------------
+@pytest.fixture
+def capturing(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+
+
+def _moe(aux=True, engine=True):
+    moe = object.__new__(model_ops.MuseSpark1xMoE)
+    torch.nn.Module.__init__(moe)
+    moe.experts = SimpleNamespace(has_muse_decode_engine=engine)
+    moe._routes_on_aux_stream = lambda n: aux
+    return moe
+
+
+@pytest.mark.parametrize("t", [1, 8, 9, 33, 64, 65, MAX_LARGE_T, MAX_LARGE_T + 1])
+def test_the_plan_is_built_for_the_large_batch_sizes_up_to_the_limit(
+    capturing, monkeypatch, t
+):
+    monkeypatch.setenv("VLLM_MUSE_SPARK_SM120_AUX_PLAN", "1")
+    monkeypatch.delenv("VLLM_MUSE_SPARK_SM120_AUX_PLAN_MAX_TOKENS", raising=False)
+    assert _moe()._builds_large_plan(t) is (8 < t <= 64)  # the default limit
+    monkeypatch.setenv("VLLM_MUSE_SPARK_SM120_AUX_PLAN_MAX_TOKENS", "128")
+    assert _moe()._builds_large_plan(t) is (8 < t <= MAX_LARGE_T)
+    monkeypatch.setenv("VLLM_MUSE_SPARK_SM120_AUX_PLAN_MAX_TOKENS", "16")
+    assert _moe()._builds_large_plan(t) is (8 < t <= 16)
+
+
+def test_the_plan_needs_the_flag_the_capture_the_aux_stream_and_the_engine(
+    capturing, monkeypatch
+):
+    monkeypatch.setenv("VLLM_MUSE_SPARK_SM120_AUX_PLAN", "1")
+    assert _moe()._builds_large_plan(64)
+    assert not _moe(aux=False)._builds_large_plan(64)
+    assert not _moe(engine=False)._builds_large_plan(64)
+    monkeypatch.setenv("VLLM_MUSE_SPARK_SM120_AUX_PLAN", "0")
+    assert not _moe()._builds_large_plan(64)
+    monkeypatch.setenv("VLLM_MUSE_SPARK_SM120_AUX_PLAN", "1")
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    assert not _moe()._builds_large_plan(64)
+
+
+def test_the_flag_is_off_by_default(monkeypatch):
+    monkeypatch.delenv("VLLM_MUSE_SPARK_SM120_AUX_PLAN", raising=False)
+    assert envs.VLLM_MUSE_SPARK_SM120_AUX_PLAN is False
+    monkeypatch.setenv("VLLM_MUSE_SPARK_SM120_AUX_PLAN", "1")
+    assert envs.VLLM_MUSE_SPARK_SM120_AUX_PLAN is True
+
+
+class _FakeRunner:
+    """Stands in for the MoE runner of ``_route_topk_and_pool``: records the stream of
+    its calls."""
+
+    def __init__(self, log):
+        self.log = log
+        self.has_muse_decode_engine = True
+
+    def select_experts(self, hidden, logits):
+        self.log.append(("select", torch.cuda.current_stream()))
+        w = torch.ones(hidden.shape[0], TOP_K, device=DEVICE)
+        ids = torch.zeros(hidden.shape[0], TOP_K, dtype=torch.int32, device=DEVICE)
+        return w, ids
+
+    def build_decode_plan(self, ids):
+        self.log.append(("plan", torch.cuda.current_stream(), ids))
+        return True
+
+
+def _routing_moe(log, builds):
+    moe = object.__new__(model_ops.MuseSpark1xMoE)
+    torch.nn.Module.__init__(moe)
+    moe.experts = _FakeRunner(log)
+    moe.use_mega_moe = False
+    moe.pooler = object()
+    moe.expert_prefetch = None
+    moe._router_aux_stream = torch.cuda.Stream()
+    moe._router_events = (torch.cuda.Event(), torch.cuda.Event())
+    moe._router_logits = lambda x: x
+    moe._pool_and_norm = lambda x: x
+    moe._builds_large_plan = lambda n: builds
+    moe.prefetches_experts = lambda n: False
+    return moe
+
+
+@pytest.mark.parametrize("builds", [True, False])
+def test_the_plan_is_built_on_the_aux_stream_right_behind_the_top_k(builds):
+    log = []
+    moe = _routing_moe(log, builds)
+    t = 32
+    x = torch.randn(t, 8, device=DEVICE)
+    pooled, w, ids = moe._route_topk_and_pool(x, x)
+    torch.accelerator.synchronize()
+    aux = moe._router_aux_stream
+    assert log[0][:2] == ("select", aux)
+    if builds:
+        assert log[1][:2] == ("plan", aux)
+        assert log[1][2] is ids  # the very ids the experts are given
+        assert len(log) == 2
+    else:
+        assert len(log) == 1
+
+
+class _RoutedRunner(model_ops.MuseMoERunner):
+    """A runner whose ``forward_routed`` reaches its (failing) modular experts."""
+
+    supports_routed_forward = True
+    moe_config = SimpleNamespace(hidden_dim=H)
+    _quant_method = SimpleNamespace(skip_forward_padding=False)
+
+    def _sequence_parallel_context(self):
+        return contextlib.nullcontext()
+
+
+def test_forward_routed_drops_a_plan_the_experts_did_not_take():
+    log = []
+    experts = object.__new__(MuseSparkSm120NvFp4Experts)
+    experts.use_muse_decode = True
+    experts.muse = SimpleNamespace(
+        discard_plan=lambda: log.append("discard_plan"),
+        discard_input=lambda: log.append("discard_input"),
+    )
+    quant_method = object.__new__(MuseSparkModelOptNvFp4FusedMoE)
+    quant_method.use_sm120_native = True
+    quant_method.moe_kernel = SimpleNamespace(fused_experts=experts)
+
+    def boom(**kwargs):
+        raise ValueError("boom")
+
+    runner = object.__new__(_RoutedRunner)
+    torch.nn.Module.__init__(runner)
+    runner.routed_experts = SimpleNamespace(
+        quant_method=quant_method,
+        _ensure_moe_quant_config_init=lambda: None,
+        forward_modular=boom,
+    )
+    x = torch.zeros(4, H, dtype=torch.bfloat16, device=DEVICE)
+    with pytest.raises(ValueError, match="boom"):
+        runner.forward_routed(x, x, x)
+    assert log == ["discard_plan", "discard_input"]
+
+
+def test_the_runner_builds_the_plan_through_the_native_experts():
+    calls = []
+    experts = object.__new__(MuseSparkSm120NvFp4Experts)
+    experts.prepare_routed_plan = lambda ids, emap: calls.append((ids, emap)) or True
+    quant_method = object.__new__(MuseSparkModelOptNvFp4FusedMoE)
+    quant_method.use_sm120_native = True
+    quant_method.moe_kernel = SimpleNamespace(fused_experts=experts)
+    runner = object.__new__(model_ops.MuseMoERunner)
+    torch.nn.Module.__init__(runner)
+    runner.routed_experts = SimpleNamespace(
+        quant_method=quant_method, expert_map="the map"
+    )
+    ids = torch.zeros(12, TOP_K, dtype=torch.int32, device=DEVICE)
+    assert runner.build_decode_plan(ids)
+    assert calls == [(ids, "the map")]
+    quant_method.use_sm120_native = False
+    assert not runner.build_decode_plan(ids)
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("t", [4, 8, 9, 64, MAX_LARGE_T, MAX_LARGE_T + 1])
+@pytest.mark.parametrize("capturing_now", [True, False])
+def test_the_experts_queue_a_plan_in_a_capture_for_the_large_batch_sizes_only(
+    monkeypatch, t, capturing_now
+):
+    queued = []
+    experts = object.__new__(MuseSparkSm120NvFp4Experts)
+    experts.use_muse_decode = True
+    experts.muse = SimpleNamespace(
+        max_tokens=MAX_LARGE_T,
+        build_plan=lambda ids, emap: queued.append((ids, emap)),
+    )
+    monkeypatch.setattr(sm120_nvfp4_moe, "_capturing", lambda: capturing_now)
+    ids = torch.zeros(t, TOP_K, dtype=torch.int32, device=DEVICE)
+    got = experts.prepare_routed_plan(ids, "map")
+    want = capturing_now and 8 < t <= MAX_LARGE_T
+    assert got is want
+    assert bool(queued) is want
+    experts.use_muse_decode = False
+    assert not experts.prepare_routed_plan(ids, "map")

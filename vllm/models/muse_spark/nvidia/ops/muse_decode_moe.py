@@ -66,6 +66,8 @@ MUSE_TOP_K = 8
 _FLAG_ZERO_NON_LOCAL = 4
 _FLAG_NO_PDL = 8
 _FLAG_LARGE_BULK_LOADER = 16  # only the large-batch op reads it
+_FLAG_LARGE_EXTERNAL_PLAN = 32  # the plan was built by build_plan (large-batch op)
+_FLAG_LARGE_EXTERNAL_XQ = 64  # the quantized activations are in the scratch (idem)
 # Scratch of the large-batch kernel: one row per route of the largest batch.
 _MAX_ROUTES = MUSE_MAX_TOKENS * MUSE_TOP_K
 
@@ -257,6 +259,11 @@ class MuseDecodeMoE:
         bulk_loader = envs.VLLM_MUSE_SPARK_SM120_LARGE_BULK_LOADER
         self._large_flags = _FLAG_LARGE_BULK_LOADER if bulk_loader else 0
         self._sources = self._pointers(w1, w1_scale, w2, w2_scale)
+        # The ids a ``build_plan`` queued the plan of, and the activations that were
+        # quantized into the scratch (``quantize_input``, or an external producer that
+        # calls ``mark_input_quantized``), until the next ``run`` takes them.
+        self._plan_key: tuple | None = None
+        self._xq_key: tuple | None = None
         # The first launch of each shape sets up its kernel (the shared memory
         # attribute), which must not happen during a CUDA graph capture.
         muse_c.load()
@@ -300,6 +307,9 @@ class MuseDecodeMoE:
             ).view(t_pad, MUSE_TOP_K)
             for ids_map in (None, expert_map):
                 self.run(hidden, ids, ids_map)
+                if t_pad > MUSE_SMALL_MAX_TOKENS:
+                    self.build_plan(ids, ids_map)
+                    self.run(hidden, ids, ids_map)
         torch.accelerator.synchronize()
         if bool(self._scratch.ctl.any()):
             raise RuntimeError("The muse decode kernel left its counters dirty.")
@@ -339,6 +349,83 @@ class MuseDecodeMoE:
             dump,
         )
 
+    @staticmethod
+    def _plan_key_of(topk_ids: torch.Tensor, expert_map: torch.Tensor | None) -> tuple:
+        return (
+            topk_ids.data_ptr(),
+            tuple(topk_ids.shape),
+            None if expert_map is None else expert_map.data_ptr(),
+        )
+
+    def build_plan(
+        self, topk_ids: torch.Tensor, expert_map: torch.Tensor | None
+    ) -> None:
+        """Queue the plan of the large-batch kernel (9 to ``max_tokens`` tokens) for ``topk_ids``.
+
+        The plan and the route -> row map depend on the ids and the expert map alone,
+        so the launch can run on another stream than ``run`` (the router's aux stream,
+        right behind the top-k): ``run`` then finds it prepared for the same ids and
+        skips building it. The stream of ``run`` must be ordered after this launch
+        (an event, or the join of the aux stream in a CUDA graph capture), and ``run``
+        for these ids must be the next call: the plan lives in the shared scratch.
+        """
+        num_tokens = topk_ids.shape[0]
+        if not MUSE_SMALL_MAX_TOKENS < num_tokens <= self.max_tokens:
+            raise RuntimeError(
+                f"The large-batch plan serves {MUSE_SMALL_MAX_TOKENS + 1}.."
+                f"{self.max_tokens} tokens, got {num_tokens}."
+            )
+        outputs = _get_large_outputs(self.device)
+        torch.ops._muse_C.nvfp4_decode_moe_plan(
+            topk_ids.to(torch.int32).contiguous(),
+            None if expert_map is None else expert_map.to(torch.int32).contiguous(),
+            self.num_local_experts,
+            outputs.perm_idx[: num_tokens * MUSE_TOP_K],
+            self._scratch.plan,
+            0 if muse_pdl_enabled() else _FLAG_NO_PDL,
+        )
+        self._plan_key = self._plan_key_of(topk_ids, expert_map)
+
+    def discard_plan(self) -> None:
+        """Forget a plan ``build_plan`` queued that no ``run`` took."""
+        self._plan_key = None
+
+    @property
+    def input_scale(self) -> torch.Tensor:
+        """The kernel's ``gs`` [2]; ``gs[0]`` is the global scale of the input
+        quantization (what ``quantize_input`` and an external producer must use)."""
+        return self._gs
+
+    def input_scratch(self, num_tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """The ``(codes [T, 2048] u8, scales [T, 256] u8)`` scratch of the large-batch
+        kernel's quantized input, for a producer that quantizes the activations itself
+        (``mark_input_quantized`` then tells ``run``)."""
+        if not MUSE_SMALL_MAX_TOKENS < num_tokens <= self.max_tokens:
+            raise RuntimeError(
+                f"The quantized input of the large-batch kernel serves "
+                f"{MUSE_SMALL_MAX_TOKENS + 1}..{self.max_tokens} tokens, got "
+                f"{num_tokens}."
+            )
+        return self._scratch.xq_data[:num_tokens], self._scratch.xq_sf[:num_tokens]
+
+    def quantize_input(self, hidden_states: torch.Tensor) -> None:
+        """Quantize ``hidden_states`` [T, 4096] bf16 (9 to ``max_tokens`` tokens) into the
+        scratch ahead of ``run``, which then skips its own quantization for these very
+        activations. The bytes are those of the preparation launch of ``run``."""
+        data, sf = self.input_scratch(hidden_states.shape[0])
+        torch.ops._muse_C.nvfp4_decode_act_quant(
+            hidden_states.contiguous(), self._gs, data, sf, muse_pdl_enabled()
+        )
+        self.mark_input_quantized(hidden_states)
+
+    def mark_input_quantized(self, hidden_states: torch.Tensor) -> None:
+        """Say that ``input_scratch`` holds the quantization of ``hidden_states`` with
+        ``input_scale[0]`` (written by the caller's own kernel, ordered before ``run``)."""
+        self._xq_key = (hidden_states.data_ptr(), tuple(hidden_states.shape))
+
+    def discard_input(self) -> None:
+        self._xq_key = None
+
     def run(
         self,
         hidden_states: torch.Tensor,
@@ -368,7 +455,33 @@ class MuseDecodeMoE:
         flags = self._flags | (0 if muse_pdl_enabled() else _FLAG_NO_PDL)
         scratch = self._scratch
         num_routes = num_tokens * MUSE_TOP_K
+        # A plan queued by ``build_plan`` is good for this call only, and only for the
+        # very ids and map it was built for.
+        plan_key, self._plan_key = self._plan_key, None
+        xq_key, self._xq_key = self._xq_key, None
         if num_tokens > MUSE_SMALL_MAX_TOKENS:
+            if xq_key is not None:
+                if xq_key == (hidden_states.data_ptr(), tuple(hidden_states.shape)):
+                    flags |= _FLAG_LARGE_EXTERNAL_XQ
+                else:
+                    logger.warning_once(
+                        "MuseSpark MoE: the activations quantized ahead of the "
+                        "large-batch muse kernel were other ones than it ran on; the "
+                        "kernel quantizes its own."
+                    )
+            if plan_key is not None:
+                if plan_key == self._plan_key_of(topk_ids, expert_map):
+                    flags |= _FLAG_LARGE_EXTERNAL_PLAN
+                    logger.info_once(
+                        "MuseSpark MoE: the plan of the large-batch muse kernel is "
+                        "built on the aux stream behind the top-k "
+                        "(VLLM_MUSE_SPARK_SM120_AUX_PLAN=1)."
+                    )
+                else:
+                    logger.warning_once(
+                        "MuseSpark MoE: the plan built on the aux stream was for other "
+                        "ids than the experts ran on; the kernel builds its own."
+                    )
             outputs = _get_large_outputs(self.device)
             rows = outputs.rows[:num_routes]
             perm_idx = outputs.perm_idx[:num_routes]

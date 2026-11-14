@@ -88,6 +88,7 @@ from vllm.models.muse_spark.nvidia.ops.b12x_decode_moe import (
 from vllm.models.muse_spark.nvidia.ops.expert_prefetch import EXPERT_PREFETCH_CTAS
 from vllm.models.muse_spark.nvidia.ops.muse_decode_moe import (
     EXPERT_PREFETCH_MAX_TOKENS,
+    MUSE_SMALL_MAX_TOKENS,
     MuseDecodeMoE,
     mark_muse_setup_failed,
     muse_shape_mismatch,
@@ -862,6 +863,29 @@ class MuseSparkSm120NvFp4Experts(mk.FusedMoEExpertsModular):
             pdl=muse_pdl_enabled(),
         )
         return True
+
+    def prepare_routed_plan(
+        self, topk_ids: torch.Tensor, expert_map: torch.Tensor | None
+    ) -> bool:
+        """Queue the plan of the large-batch muse kernel for ``topk_ids``.
+
+        Meant for the router's aux stream, right behind the top-k, in a CUDA graph
+        capture that goes on to call ``apply`` with the same ids (and the same map):
+        the launch of the kernel then does not build the plan itself. It does nothing
+        where ``apply`` would not run the large-batch muse kernel. Returns whether a
+        plan was queued; ``discard_prepared_plan`` drops one that ``apply`` did not take.
+        """
+        if not (self.use_muse_decode and self.muse is not None and _capturing()):
+            return False
+        if not MUSE_SMALL_MAX_TOKENS < topk_ids.shape[0] <= self.muse.max_tokens:
+            return False
+        self.muse.build_plan(topk_ids, expert_map)
+        return True
+
+    def discard_prepared_plan(self) -> None:
+        if self.muse is not None:
+            self.muse.discard_plan()
+            self.muse.discard_input()
 
     def _apply_muse(
         self,

@@ -100,6 +100,11 @@ constexpr int kFlagNoPdl = 8;           // no PDL: K2 / k_persistent are plain l
 // Large-batch kernel: the loader warp fetches the B operand with one bulk copy per
 // column and K half instead of a cp.async per 16 bytes (same bytes in shared memory).
 constexpr int kFlagLargeBulkLoader = 16;
+// Large-batch kernel: the plan was built earlier by nvfp4_decode_moe_plan (on any
+// stream the launch is ordered after), and / or the activations are already quantized
+// into xq_data / xq_sf (see muse_nvfp4_decode_large.cuh).
+constexpr int kFlagLargeExternalPlan = 32;
+constexpr int kFlagLargeExternalXq = 64;
 
 // ---- shared memory layout ---------------------------------------------------
 #ifndef MUSE_DECODE_STAGES
@@ -943,6 +948,8 @@ void launch_persistent(const DecodeParams& p, int grid, cudaStream_t stream) {
 }
 
 // Large batches: k_prep, then the persistent kernel as its programmatic dependent.
+// k_prep has a CTA for the plan and one per 32 token rows, each left out when its
+// product is external; with neither there is no k_prep.
 template <bool BULK>
 void launch_large_kernels(const DecodeParams& p, int grid, cudaStream_t stream) {
   static std::atomic<int> attr{0};
@@ -952,13 +959,18 @@ void launch_large_kernels(const DecodeParams& p, int grid, cudaStream_t stream) 
                 "fit the shared memory of an SM120 block (MUSE_LARGE_COLS, "
                 "MUSE_LARGE_STAGES)");
   ensure_smem_checked(k_persistent<kLargeMaxTokens, true, BULK>, kSmem, attr);
-  const int prep_grid = 1 + (p.T + kPrepRowsPerCta - 1) / kPrepRowsPerCta;
+  const int plan_ctas = (p.flags & kFlagLargeExternalPlan) ? 0 : 1;
+  const int quant_ctas =
+      (p.flags & kFlagLargeExternalXq) ? 0 : (p.T + kPrepRowsPerCta - 1) / kPrepRowsPerCta;
+  const int prep_grid = plan_ctas + quant_ctas;
   if (!(p.flags & kFlagNoPdl)) {
-    launch_dependent(k_prep, p, prep_grid, 0, stream, kPrepThreads);
+    if (prep_grid > 0) launch_dependent(k_prep, p, prep_grid, 0, stream, kPrepThreads);
     launch_dependent(k_persistent<kLargeMaxTokens, true, BULK>, p, grid, kSmem, stream);
   } else {
-    k_prep<<<prep_grid, kPrepThreads, 0, stream>>>(p);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    if (prep_grid > 0) {
+      k_prep<<<prep_grid, kPrepThreads, 0, stream>>>(p);
+      C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
     k_persistent<kLargeMaxTokens, true, BULK><<<grid, kBlockThreads, kSmem, stream>>>(p);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
@@ -1198,23 +1210,91 @@ void nvfp4_decode_moe_large(
   launch_large(p, grid, stream);
 }
 
+void nvfp4_decode_moe_plan(at::Tensor const& topk_ids,
+                           std::optional<at::Tensor> const& expert_map,
+                           int64_t num_local, at::Tensor& perm_idx,
+                           at::Tensor& plan, int64_t flags) {
+  const int64_t T = topk_ids.size(0);
+  const int64_t num_routes = T * kTopK;
+  check_tensor(topk_ids, at::kInt, "topk_ids", {-1, kTopK});
+  TORCH_CHECK(T >= 1 && T <= kLargeMaxTokens, "token count ", T, " is outside 1..",
+              kLargeMaxTokens);
+  TORCH_CHECK(num_local >= 1 && num_local <= kLargeMaxLocal, "the rank holds ",
+              num_local, " experts, the large-batch kernel takes 1..", kLargeMaxLocal);
+  check_tensor(perm_idx, at::kInt, "perm_idx", {num_routes});
+  check_tensor(plan, at::kInt, "plan", {-1});
+  TORCH_CHECK(plan.numel() * 4 >= static_cast<int64_t>(sizeof(PlanLarge)),
+              "plan scratch is too small");
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(plan.data_ptr()) % 16 == 0,
+              "the plan scratch must be 16-byte aligned");
+
+  DecodeParams p{};
+  p.topk_ids = reinterpret_cast<const int*>(topk_ids.data_ptr());
+  p.expert_map = nullptr;
+  p.num_global = 0;
+  if (expert_map.has_value()) {
+    check_tensor(*expert_map, at::kInt, "expert_map", {-1});
+    p.expert_map = reinterpret_cast<const int*>(expert_map->data_ptr());
+    p.num_global = static_cast<int>(expert_map->size(0));
+  }
+  p.num_local = static_cast<int>(num_local);
+  p.perm_idx = reinterpret_cast<int*>(perm_idx.data_ptr());
+  p.plan = reinterpret_cast<int*>(plan.data_ptr());
+  p.flags = static_cast<int>(flags & 0xffff);
+  p.T = static_cast<int>(T);
+  p.num_perm = static_cast<int>(num_routes);
+
+  const c10::cuda::OptionalCUDAGuard guard(topk_ids.device());
+  cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+  if (!(p.flags & kFlagNoPdl)) {
+    launch_dependent(k_plan, p, 1, 0, stream, kPrepThreads);
+  } else {
+    k_plan<<<1, kPrepThreads, 0, stream>>>(p);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+}
+
 void nvfp4_decode_act_quant(at::Tensor const& hidden, at::Tensor const& gs,
-                            at::Tensor& data, at::Tensor& sf) {
+                            at::Tensor& data, at::Tensor& sf, bool pdl) {
   const int64_t T = hidden.size(0);
   check_tensor(hidden, at::kBFloat16, "hidden", {-1, kHidden});
   check_tensor(gs, at::kFloat, "gs", {-1});
   check_tensor(data, at::kByte, "data", {T, kHidden / 2});
   check_tensor(sf, at::kByte, "sf", {T, kSfCols});
-  TORCH_CHECK(T >= 1 && T <= 8, "at most 8 tokens");
+  TORCH_CHECK(T >= 1 && T <= kLargeMaxTokens, "at most ", kLargeMaxTokens, " tokens");
   const c10::cuda::OptionalCUDAGuard guard(hidden.device());
   cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
-  const int smem = static_cast<int>(T) * kXqBytes;
-  act_quant_kernel<128><<<1, 128, smem, stream>>>(
-      reinterpret_cast<const __nv_bfloat16*>(hidden.data_ptr()),
-      reinterpret_cast<const float*>(gs.data_ptr()), static_cast<int>(T),
-      reinterpret_cast<uint8_t*>(data.data_ptr()),
-      reinterpret_cast<uint8_t*>(sf.data_ptr()));
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  if (T <= 8) {
+    TORCH_CHECK(!pdl, "the small-batch quantization has no programmatic launch");
+    const int smem = static_cast<int>(T) * kXqBytes;
+    act_quant_kernel<128><<<1, 128, smem, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(hidden.data_ptr()),
+        reinterpret_cast<const float*>(gs.data_ptr()), static_cast<int>(T),
+        reinterpret_cast<uint8_t*>(data.data_ptr()),
+        reinterpret_cast<uint8_t*>(sf.data_ptr()));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return;
+  }
+  // More than 8 tokens: the quantizing CTAs of the large-batch preparation launch on
+  // their own, so the bytes are those that launch writes (one warp per row).
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(data.data_ptr()) % 16 == 0 &&
+                  reinterpret_cast<uintptr_t>(sf.data_ptr()) % 16 == 0 &&
+                  reinterpret_cast<uintptr_t>(hidden.data_ptr()) % 16 == 0,
+              "the activations and their quantized scratch must be 16-byte aligned");
+  DecodeParams p{};
+  p.hidden = reinterpret_cast<const __nv_bfloat16*>(hidden.data_ptr());
+  p.gs = reinterpret_cast<const float*>(gs.data_ptr());
+  p.xq_buf = reinterpret_cast<uint8_t*>(data.data_ptr());
+  p.xq_sf_buf = reinterpret_cast<uint8_t*>(sf.data_ptr());
+  p.flags = kFlagLargeExternalPlan;
+  p.T = static_cast<int>(T);
+  const int grid = (p.T + kPrepRowsPerCta - 1) / kPrepRowsPerCta;
+  if (pdl) {
+    launch_dependent(k_prep, p, grid, 0, stream, kPrepThreads);
+  } else {
+    k_prep<<<grid, kPrepThreads, 0, stream>>>(p);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
 }
 
 }  // namespace muse_spark

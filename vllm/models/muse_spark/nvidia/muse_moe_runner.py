@@ -1109,6 +1109,28 @@ class MuseMoERunner(MoERunner):
             topk_ids, self.routed_experts.expert_map, budget_bytes
         )
 
+    def build_decode_plan(self, topk_ids: torch.Tensor) -> bool:
+        """Queue the plan of the large-batch muse kernel for ``topk_ids`` (the ids that
+        ``forward_routed`` goes on to run), on the stream that is current.
+
+        Meant for the router's aux stream, right behind the top-k. Only the SM120
+        native NVFP4 experts with the muse decode engine have a plan to build; it does
+        nothing for any other. Returns whether a plan was queued (``forward_routed``
+        drops one that the experts did not take).
+        """
+        experts = self._sm120_native_experts()
+        if experts is None:
+            return False
+        return experts.prepare_routed_plan(topk_ids, self.routed_experts.expert_map)
+
+    def discard_prepared_decode_inputs(self) -> None:
+        """Drop a plan (``build_decode_plan``) and a quantized input
+        (``norm_quant_decode_input``) that the experts did not take: they are for one
+        call of the experts only."""
+        experts = self._sm120_native_experts()
+        if experts is not None:
+            experts.discard_prepared_plan()
+
     @property
     def _prepared_nvfp4_experts(self) -> MuseSparkTrtLlmNvFp4Experts | None:
         quant_method = self.routed_experts.quant_method
@@ -1272,10 +1294,13 @@ class MuseMoERunner(MoERunner):
             or self._quant_method.skip_forward_padding
         ), "forward_routed does not pad the expert input"
         self.routed_experts._ensure_moe_quant_config_init()
-        with self._sequence_parallel_context():
-            output = self.routed_experts.forward_modular(
-                x=hidden_states, topk_weights=topk_weights, topk_ids=topk_ids
-            )
+        try:
+            with self._sequence_parallel_context():
+                output = self.routed_experts.forward_modular(
+                    x=hidden_states, topk_weights=topk_weights, topk_ids=topk_ids
+                )
+        finally:
+            self.discard_prepared_decode_inputs()
         assert isinstance(output, torch.Tensor)
         return self._maybe_reduce_final_output(
             output, None, self._fused_output_is_reduced

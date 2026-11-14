@@ -148,6 +148,7 @@ from vllm.models.muse_spark.nvidia.ops.mnnvl_fusions import (
 from vllm.models.muse_spark.nvidia.ops.muse_decode_moe import (
     EXPERT_PREFETCH_MAX_TOKENS,
     MUSE_MAX_TOKENS,
+    MUSE_SMALL_MAX_TOKENS,
 )
 from vllm.models.muse_spark.nvidia.ops.prepare_megamoe_nvfp4 import (
     prepare_megamoe_nvfp4_with_norm,
@@ -1473,6 +1474,25 @@ class MuseSpark1xMoE(nn.Module):
             and cast(MuseMoERunner, self.experts).has_muse_decode_engine
         )
 
+    def _builds_large_plan(self, num_tokens: int) -> bool:
+        """Whether the routing on the aux stream also builds the plan of the muse
+        large-batch kernel (``VLLM_MUSE_SPARK_SM120_AUX_PLAN``).
+
+        Only in a CUDA graph capture of a padded batch of ``MUSE_SMALL_MAX_TOKENS + 1`` to
+        ``VLLM_MUSE_SPARK_SM120_AUX_PLAN_MAX_TOKENS`` (at most ``MUSE_MAX_TOKENS``) tokens,
+        where the routing runs on the aux stream and the layer's experts are on the muse
+        decode kernel: that kernel builds the plan in its own preparation launch otherwise.
+        """
+        return (
+            envs.VLLM_MUSE_SPARK_SM120_AUX_PLAN
+            and torch.cuda.is_current_stream_capturing()
+            and MUSE_SMALL_MAX_TOKENS
+            < num_tokens
+            <= min(MUSE_MAX_TOKENS, envs.VLLM_MUSE_SPARK_SM120_AUX_PLAN_MAX_TOKENS)
+            and self._routes_on_aux_stream(num_tokens)
+            and cast(MuseMoERunner, self.experts).has_muse_decode_engine
+        )
+
     def _router_logits(self, router_input: torch.Tensor) -> torch.Tensor:
         """The router logits: the ``_muse_C`` decode GEMV where it serves the batch."""
         weight = self.router.weight
@@ -1550,15 +1570,22 @@ class MuseSpark1xMoE(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Overlap the full routing chain with the expert input projection."""
 
+        builds_plan = self._builds_large_plan(hidden_states.shape[0])
+
         def route() -> tuple[torch.Tensor, torch.Tensor]:
             logits = self._router_logits(router_input)
             if self.use_mega_moe:
                 return self.moe_router._compute_routing(
                     hidden_states, logits, torch.int32
                 )
-            return cast(MuseMoERunner, self.experts).select_experts(
+            routed = cast(MuseMoERunner, self.experts).select_experts(
                 hidden_states, logits
             )
+            if builds_plan:
+                # Right behind the top-k, on the aux stream: the experts find the plan
+                # of the large-batch kernel ready when the aux stream joins.
+                cast(MuseMoERunner, self.experts).build_decode_plan(routed[1])
+            return routed
 
         if self.pooler is None:
             weights, ids = route()
@@ -1781,20 +1808,13 @@ class MuseSpark1xMoE(nn.Module):
         )
         return self.experts.forward_prepared_nvfp4(a1q, a1q_scale, routing)
 
-    def _routed_forward(
+    def _run_experts(
         self,
         hidden_states: torch.Tensor,
-        router_input: torch.Tensor | None = None,
-        defer_column_gather: bool = False,
-    ) -> torch.Tensor | MuseSpark1xUnpoolerInput:
-        num_tokens = hidden_states.shape[0]
-        if self.use_sequence_parallel_moe:
-            hidden_states = sequence_parallel_chunk(hidden_states)
-            if router_input is not None:
-                router_input = sequence_parallel_chunk(router_input)
-        if router_input is None:
-            router_input = hidden_states
-
+        router_input: torch.Tensor,
+        num_tokens: int,
+    ) -> torch.Tensor:
+        """The routing, the pooler and the experts of the layer."""
         if self._can_fuse_megamoe_inputs(hidden_states):
             experts_out = self._stage_megamoe_inputs(hidden_states, router_input)
         elif self._prepares_nvfp4_inputs(num_tokens):
@@ -1819,6 +1839,29 @@ class MuseSpark1xMoE(nn.Module):
                 hidden_states=hidden_states,
                 router_logits=router_logits,
             )
+        return experts_out
+
+    def _routed_forward(
+        self,
+        hidden_states: torch.Tensor,
+        router_input: torch.Tensor | None = None,
+        defer_column_gather: bool = False,
+    ) -> torch.Tensor | MuseSpark1xUnpoolerInput:
+        num_tokens = hidden_states.shape[0]
+        if self.use_sequence_parallel_moe:
+            hidden_states = sequence_parallel_chunk(hidden_states)
+            if router_input is not None:
+                router_input = sequence_parallel_chunk(router_input)
+        if router_input is None:
+            router_input = hidden_states
+
+        try:
+            experts_out = self._run_experts(hidden_states, router_input, num_tokens)
+        finally:
+            # A plan or a quantized input prepared for the muse large-batch kernel is for
+            # one call of the experts only.
+            if isinstance(self.experts, MuseMoERunner):
+                self.experts.discard_prepared_decode_inputs()
 
         if defer_column_gather:
             return self._deferred_unpooler_columns(experts_out)

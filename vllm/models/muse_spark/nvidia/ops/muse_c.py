@@ -508,9 +508,24 @@ def _register_decode_fakes() -> None:
     ) -> None:
         return None
 
+    @torch.library.register_fake("_muse_C::nvfp4_decode_moe_plan")
+    def _nvfp4_decode_moe_plan_fake(
+        topk_ids: torch.Tensor,
+        expert_map: torch.Tensor | None,
+        num_local: int,
+        perm_idx: torch.Tensor,
+        plan: torch.Tensor,
+        flags: int = 0,
+    ) -> None:
+        return None
+
     @torch.library.register_fake("_muse_C::nvfp4_decode_act_quant")
     def _nvfp4_decode_act_quant_fake(
-        hidden: torch.Tensor, gs: torch.Tensor, data: torch.Tensor, sf: torch.Tensor
+        hidden: torch.Tensor,
+        gs: torch.Tensor,
+        data: torch.Tensor,
+        sf: torch.Tensor,
+        pdl: bool = False,
     ) -> None:
         return None
 

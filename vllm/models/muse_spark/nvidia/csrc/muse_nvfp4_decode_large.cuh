@@ -21,6 +21,16 @@
 // It is a programmatic dependent of the kernel before it (the routing kernel, or
 // the pre-expert norm) and lets the persistent kernel launch right away; that
 // kernel waits for this one to finish before it reads the plan or the scratch.
+//
+// The two halves can be taken out of this launch (flags of the large-batch op):
+//   * kFlagLargeExternalPlan: the plan was built earlier by k_plan (the op
+//     nvfp4_decode_moe_plan: CTA 0 of this kernel on its own, which depends on the
+//     top-k ids only, so it can run on the router's aux stream beside the pooler);
+//     k_prep then has the quantizing CTAs only;
+//   * kFlagLargeExternalXq: the caller quantized the activations into the scratch
+//     (the same bytes, see nvfp4_decode_act_quant); k_prep then has no
+//     quantizing CTAs. With both flags there is no k_prep, and the persistent
+//     kernel is the programmatic dependent of the kernel before it.
 
 constexpr int kPrepThreads = 1024;
 constexpr int kPrepRowsPerCta = kPrepThreads / 32;
@@ -43,7 +53,37 @@ __device__ __forceinline__ int prep_block_scan(int value, int* warp_sums) {
   return value + prefix;
 }
 
-__global__ void __launch_bounds__(kPrepThreads, 1) k_prep(const DecodeParams p) {
+// One warp quantizes one token row of the activations into the scratch.
+__device__ __forceinline__ void prep_quantize_row(const DecodeParams& p, int row) {
+  const int lane = threadIdx.x & 31;
+  // The row is 512 vectors of 8 elements, a warp takes 32 of them at a time;
+  // 8 loads in flight per lane keep the registers inside the 1024-thread limit.
+  constexpr int kBatch = 8;
+  const float gs0 = p.gs[0];
+  uint8_t* codes = p.xq_buf + static_cast<size_t>(row) * kRowBytes;
+  uint8_t* sf = p.xq_sf_buf + static_cast<size_t>(row) * kSfCols;
+#pragma unroll
+  for (int b = 0; b < 512 / 32 / kBatch; ++b) {
+    PackedVec<__nv_bfloat16> vec[kBatch];
+#pragma unroll
+    for (int i = 0; i < kBatch; ++i) {
+      vec[i] = *reinterpret_cast<const PackedVec<__nv_bfloat16>*>(
+          p.hidden + static_cast<size_t>(row) * kHidden +
+          ((b * kBatch + i) * 32 + lane) * 8);
+    }
+#pragma unroll
+    for (int i = 0; i < kBatch; ++i) {
+      const int idx = (b * kBatch + i) * 32 + lane;  // 8-element vector of the row
+      uint8_t* sf_out = (lane & 1) ? nullptr : sf + (idx >> 1);
+      const uint32_t c = cvt_warp_fp16_to_fp4<__nv_bfloat16, 2>(vec[i], gs0, sf_out);
+      *reinterpret_cast<uint32_t*>(codes + idx * 4) = c;
+    }
+  }
+}
+
+// The plan of the layer and the route -> row map, built by one block of kPrepThreads
+// threads from the top-k ids (and the expert map) alone.
+__device__ __forceinline__ void prep_build_plan(const DecodeParams& p) {
   __shared__ __align__(16) uint8_t wc[kLargeMaxLocal][32];  // routes of expert, warp
   __shared__ int count_of[kLargeMaxLocal];
   __shared__ int entry_end[kLargeMaxLocal];   // inclusive scan of the entry counts
@@ -54,43 +94,6 @@ __global__ void __launch_bounds__(kPrepThreads, 1) k_prep(const DecodeParams p) 
   const int tid = threadIdx.x;
   const int warp = tid >> 5;
   const int lane = tid & 31;
-
-  // The persistent kernel may launch now: it waits for this kernel to complete
-  // before it reads anything this kernel writes.
-  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
-  // The ids and the activations come from the kernels before this one.
-  asm volatile("griddepcontrol.wait;" ::: "memory");
-
-  if (blockIdx.x > 0) {
-    const int row = (blockIdx.x - 1) * kPrepRowsPerCta + warp;
-    if (row >= p.T) return;
-    // The row is 512 vectors of 8 elements, a warp takes 32 of them at a time;
-    // 8 loads in flight per lane keep the registers inside the 1024-thread limit.
-    constexpr int kBatch = 8;
-    const float gs0 = p.gs[0];
-    uint8_t* codes = p.xq_buf + static_cast<size_t>(row) * kRowBytes;
-    uint8_t* sf = p.xq_sf_buf + static_cast<size_t>(row) * kSfCols;
-#pragma unroll
-    for (int b = 0; b < 512 / 32 / kBatch; ++b) {
-      PackedVec<__nv_bfloat16> vec[kBatch];
-#pragma unroll
-      for (int i = 0; i < kBatch; ++i) {
-        vec[i] = *reinterpret_cast<const PackedVec<__nv_bfloat16>*>(
-            p.hidden + static_cast<size_t>(row) * kHidden +
-            ((b * kBatch + i) * 32 + lane) * 8);
-      }
-#pragma unroll
-      for (int i = 0; i < kBatch; ++i) {
-        const int idx = (b * kBatch + i) * 32 + lane;  // 8-element vector of the row
-        uint8_t* sf_out = (lane & 1) ? nullptr : sf + (idx >> 1);
-        const uint32_t c = cvt_warp_fp16_to_fp4<__nv_bfloat16, 2>(vec[i], gs0, sf_out);
-        *reinterpret_cast<uint32_t*>(codes + idx * 4) = c;
-      }
-    }
-    return;
-  }
-
-  // ---- CTA 0: the plan ----
   PlanLarge* const plan = reinterpret_cast<PlanLarge*>(p.plan);
   const int num_routes = p.T * kTopK;
   int l = -1;  // local expert of route `tid`, or -1
@@ -158,4 +161,32 @@ __global__ void __launch_bounds__(kPrepThreads, 1) k_prep(const DecodeParams p) 
     }
     p.perm_idx[tid] = l >= 0 ? tid : -1;
   }
+}
+
+// The preparation launch: CTA 0 builds the plan (unless kFlagLargeExternalPlan), the
+// other CTAs quantize the activations (unless kFlagLargeExternalXq).
+__global__ void __launch_bounds__(kPrepThreads, 1) k_prep(const DecodeParams p) {
+  // The persistent kernel may launch now: it waits for this kernel to complete
+  // before it reads anything this kernel writes.
+  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+  // The ids and the activations come from the kernels before this one.
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+
+  const bool builds_plan = !(p.flags & kFlagLargeExternalPlan);
+  if (builds_plan && blockIdx.x == 0) {
+    prep_build_plan(p);
+    return;
+  }
+  const int row = (blockIdx.x - (builds_plan ? 1 : 0)) * kPrepRowsPerCta +
+                  (threadIdx.x >> 5);
+  if (row < p.T) prep_quantize_row(p, row);
+}
+
+// The plan on its own (nvfp4_decode_moe_plan), for a stream that has the top-k ids
+// before the activations are ready: one block, no programmatic dependents.
+__global__ void __launch_bounds__(kPrepThreads, 1) k_plan(const DecodeParams p) {
+  // The ids come from the kernel before this one (a programmatic predecessor when
+  // the launch is one; a no-op otherwise).
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+  prep_build_plan(p);
 }
