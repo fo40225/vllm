@@ -57,6 +57,7 @@ from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
@@ -87,6 +88,7 @@ from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather_columns,
     sp_reduce_scatter,
     sp_shard,
+    tp_reduce_scatter_matches_all_reduce,
 )
 from vllm.models.muse_spark.common.layers import (  # noqa: F401 re-exported
     MulTanhSoftCap,
@@ -380,6 +382,10 @@ def is_sequence_parallel_enabled(vllm_config: VllmConfig) -> bool:
     )
 
 
+# The backends known to give the SM120 stream modular experts.
+_AUTO_SP_MOE_BACKENDS = ("auto", "cutlass")
+
+
 def _on_sm120() -> bool:
     return (
         current_platform.is_cuda() and current_platform.is_device_capability_family(120)
@@ -413,20 +419,50 @@ def _sm120_sequence_parallel_blocker(vllm_config: VllmConfig) -> str | None:
 
 
 def is_sm120_sequence_parallel_enabled(vllm_config: VllmConfig) -> bool:
-    """Whether large prefill batches shard the stream along the sequence on SM120.
+    """Whether large prefill batches may shard the stream along the sequence on SM120.
 
-    Opt-in. The stream is sharded only for batches of at least
-    ``sm120_sequence_parallel_min_tokens``; the experts still see every token,
+    ``VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL=1`` shards every batch of at least
+    ``sm120_sequence_parallel_min_tokens`` and ``0`` never does. Unset (auto), the
+    stream is sharded only where that cannot change a bit: the TP communicator
+    must guarantee that reduce-scatter + all-gather equals its all-reduce, and
+    ``_SequenceParallelRowGate`` then admits the batch sizes whose row-sharded
+    projections equal the replicated ones. The experts still see every token,
     through the same runner as the replicated stream.
     """
-    if not envs.VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL:
+    setting = envs.VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL
+    if setting is False:
         return False
     blocker = _sm120_sequence_parallel_blocker(vllm_config)
+    if setting is None:
+        # Not a request: stay silent where it cannot apply. Another backend may
+        # hand the routing to monolithic experts, which the stream cannot feed.
+        return (
+            blocker is None
+            and vllm_config.kernel_config.moe_backend in _AUTO_SP_MOE_BACKENDS
+            and tp_reduce_scatter_matches_all_reduce()
+        )
     if blocker is not None:
         logger.warning_once(
             "VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL is set but ignored: %s.", blocker
         )
     return blocker is None
+
+
+def sm120_sequence_parallel_is_gated() -> bool:
+    """Whether the sharded stream takes only the batch sizes the row gate verifies."""
+    return envs.VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL is None
+
+
+def _sequence_parallel_active(
+    enabled: bool,
+    num_tokens: int,
+    min_tokens: int | None,
+    row_gate: Callable[[int], bool] | None,
+) -> bool:
+    """``is_sequence_parallel_active`` plus the SM120 batch-size gate, if any."""
+    return is_sequence_parallel_active(enabled, num_tokens, min_tokens) and (
+        row_gate is None or row_gate(num_tokens)
+    )
 
 
 def sm120_sequence_parallel_min_tokens(vllm_config: VllmConfig) -> int:
@@ -461,6 +497,100 @@ def _fp32_split_k_reduction() -> Iterator[None]:
         yield
     finally:
         matmul.allow_bf16_reduced_precision_reduction = previous
+
+
+class _SequenceParallelRowGate:
+    """Whether a batch of ``num_tokens`` takes the sharded stream without a changed bit.
+
+    The sharded stream runs the pooler, the unpooler and the fp32 router on
+    ``ceil(T / tp)`` rows where the replicated stream runs them on T rows. cuBLAS
+    picks its kernel per M, and a kernel that splits K sums the slices in another
+    order (the default settings even round them to bf16), so the rows of the two
+    agree bit for bit only at the sizes where both calls take the same split. Of
+    the 1992 sizes from 512 to 16384 tokens in steps of 8, 100 pass on 8 RTX PRO
+    6000 (4104-4224, 5312-5472, 6920-7168 and 8008-8224: among them the full
+    8192-token prefill chunk and the chunks that decode tokens fill up), and at the
+    others up to 95% of the router logits differ in the last bit. The kernel choice depends on the shapes and not on the values, so the
+    check runs the three projections of one layer on random inputs of the real
+    shapes, once per batch size, and compares the rows. Every other op of the
+    sharded stream is a row-wise kernel of fixed configuration (identical at any
+    size) or a collective with the guarantee ``tp_reduce_scatter_matches_all_reduce``
+    asks for.
+    """
+
+    # Admitted sizes that are logged at info level; the rest at debug level.
+    _ANNOUNCED = 4
+
+    def __init__(self, feed_forward: "MuseSpark1xMoE") -> None:
+        self._feed_forward = feed_forward
+        self._verdicts: dict[int, bool] = {}
+
+    def __call__(self, num_tokens: int) -> bool:
+        verdict = self._verdicts.get(num_tokens)
+        if verdict is None:
+            verdict = self._agreed(self._rows_match(num_tokens))
+            announce = verdict and sum(self._verdicts.values()) < self._ANNOUNCED
+            self._verdicts[num_tokens] = verdict
+            (logger.info if announce else logger.debug)(
+                "MuseSpark SM120 sequence parallel: batches of %d tokens %s.",
+                num_tokens,
+                "shard the stream (the sharded projections are bitwise the "
+                "replicated ones)"
+                if verdict
+                else "stay replicated (the sharded projections are not bitwise "
+                "the replicated ones)",
+            )
+        return verdict
+
+    @staticmethod
+    def _agreed(verdict: bool) -> bool:
+        """The verdict of the whole TP group, whose ranks must take one branch."""
+        group = get_tp_group()
+        if group.world_size == 1:
+            return verdict
+        flag = torch.tensor([int(verdict)], dtype=torch.int32)
+        torch.distributed.all_reduce(
+            flag, op=torch.distributed.ReduceOp.MIN, group=group.cpu_group
+        )
+        return bool(flag.item())
+
+    @torch.no_grad()
+    def _rows_match(self, num_tokens: int) -> bool:
+        feed_forward = self._feed_forward
+        tp_size = feed_forward.tp_size
+        rows = cdiv(num_tokens, tp_size)
+        for layer in (
+            feed_forward.pooler,
+            feed_forward.unpooler,
+            feed_forward.router,
+        ):
+            assert layer is not None
+            weight = layer.weight
+            generator = torch.Generator(device=weight.device)
+            generator.manual_seed(0)
+            x = torch.empty(
+                rows * tp_size,
+                weight.shape[1],
+                dtype=weight.dtype,
+                device=weight.device,
+            ).normal_(generator=generator)
+            full = self._project(layer, x[:num_tokens])
+            for rank in range(tp_size):
+                valid = min(rows, num_tokens - rank * rows)
+                if valid <= 0:
+                    break
+                # As forward_sequence_parallel runs the pooler and the unpooler.
+                with _fp32_split_k_reduction():
+                    local = self._project(layer, x[rank * rows : (rank + 1) * rows])
+                start = rank * rows
+                if not torch.equal(full[start : start + valid], local[:valid]):
+                    return False
+        return True
+
+    @staticmethod
+    def _project(layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
+        out = layer(x)
+        return out[0] if isinstance(out, tuple) else out
 
 
 class MuseSpark1xMoE(nn.Module):
@@ -1343,6 +1473,7 @@ class MuseSpark1xAttention(nn.Module):
         self.is_sequence_parallel_output = False
         # Smallest batch that shards the stream; None: one token per rank.
         self.sp_min_tokens: int | None = None
+        self.sp_row_gate: Callable[[int], bool] | None = None
         self.gemm_rs = None
 
         # get_rope shares one instance (and its cos/sin cache, ~256 MiB in
@@ -1538,8 +1669,11 @@ class MuseSpark1xAttention(nn.Module):
         return self._project_output(attn_output)
 
     def _project_output(self, attn_output: torch.Tensor) -> torch.Tensor:
-        sp_active = is_sequence_parallel_active(
-            self.is_sequence_parallel_output, attn_output.shape[0], self.sp_min_tokens
+        sp_active = _sequence_parallel_active(
+            self.is_sequence_parallel_output,
+            attn_output.shape[0],
+            self.sp_min_tokens,
+            self.sp_row_gate,
         )
         if (
             sp_active
@@ -1681,6 +1815,8 @@ class MuseSpark1xDecoderLayer(nn.Module):
         self.is_sequence_parallel_input = self.is_sequence_parallel
         self.self_attn.is_sequence_parallel_output = self.is_sequence_parallel
         self.self_attn.sp_min_tokens = self.sp_min_tokens
+        # Set by the model in the auto mode (see _SequenceParallelRowGate).
+        self.sp_row_gate: Callable[[int], bool] | None = None
         if self.is_sequence_parallel:
             self.self_attn.o_proj.reduce_results = False
 
@@ -1720,8 +1856,11 @@ class MuseSpark1xDecoderLayer(nn.Module):
             )
         assert stream.dtype == self.residual_dtype
 
-        sp_active = is_sequence_parallel_active(
-            self.is_sequence_parallel, positions.shape[0], self.sp_min_tokens
+        sp_active = _sequence_parallel_active(
+            self.is_sequence_parallel,
+            positions.shape[0],
+            self.sp_min_tokens,
+            self.sp_row_gate,
         )
         sm120_sp = sp_active and self.sm120_sequence_parallel
         if sp_active and self.is_sequence_parallel_input:
@@ -1833,20 +1972,28 @@ class MuseSpark1xModel(LlamaModel):
         self.sp_min_tokens = (
             sm120_sequence_parallel_min_tokens(vllm_config) if sm120_sp else None
         )
+        self.sp_row_gate: Callable[[int], bool] | None = None
         if self.sp_min_tokens is not None:
             logger.info_once(
                 "MuseSpark SM120: sequence-parallel residual stream for batches of "
                 "at least %d tokens (VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_MIN_TOKENS"
-                "=%d, CUDA graphs up to %d tokens).",
+                "=%d, CUDA graphs up to %d tokens)%s.",
                 self.sp_min_tokens,
                 envs.VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_MIN_TOKENS,
                 vllm_config.compilation_config.max_cudagraph_capture_size or 0,
+                ", only for the batch sizes whose sharded projections are bitwise "
+                "the replicated ones (auto: the TP communicator's reduce-scatter + "
+                "all-gather equals its all-reduce)"
+                if sm120_sequence_parallel_is_gated()
+                else "",
             )
         self.make_empty_intermediate_tensors = self._make_empty_intermediate_tensors
         self.is_sequence_parallel_input = self.is_sequence_parallel
         self._configure_replicated_prefix()
         self._configure_column_gather()
         self._configure_pooler_gather()
+        if sm120_sp and sm120_sequence_parallel_is_gated():
+            self._configure_sequence_parallel_row_gate()
         self._l2_prefetcher: L2Prefetcher | None = None
         if envs.VLLM_MUSE_SPARK_SM120_L2_PREFETCH and _on_sm120():
             self._configure_l2_prefetch()
@@ -1866,6 +2013,20 @@ class MuseSpark1xModel(LlamaModel):
                 for attn in attention_layers:
                     if gemm_rs.supports_projection(attn.o_proj):
                         attn.gemm_rs = gemm_rs
+
+    def _configure_sequence_parallel_row_gate(self) -> None:
+        """Admit the batch sizes whose sharded projections equal the replicated."""
+        layers = list(islice(self.layers, self.start_layer, self.end_layer))
+        feed_forward = next(
+            layer.feed_forward
+            for layer in layers
+            if isinstance(layer.feed_forward, MuseSpark1xMoE)
+            and layer.feed_forward.sm120_sequence_parallel
+        )
+        self.sp_row_gate = _SequenceParallelRowGate(feed_forward)
+        for layer in layers:
+            layer.sp_row_gate = self.sp_row_gate
+            layer.self_attn.sp_row_gate = self.sp_row_gate
 
     def _configure_replicated_prefix(self) -> None:
         # Layer 0 (BF16 runner) stays replicated until layer 1's attention RS.
@@ -2079,8 +2240,11 @@ class MuseSpark1xModel(LlamaModel):
         x: MuseSpark1xResidualStream | torch.Tensor = hidden_states.to(
             self.residual_dtype
         )
-        sp_active = is_sequence_parallel_active(
-            self.is_sequence_parallel, positions.shape[0], self.sp_min_tokens
+        sp_active = _sequence_parallel_active(
+            self.is_sequence_parallel,
+            positions.shape[0],
+            self.sp_min_tokens,
+            self.sp_row_gate,
         )
         if sp_active and self.is_sequence_parallel_input:
             x = sp_shard(x)

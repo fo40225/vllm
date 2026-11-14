@@ -196,6 +196,16 @@ class DeviceCommunicatorBase:
     communication backend), the `device_group` will also be given.
     """
 
+    # Whether all_gather(reduce_scatter(x, 0), 0) returns, bit for bit, what
+    # all_reduce(x) returns for the same input, for a tensor whose row count is a
+    # multiple of the group size and which is large enough for the communicator
+    # to reduce it itself. NCCL's ring all-reduce and its reduce-scatter round
+    # differently, so it is False here. A communicator whose reductions all follow
+    # one fixed arithmetic (a sum in a fixed order with a single final rounding)
+    # can set it, and a caller may then shard a reduction along the rows without
+    # changing the result.
+    reduce_scatter_all_gather_matches_all_reduce: bool = False
+
     def __init__(
         self,
         cpu_group: ProcessGroup,

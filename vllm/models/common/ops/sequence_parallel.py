@@ -25,6 +25,20 @@ def _custom_collective(name: str, x: torch.Tensor) -> torch.Tensor | None:
     return None if collective is None else collective(x)
 
 
+def tp_reduce_scatter_matches_all_reduce() -> bool:
+    """Whether the TP communicator promises ``all_gather(reduce_scatter(x))`` to be
+    bit for bit ``all_reduce(x)`` (see ``DeviceCommunicatorBase``).
+
+    Sharding a reduction along the sequence then leaves its result unchanged.
+    """
+    device_communicator = get_tp_group().device_communicator
+    return bool(
+        getattr(
+            device_communicator, "reduce_scatter_all_gather_matches_all_reduce", False
+        )
+    )
+
+
 @lru_cache
 def is_sequence_parallel_active(
     is_enabled: bool, num_tokens: int, min_tokens: int | None = None

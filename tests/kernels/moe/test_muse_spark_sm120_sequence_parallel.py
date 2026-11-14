@@ -69,12 +69,190 @@ def sm120_platform(monkeypatch):
     )
 
 
-def test_sm120_sequence_parallel_is_opt_in(monkeypatch, sm120_platform) -> None:
-    monkeypatch.delenv(FLAG, raising=False)
+def test_sm120_sequence_parallel_flag_values(monkeypatch) -> None:
+    # Unset, "" and "auto" are the auto mode (None); 0 and 1 override it.
+    for value, expected in (
+        (None, None),
+        ("", None),
+        ("auto", None),
+        ("0", False),
+        ("1", True),
+    ):
+        if value is None:
+            monkeypatch.delenv(FLAG, raising=False)
+        else:
+            monkeypatch.setenv(FLAG, value)
+        assert envs.VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL is expected, value
+
+
+def _communicator_advertises(monkeypatch, advertised: bool) -> list[int]:
+    asked: list[int] = []
+
+    def advertises() -> bool:
+        asked.append(1)
+        return advertised
+
+    monkeypatch.setattr(muse_model, "tp_reduce_scatter_matches_all_reduce", advertises)
+    return asked
+
+
+def test_sm120_sequence_parallel_auto_follows_the_communicator(
+    monkeypatch, sm120_platform
+) -> None:
     config = _vllm_config()
+    monkeypatch.delenv(FLAG, raising=False)
+    _communicator_advertises(monkeypatch, True)
+    assert muse_model.is_sm120_sequence_parallel_enabled(config)
+    assert muse_model.sm120_sequence_parallel_is_gated()
+    # NCCL (or any communicator that rounds the reduce-scatter and the all-reduce
+    # differently) keeps the stream replicated unless it is asked for.
+    _communicator_advertises(monkeypatch, False)
     assert not muse_model.is_sm120_sequence_parallel_enabled(config)
     monkeypatch.setenv(FLAG, "1")
     assert muse_model.is_sm120_sequence_parallel_enabled(config)
+    assert not muse_model.sm120_sequence_parallel_is_gated()
+    _communicator_advertises(monkeypatch, True)
+    monkeypatch.setenv(FLAG, "0")
+    assert not muse_model.is_sm120_sequence_parallel_enabled(config)
+
+
+def test_sm120_sequence_parallel_auto_is_silent_where_it_cannot_apply(
+    monkeypatch, sm120_platform
+) -> None:
+    warnings: list[tuple] = []
+    monkeypatch.setattr(
+        muse_model.logger, "warning_once", lambda *args: warnings.append(args)
+    )
+    monkeypatch.delenv(FLAG, raising=False)
+    asked = _communicator_advertises(monkeypatch, True)
+    for overrides in (
+        dict(parallel=dict(enable_expert_parallel=False)),
+        dict(parallel=dict(tensor_parallel_size=1)),
+        dict(mlp_layer_types=["sparse", "dense"]),
+        # Backends that may hand the routing to monolithic experts.
+        dict(moe_backend="flashinfer_b12x"),
+        dict(moe_backend="marlin"),
+    ):
+        assert not muse_model.is_sm120_sequence_parallel_enabled(
+            _vllm_config(**overrides)
+        )
+    assert muse_model.is_sm120_sequence_parallel_enabled(
+        _vllm_config(moe_backend="cutlass")
+    )
+    assert not warnings
+    # The communicator is only asked where the layout and the backend allow the
+    # stream at all (the cutlass launch above).
+    assert len(asked) == 1
+    # A request for the stream on a backend it cannot feed is not silent.
+    monkeypatch.setenv(FLAG, "1")
+    assert muse_model.is_sm120_sequence_parallel_enabled(
+        _vllm_config(moe_backend="flashinfer_b12x")
+    )
+
+
+def test_tp_reduce_scatter_capability(monkeypatch) -> None:
+    from vllm.distributed.device_communicators.base_device_communicator import (
+        DeviceCommunicatorBase,
+    )
+    from vllm.models.common.ops import sequence_parallel as sp_ops
+
+    # A communicator promises nothing unless it says so: NCCL rounds differently.
+    assert DeviceCommunicatorBase.reduce_scatter_all_gather_matches_all_reduce is False
+    for communicator, expected in (
+        (SimpleNamespace(reduce_scatter_all_gather_matches_all_reduce=True), True),
+        (SimpleNamespace(reduce_scatter_all_gather_matches_all_reduce=False), False),
+        (SimpleNamespace(), False),
+        (None, False),
+    ):
+        monkeypatch.setattr(
+            sp_ops,
+            "get_tp_group",
+            lambda communicator=communicator: SimpleNamespace(
+                device_communicator=communicator
+            ),
+        )
+        assert sp_ops.tp_reduce_scatter_matches_all_reduce() is expected
+
+
+class _Projection(torch.nn.Module):
+    """A linear layer that computes the rows of fewer than ``split_below`` rows
+    differently (in the last bits), as a split-K cuBLAS kernel does."""
+
+    def __init__(self, in_features: int, out_features: int, split_below: int = 0):
+        super().__init__()
+        g = torch.Generator().manual_seed(in_features)
+        self.weight = torch.nn.Parameter(
+            torch.randn(out_features, in_features, generator=g), requires_grad=False
+        )
+        self.split_below = split_below
+        self.calls = 0
+
+    def forward(self, x: torch.Tensor):
+        self.calls += 1
+        out = x @ self.weight.t()
+        if x.shape[0] < self.split_below:
+            out = out * (1 + 2**-20)
+        return out, None
+
+
+def _row_gate(monkeypatch, split_below=(0, 0, 0), world_size=1):
+    monkeypatch.setattr(
+        muse_model,
+        "get_tp_group",
+        lambda: SimpleNamespace(world_size=world_size, cpu_group=None),
+    )
+    projections = [
+        _Projection(32, 16, split_below[0]),
+        _Projection(16, 32, split_below[1]),
+        _Projection(32, 8, split_below[2]),
+    ]
+    feed_forward = SimpleNamespace(
+        tp_size=8,
+        pooler=projections[0],
+        unpooler=projections[1],
+        router=projections[2],
+    )
+    return muse_model._SequenceParallelRowGate(feed_forward), projections
+
+
+def test_sequence_parallel_row_gate_admits_only_matching_sizes(monkeypatch) -> None:
+    # Rows of 1024 / 8 = 128 are computed like the full batch, those of 512 / 8 = 64
+    # are not (one of the three projections splits).
+    gate, projections = _row_gate(monkeypatch, split_below=(0, 100, 0))
+    assert gate(1024)
+    assert not gate(512)
+    assert gate(2048)
+    # One verdict per size.
+    calls = [p.calls for p in projections]
+    assert gate(1024) and not gate(512)
+    assert [p.calls for p in projections] == calls
+    # A size whose last rank holds padding only compares the rows that exist.
+    gate, _ = _row_gate(monkeypatch)
+    assert gate(1001) and gate(1003) and gate(1009)
+    # Every projection counts.
+    for index in range(3):
+        split = [0, 0, 0]
+        split[index] = 100
+        gate, _ = _row_gate(monkeypatch, split_below=tuple(split))
+        assert not gate(512), index
+
+
+def test_sequence_parallel_row_gate_ranks_agree(monkeypatch) -> None:
+    gate, _ = _row_gate(monkeypatch, world_size=8)
+    reduced: list[torch.Tensor] = []
+
+    def all_reduce(tensor, op=None, group=None):
+        assert op == torch.distributed.ReduceOp.MIN
+        reduced.append(tensor.clone())
+        tensor.zero_()  # another rank of the group found a difference
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+    # The local verdict is true, the group's is not: the rank takes the group's.
+    assert not gate(1024)
+    assert reduced[0].item() == 1
+    # A group of one never reduces.
+    gate, _ = _row_gate(monkeypatch, world_size=1)
+    assert gate(1024) and len(reduced) == 1
 
 
 @pytest.mark.parametrize(
@@ -312,7 +490,8 @@ def test_forward_routed_partial_leaves_the_expert_parallel_sum_to_the_caller(
 def test_projections_on_local_rows_stay_accurate(dist_init) -> None:
     """The sharded stream runs the router, pooler and unpooler on T / 8 rows. cuBLAS
     picks its kernel by the row count, so these rows are not bitwise those of the full
-    batch (one reason the sharded stream is opt-in). Without
+    batch (one reason the sharded stream is opt-in, and why the auto mode checks each
+    batch size, see ``_SequenceParallelRowGate``). Without
     ``_fp32_split_k_reduction`` the bf16 GEMMs of the small batch are also less exact
     (split-K slices reduced in bf16: 1.2-1.7x the error of a single rounding against an
     fp32 reference on SM120); with it they must stay at the single rounding."""
@@ -363,6 +542,44 @@ def test_fp32_split_k_reduction_restores_the_flag() -> None:
                 raise RuntimeError
         assert matmul.allow_bf16_reduced_precision_reduction == initial
     matmul.allow_bf16_reduced_precision_reduction = True
+
+
+@requires_sm120
+@pytest.mark.parametrize("num_tokens", [512, 1024, 1503, 3000, 4096, 8192])
+def test_sequence_parallel_row_gate_matches_the_real_projections(
+    num_tokens: int, dist_init
+) -> None:
+    """The verdict of the gate (on its own random inputs) agrees with the rows of the
+    real-shape pooler, unpooler and fp32 router on other inputs: the sizes it admits
+    are bitwise equal on a rank's rows, the sizes it refuses differ somewhere."""
+    torch.manual_seed(7)
+    with set_current_vllm_config(_gemm_vllm_config()), torch.device("cuda"):
+        pooler = ReplicatedLinear(8192, 4096, bias=False, params_dtype=torch.bfloat16)
+        unpooler = ReplicatedLinear(4096, 8192, bias=False, params_dtype=torch.bfloat16)
+        router = GateLinear(
+            8192, 256, bias=False, out_dtype=torch.float32, params_dtype=torch.float32
+        )
+    for module in (pooler, unpooler, router):
+        for p in module.parameters():
+            p.data.normal_(std=0.02)
+    gate = muse_model._SequenceParallelRowGate(
+        SimpleNamespace(tp_size=8, pooler=pooler, unpooler=unpooler, router=router)
+    )
+    rows = -(-num_tokens // 8)
+    equal = True
+    for module in (pooler, unpooler, router):
+        weight = module.weight
+        x = torch.randn(num_tokens, weight.shape[1], device="cuda").to(weight.dtype)
+        full = module(x)[0]
+        padded = F.pad(x, (0, 0, 0, rows * 8 - num_tokens))
+        for rank in range(8):
+            valid = min(rows, num_tokens - rank * rows)
+            with muse_model._fp32_split_k_reduction():
+                local = module(padded[rank * rows : (rank + 1) * rows])[0]
+            equal &= torch.equal(
+                full[rank * rows : rank * rows + valid], local[:valid]
+            )
+    assert gate(num_tokens) == equal, num_tokens
 
 
 def _gemm_vllm_config():
