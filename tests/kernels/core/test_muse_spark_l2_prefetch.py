@@ -6,12 +6,19 @@ The prefetch is a cache hint: it must leave every tensor and every GEMM result
 bit-for-bit as they were, also when it runs on a side stream inside a CUDA graph.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn.functional as F
 
+import vllm.models.muse_spark.nvidia.model as model_ops
 from vllm.models.muse_spark.nvidia.ops import muse_c
-from vllm.models.muse_spark.nvidia.ops.l2_prefetch import L2Prefetcher
+from vllm.models.muse_spark.nvidia.ops.l2_prefetch import (
+    L2_BUDGET_FRACTION,
+    L2Prefetcher,
+    l2_budget_bytes,
+)
 from vllm.platforms import current_platform
 
 if not current_platform.is_device_capability_family(120):
@@ -101,3 +108,115 @@ def test_graph_side_stream(evict_last):
         graph.replay()
     torch.accelerator.synchronize()
     assert torch.equal(out, ref)
+
+
+MIB = 1 << 20
+
+
+def _bf16(rows: int, cols: int) -> torch.Tensor:
+    return torch.empty(rows, cols, device=DEVICE, dtype=torch.bfloat16)
+
+
+def test_budget_is_a_share_of_the_device_l2():
+    l2_bytes = torch.cuda.get_device_properties(0).L2_cache_size
+    assert l2_budget_bytes() == int(l2_bytes * L2_BUDGET_FRACTION)
+    assert 0 < l2_budget_bytes() < l2_bytes
+
+
+def test_select_keeps_what_fits_the_budget_in_order():
+    prefetcher = L2Prefetcher(budget_bytes=10 * MIB)
+    tensors = [
+        _bf16(3 * MIB, 1),
+        _bf16(5 * MIB // 2, 1),
+        _bf16(MIB, 1),
+        _bf16(MIB // 2, 1),
+    ]
+    # 6 MiB, 5 MiB (11 > 10: skipped), 2 MiB (8), 1 MiB (9); nothing is reordered.
+    assert prefetcher.select(tensors) == [tensors[0], tensors[2], tensors[3]]
+    assert prefetcher.select([_bf16(11 * MIB // 2, 1)]) == []
+
+
+def test_select_skips_unusable_tensors_and_caps_the_count():
+    prefetcher = L2Prefetcher(budget_bytes=1 << 30)
+    good = [_bf16(64, 64) for _ in range(6)]
+    odd = torch.zeros(4096 + 1, device=DEVICE, dtype=torch.uint8)[1:]  # unaligned
+    strided = _bf16(64, 64).t()
+    tensors = [odd, strided, torch.empty(0, device=DEVICE), torch.zeros(64), *good]
+    assert prefetcher.select(tensors) == good[:4]
+
+
+def test_the_tp8_decode_set_fits_the_default_budget_and_a_smaller_tp_is_trimmed():
+    l2_bytes = 128 * MIB
+    budget = int(l2_bytes * L2_BUDGET_FRACTION)
+    prefetcher = L2Prefetcher(budget_bytes=budget)
+    # After the experts of a layer (unpooler shard, QKV+gate, O), per rank.
+    tp8 = [_bf16(1024, 4096), _bf16(*QKV_SHAPE), _bf16(*O_SHAPE)]
+    assert prefetcher.select(tp8) == tp8
+    # TP4 doubles the attention shards: QKV and O would not fit together.
+    tp4 = [_bf16(2048, 4096), _bf16(2 * QKV_SHAPE[0], QKV_SHAPE[1]), _bf16(8192, 2048)]
+    assert prefetcher.select(tp4) == tp4[:2]
+
+
+class _Experts(model_ops.MuseMoERunner):
+    supports_after_gemm2_hook = True
+
+    def set_after_gemm2_hook(self, hook) -> bool:
+        self.hooks.append(hook)
+        return True
+
+
+def _model_with_layers(hookable: bool) -> model_ops.MuseSpark1xModel:
+    """A model with just the state ``_configure_l2_prefetch`` reads: three layers
+    with MoE blocks, whose experts do or do not have the hook call site."""
+    layers = []
+    for _ in range(3):
+        moe = object.__new__(model_ops.MuseSpark1xMoE)
+        torch.nn.Module.__init__(moe)
+        experts = object.__new__(_Experts)
+        torch.nn.Module.__init__(experts)
+        moe.experts = experts
+        moe.experts.hooks = []
+        moe.experts.supports_after_gemm2_hook = hookable
+        layers.append(SimpleNamespace(feed_forward=moe, self_attn=SimpleNamespace()))
+    model = object.__new__(model_ops.MuseSpark1xModel)
+    model.layers = layers
+    model.start_layer, model.end_layer = 0, 3
+    model._l2_prefetcher = None
+    return model
+
+
+def test_a_failed_extension_build_leaves_the_prefetch_off(monkeypatch):
+    """The preflight passes but the build fails (or failed earlier): the model must
+    still be constructed, without the prefetch and without hooks."""
+    monkeypatch.setattr(muse_c, "preflight", lambda: None)
+
+    def cannot_build(*args, **kwargs):
+        raise RuntimeError("nvcc: out of luck")
+
+    monkeypatch.setattr(model_ops, "L2Prefetcher", cannot_build)
+    model = _model_with_layers(hookable=True)
+    model._configure_l2_prefetch()
+    assert model._l2_prefetcher is None
+    assert all(not layer.feed_forward.experts.hooks for layer in model.layers)
+
+
+def test_a_model_without_hook_sites_builds_no_prefetcher(monkeypatch):
+    monkeypatch.setattr(muse_c, "preflight", lambda: None)
+    monkeypatch.setattr(
+        model_ops, "L2Prefetcher", lambda: pytest.fail("built for nothing")
+    )
+    model = _model_with_layers(hookable=False)
+    model._configure_l2_prefetch()
+    assert model._l2_prefetcher is None
+
+
+def test_the_prefetch_is_hooked_into_all_but_the_last_layer(monkeypatch):
+    monkeypatch.setattr(muse_c, "preflight", lambda: None)
+    model = _model_with_layers(hookable=True)
+    model._configure_l2_prefetch()
+    assert isinstance(model._l2_prefetcher, L2Prefetcher)
+    assert [len(layer.feed_forward.experts.hooks) for layer in model.layers] == [
+        1,
+        1,
+        0,
+    ]

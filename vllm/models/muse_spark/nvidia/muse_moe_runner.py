@@ -1013,6 +1013,15 @@ class MuseMoERunner(MoERunner):
         )
         quant_method.muse_post_expert_finalize = self.post_expert_finalize
 
+    @property
+    def supports_after_gemm2_hook(self) -> bool:
+        """Whether ``set_after_gemm2_hook`` takes a hook in this layer."""
+        quant_method = self.routed_experts.quant_method
+        return (
+            isinstance(quant_method, MuseSparkModelOptNvFp4FusedMoE)
+            and quant_method.use_sm120_native
+        )
+
     def set_after_gemm2_hook(self, hook: Callable[[int], None]) -> bool:
         """Call ``hook(num_tokens)`` once the experts' GEMMs are queued.
 
@@ -1020,13 +1029,9 @@ class MuseMoERunner(MoERunner):
         post-GEMM2 finalize with its all-reduce. Returns whether this layer does.
         The hook reaches the experts when they are built after the weights load.
         """
-        quant_method = self.routed_experts.quant_method
-        if not (
-            isinstance(quant_method, MuseSparkModelOptNvFp4FusedMoE)
-            and quant_method.use_sm120_native
-        ):
+        if not self.supports_after_gemm2_hook:
             return False
-        quant_method.muse_after_gemm2_hook = hook
+        self.routed_experts.quant_method.muse_after_gemm2_hook = hook
         return True
 
     @property

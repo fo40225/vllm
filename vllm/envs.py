@@ -148,7 +148,7 @@ if TYPE_CHECKING:
     VLLM_MUSE_SPARK_SM120_PREFILL_LOCAL_ROWS: bool = True
     VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL: bool = False
     VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_MIN_TOKENS: int = 512
-    VLLM_MUSE_SPARK_SM120_L2_PREFETCH: bool = False
+    VLLM_MUSE_SPARK_SM120_L2_PREFETCH: bool = True
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
     VLLM_ROCM_USE_AITER_LINEAR_HIPBMM: bool = False
     VLLM_ROCM_USE_AITER_MOE: bool = True
@@ -1380,11 +1380,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Muse Spark on SM120: inside the decode CUDA graphs, prefetch the weights of
     # the next GEMMs (QKV and O of the next layer, the pooler, router and unpooler)
-    # into L2 on a side stream while the collectives of the layer run.
-    # Bit-identical outputs; needs the _muse_C extension. Read once, when the
-    # model is constructed.
+    # into L2 on a side stream while the collectives of the layer run. One launch
+    # pulls at most 3/4 of the L2 (the TP8 layout takes about half of it). Decode
+    # TPOT -9% at c1 and about -1% at c128 on 8 GPUs. Bit-identical outputs; needs
+    # the _muse_C extension, and without it (or on another GPU) the flag does
+    # nothing. Read once, when the model is constructed.
     "VLLM_MUSE_SPARK_SM120_L2_PREFETCH": lambda: bool(
-        int(os.getenv("VLLM_MUSE_SPARK_SM120_L2_PREFETCH", "0"))
+        int(os.getenv("VLLM_MUSE_SPARK_SM120_L2_PREFETCH", "1"))
     ),
     # use aiter linear op if aiter ops are enabled
     # The following list of related ops

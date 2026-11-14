@@ -33,19 +33,40 @@ logger = init_logger(__name__)
 L2_PREFETCH_MAX_TOKENS = 256
 # What one ``_muse_C::l2_prefetch`` launch takes.
 _MAX_TENSORS = 4
+# The most that one launch pulls into L2, as a share of the cache. The weights share
+# it with the activations, the KV blocks of the attention in flight, the NCCL buffers
+# and the weights of the op that is running, and a prefetch of more than the cache
+# holds evicts its own first lines before the GEMMs read them. The model at TP8 takes
+# about 63 MB (half of a 128 MB L2) per launch; a smaller TP has larger shards of QKV
+# and O and would thrash without a limit.
+L2_BUDGET_FRACTION = 0.75
+# The L2 size to assume when the driver does not report one.
+_FALLBACK_L2_BYTES = 64 << 20
+
+
+def l2_budget_bytes(device: torch.device | int | None = None) -> int:
+    """What one launch may prefetch on ``device``: ``L2_BUDGET_FRACTION`` of its L2."""
+    props = torch.cuda.get_device_properties(device)
+    l2_bytes = getattr(props, "L2_cache_size", 0) or _FALLBACK_L2_BYTES
+    return int(l2_bytes * L2_BUDGET_FRACTION)
 
 
 class L2Prefetcher:
     """Launches ``_muse_C::l2_prefetch`` on a side stream inside a graph capture."""
 
     def __init__(
-        self, num_ctas: int = 4, chunk_kib: int = 64, evict_last: bool = False
+        self,
+        num_ctas: int = 4,
+        chunk_kib: int = 64,
+        evict_last: bool = False,
+        budget_bytes: int | None = None,
     ) -> None:
         # Never build inside a forward pass or a capture.
         muse_c.load()
         self.num_ctas = num_ctas
         self.chunk_kib = chunk_kib
         self.evict_last = evict_last
+        self.budget_bytes = l2_budget_bytes() if budget_bytes is None else budget_bytes
         self._stream = torch.cuda.Stream()
         self._fork = torch.cuda.Event()
         self._join = torch.cuda.Event()
@@ -59,15 +80,41 @@ class L2Prefetcher:
 
         return not BreakableCUDAGraphCapture.is_active()
 
+    def select(self, tensors: Sequence[torch.Tensor]) -> list[torch.Tensor]:
+        """The tensors of ``tensors`` that one launch takes: the usable ones, in the
+        order given, as long as they fit the byte budget (a tensor that does not fit
+        is skipped, a smaller one after it may still be taken)."""
+        chosen: list[torch.Tensor] = []
+        total = 0
+        for t in tensors:
+            if not (
+                t.is_cuda
+                and t.is_contiguous()
+                and t.numel()
+                and t.data_ptr() % 16 == 0
+            ):
+                continue
+            nbytes = t.numel() * t.element_size()
+            if total + nbytes > self.budget_bytes:
+                logger.info_once(
+                    "MuseSpark: the L2 prefetch skips weights beyond its budget of %d "
+                    "MiB per launch (a %d MiB tensor does not fit after %d MiB).",
+                    self.budget_bytes >> 20,
+                    nbytes >> 20,
+                    total >> 20,
+                )
+                continue
+            chosen.append(t)
+            total += nbytes
+            if len(chosen) == _MAX_TENSORS:
+                break
+        return chosen
+
     def launch(self, tensors: Sequence[torch.Tensor]) -> None:
         """Prefetch ``tensors`` after the work queued on the current stream."""
         if not self._active():
             return
-        tensors = [
-            t
-            for t in tensors
-            if t.is_cuda and t.is_contiguous() and t.numel() and t.data_ptr() % 16 == 0
-        ][:_MAX_TENSORS]
+        tensors = self.select(tensors)
         if not tensors:
             return
         self._fork.record()

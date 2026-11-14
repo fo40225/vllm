@@ -1848,7 +1848,7 @@ class MuseSpark1xModel(LlamaModel):
         self._configure_column_gather()
         self._configure_pooler_gather()
         self._l2_prefetcher: L2Prefetcher | None = None
-        if envs.VLLM_MUSE_SPARK_SM120_L2_PREFETCH:
+        if envs.VLLM_MUSE_SPARK_SM120_L2_PREFETCH and _on_sm120():
             self._configure_l2_prefetch()
         if self.is_sequence_parallel:
             from vllm.models.muse_spark.nvidia.ops.gemm_rs import (
@@ -1959,18 +1959,33 @@ class MuseSpark1xModel(LlamaModel):
         layer ``i`` (the attention reads little from HBM there), the pooler and
         router weights of layer ``i``. The weights are looked up when the graph
         is captured, after they are final.
+
+        A hint that changes no output, so a host that cannot build the ``_muse_C``
+        extension, and a model without the SM120 native NVFP4 experts, run without it.
         """
-        if not (
-            current_platform.is_cuda()
-            and current_platform.is_device_capability_family(120)
+        layers = list(islice(self.layers, self.start_layer, self.end_layer))
+        # No extension (and no stream) for a model whose experts have no call site.
+        if not any(
+            isinstance(layer.feed_forward, MuseSpark1xMoE)
+            and isinstance(layer.feed_forward.experts, MuseMoERunner)
+            and layer.feed_forward.experts.supports_after_gemm2_hook
+            for layer in layers[:-1]
         ):
-            logger.warning_once("VLLM_MUSE_SPARK_SM120_L2_PREFETCH needs an SM120 GPU.")
             return
         if (reason := muse_c.preflight()) is not None:
-            logger.warning_once("The L2 weight prefetch is off: %s", reason)
+            logger.info_once("The L2 weight prefetch is off: %s", reason)
             return
-        layers = list(islice(self.layers, self.start_layer, self.end_layer))
-        prefetcher = L2Prefetcher()
+        try:
+            prefetcher = L2Prefetcher()
+        except Exception as e:
+            # The preflight does not know whether the build works.
+            logger.warning_once(
+                "The L2 weight prefetch is off: the _muse_C extension could not be "
+                "built (%s: %s).",
+                type(e).__name__,
+                e,
+            )
+            return
 
         def after_experts(
             moe: MuseSpark1xMoE, next_attn: MuseSpark1xAttention
