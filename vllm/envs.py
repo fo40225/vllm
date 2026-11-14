@@ -1419,13 +1419,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MUSE_SPARK_SM120_L2_PREFETCH_AFTER_EXPERTS_CTAS": lambda: int(
         os.getenv("VLLM_MUSE_SPARK_SM120_L2_PREFETCH_AFTER_EXPERTS_CTAS", "4")
     ),
-    # Muse Spark on SM120: in the decode CUDA graphs of up to 8 tokens, prefetch the head
-    # of the experts that the routing picked for this rank into L2 on the aux stream, behind
-    # the routing kernel and ahead of the muse decode kernel (a few microseconds before its
-    # first loads; the boundary kernel then also writes the FP32 router input, which moves
-    # the routing earlier). Decode TPOT -1.2% at batch 1 on 8 GPUs, bit-identical outputs.
-    # Needs the _muse_C extension and the muse decode engine; without them (or on another
-    # GPU) the flag does nothing. Read once, when the model is constructed.
+    # Muse Spark on SM120: in the decode CUDA graphs of up to 8 tokens, prefetch the
+    # head of the experts that the routing picked for this rank into L2 on the aux
+    # stream, behind the routing kernel and ahead of the muse decode kernel (a few
+    # microseconds before its first loads). The boundary kernel then also writes the
+    # FP32 router input, which moves the routing earlier. Decode TPOT -1.7% at batch 1
+    # on 8 GPUs with the stock NCCL collectives (-1.2% with the host collectives),
+    # bit-identical outputs. Needs the _muse_C extension and the muse decode engine;
+    # without them (or on another GPU, or outside a CUDA graph) the flag does nothing.
+    # Read once, when the model is constructed.
     "VLLM_MUSE_SPARK_SM120_EXPERT_PREFETCH": lambda: bool(
         int(os.getenv("VLLM_MUSE_SPARK_SM120_EXPERT_PREFETCH", "1"))
     ),

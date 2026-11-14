@@ -418,6 +418,12 @@ def test_a_launch_that_queued_nothing_leaves_nothing_to_join():
     assert torch.equal(y, torch.full_like(x, 2.0))
 
 
+@pytest.fixture
+def capturing(monkeypatch):
+    """The forward is a CUDA graph capture, the only place that queues the prefetch."""
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+
+
 def _moe(prefetch, overlaps=True, aux=True, fp32_input=False, sp=False, engine=True):
     """A MuseSpark1xMoE with just the state ``wants_cast_router_input`` reads."""
     moe = object.__new__(model_ops.MuseSpark1xMoE)
@@ -433,13 +439,13 @@ def _moe(prefetch, overlaps=True, aux=True, fp32_input=False, sp=False, engine=T
 
 
 @pytest.mark.parametrize("t", [1, 4, EXPERT_PREFETCH_MAX_TOKENS])
-def test_the_prefetch_wants_the_cast_in_the_boundary(t):
+def test_the_prefetch_wants_the_cast_in_the_boundary(capturing, t):
     moe = _moe(prefetch=True)
     assert moe.prefetches_experts(t)
     assert moe.wants_cast_router_input(t)
 
 
-def test_without_the_prefetch_the_cast_hides_beside_the_pooler():
+def test_without_the_prefetch_the_cast_hides_beside_the_pooler(capturing):
     moe = _moe(prefetch=False)
     assert not moe.prefetches_experts(1)
     assert not moe.wants_cast_router_input(1)
@@ -447,7 +453,7 @@ def test_without_the_prefetch_the_cast_hides_beside_the_pooler():
     assert _moe(prefetch=False, overlaps=False).wants_cast_router_input(1)
 
 
-def test_the_prefetch_needs_the_muse_kernel_and_the_aux_routing():
+def test_the_prefetch_needs_the_muse_kernel_and_the_aux_routing(capturing):
     assert not _moe(prefetch=True).prefetches_experts(EXPERT_PREFETCH_MAX_TOKENS + 1)
     # Another expert path (CUTLASS, b12x, the engine not prepared yet): nothing to
     # prefetch for, so the boundary does not pay for the fused router cast either.
@@ -457,6 +463,17 @@ def test_the_prefetch_needs_the_muse_kernel_and_the_aux_routing():
     assert not _moe(prefetch=True, aux=False).wants_cast_router_input(1)
     assert not _moe(prefetch=True, sp=True).wants_cast_router_input(1)
     assert not _moe(prefetch=True, fp32_input=True).wants_cast_router_input(1)
+
+
+def test_an_eager_forward_neither_prefetches_nor_fuses_the_cast(monkeypatch):
+    """Eager decode (enforce-eager, an uncaptured small mixed batch) queues no
+    prefetch, so its boundary must not pay for the fused router cast either."""
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    moe = _moe(prefetch=True)
+    assert not moe.prefetches_experts(1)
+    assert not moe.wants_cast_router_input(1)
+    # Where the cast is on the critical path anyway it is fused as before.
+    assert _moe(prefetch=True, overlaps=False).wants_cast_router_input(1)
 
 
 def _runner(native=True, use_muse=True, engine=True, kernel=True, queued=True):

@@ -989,13 +989,16 @@ class MuseSpark1xMoE(nn.Module):
     def prefetches_experts(self, num_tokens: int) -> bool:
         """Whether the decode graph of this size queues the expert prefetch.
 
-        It needs the routing on the aux stream and the muse decode kernel (padded
-        batches of up to ``MUSE_MAX_TOKENS``, of which the prefetch maps the first
+        It needs a CUDA graph capture (an eager forward queues no prefetch, and the
+        fused router cast would only slow its boundary), the routing on the aux
+        stream and the muse decode kernel (padded batches of up to
+        ``MUSE_MAX_TOKENS``, of which the prefetch maps the first
         ``EXPERT_PREFETCH_MAX_TOKENS``); the layers on another expert path would pay
         the fused router cast for nothing.
         """
         return (
             self.expert_prefetch is not None
+            and torch.cuda.is_current_stream_capturing()
             and num_tokens <= min(MUSE_MAX_TOKENS, EXPERT_PREFETCH_MAX_TOKENS)
             and self._routes_on_aux_stream(num_tokens)
             and cast(MuseMoERunner, self.experts).has_muse_decode_engine
