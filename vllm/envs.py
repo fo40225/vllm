@@ -171,7 +171,7 @@ if TYPE_CHECKING:
     VLLM_MUSE_SPARK_SM120_TOPK_LOGITS_K: int = 64
     VLLM_MUSE_SPARK_SM120_TOPK_LOGITS_MIN_TOKENS: int = 2
     VLLM_MUSE_SPARK_SM120_VERIFY_TOPK_LOGITS: int = 2
-    VLLM_MUSE_SPARK_SM120_DRAFT_FC_SHARD: int = 0
+    VLLM_MUSE_SPARK_SM120_DRAFT_FC_SHARD: int = 2
     VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT: bool = True
     VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT_TABLE: str | None = None
     VLLM_MUSE_SPARK_SM120_DENSE_Q: bool = True
@@ -1802,10 +1802,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # level, identically on all ranks); the draft is a proposal, the rejection sampler
     # keeps the output distribution. Not with pipeline stages. A launch that cannot
     # apply it (TP 1, a quantized fc) keeps the projection in the propose step; the log
-    # line "the aux projection runs in the target's forward" says when it runs.
+    # line "the aux projection runs in the target's forward" says when it runs. Default 2
+    # (0 restores the replicated projection in the propose step).
     # Read once, when the draft model is constructed.
     "VLLM_MUSE_SPARK_SM120_DRAFT_FC_SHARD": lambda: int(
-        os.getenv("VLLM_MUSE_SPARK_SM120_DRAFT_FC_SHARD", "0")
+        os.getenv("VLLM_MUSE_SPARK_SM120_DRAFT_FC_SHARD", "2")
     ),
     # Muse Spark on SM120: place the experts of every MoE layer on the EP ranks by the
     # table of the model snapshot (vllm/models/muse_spark/nvidia/data/
