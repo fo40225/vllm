@@ -36,7 +36,6 @@ class UBatchContext:
         forward_context: ForwardContext,
         ready_barrier: threading.Barrier,
         cpu_wait_event: threading.Event,
-        cpu_signal_event: threading.Event,
         gpu_comm_done_event: torch.Event,
         gpu_compute_done_event: torch.Event,
         schedule: str = "default",
@@ -49,7 +48,6 @@ class UBatchContext:
         self.forward_context = forward_context
         self.ready_barrier = ready_barrier
         self.cpu_wait_event = cpu_wait_event
-        self.cpu_signal_event = cpu_signal_event
         self.current_stream = compute_stream
         self.gpu_comm_done_event = gpu_comm_done_event
         self.gpu_compute_done_event = gpu_compute_done_event
@@ -68,23 +66,50 @@ class UBatchContext:
         _THREAD_ID_TO_CONTEXT[threading.get_ident()] = self.id
         _CURRENT_CONTEXTS[self.id] = self
         # _NUM_UBATCHES is set in make_ubatch_contexts
-        self.ready_barrier.wait()
+        try:
+            self.ready_barrier.wait()
 
-        self.cpu_wait_event.wait()
-        self.cpu_wait_event.clear()
-        self._check_not_aborted()
+            self.cpu_wait_event.wait()
+            self.cpu_wait_event.clear()
+            self._check_not_aborted()
+        except BaseException:
+            # __exit__ does not run when __enter__ raises: leave no registration
+            # behind (a stale one makes dbo_enabled() true for the steps that follow).
+            self._unregister()
+            raise
         self._restore_context()
         # Assume we want to start on the compute stream
         self.update_stream(self.compute_stream)
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        global _CURRENT_CONTEXTS, _THREAD_ID_TO_CONTEXT
-        _CURRENT_CONTEXTS[self.id] = None
-        del _THREAD_ID_TO_CONTEXT[threading.get_ident()]
+        if exc_type is not None:
+            # The siblings must not take this microbatch's silence for a handoff.
+            dbo_abort()
+        self._unregister()
         self.maybe_run_recv_hook()
-        self.cpu_signal_event.set()
+        self._signal_next()
         self.cpu_wait_event.clear()
+        return False
+
+    def _unregister(self):
+        _CURRENT_CONTEXTS[self.id] = None
+        _THREAD_ID_TO_CONTEXT.pop(threading.get_ident(), None)
+
+    def _signal_next(self) -> bool:
+        """Wake the next microbatch (in ring order) that is still running.
+
+        False when this is the only one left. A microbatch that has finished is
+        skipped: the threads hand off at every collective of the model and a
+        model may issue a different number of them for each microbatch (the
+        paths for a few tokens and for many differ), so the longest-running thread
+        must not wait for a handoff that its finished siblings can no longer make.
+        """
+        for step in range(1, _NUM_UBATCHES):
+            ctx = _CURRENT_CONTEXTS[(self.id + step) % _NUM_UBATCHES]
+            if ctx is not None:
+                ctx.cpu_wait_event.set()
+                return True
         return False
 
     def _restore_context(self):
@@ -115,7 +140,9 @@ class UBatchContext:
         assert current_stream() == self.current_stream
         assert not self.cpu_wait_event.is_set()
 
-        self.cpu_signal_event.set()
+        if not self._signal_next():
+            # The other microbatches are done: nothing to hand off to.
+            return
         self.cpu_wait_event.wait()
         self.cpu_wait_event.clear()
         self._check_not_aborted()
@@ -327,9 +354,9 @@ def make_ubatch_contexts(
     _ABORTED.clear()
 
     _NUM_UBATCHES = num_micro_batches
-    # Ensure the global context list is large enough
-    if len(_CURRENT_CONTEXTS) < num_micro_batches:
-        _CURRENT_CONTEXTS.extend([None] * (num_micro_batches - len(_CURRENT_CONTEXTS)))
+    # The threads of the previous step are gone: start from an empty registry.
+    _THREAD_ID_TO_CONTEXT.clear()
+    _CURRENT_CONTEXTS[:] = [None] * num_micro_batches
 
     """
     Create a context manager for micro-batching synchronization.
@@ -347,7 +374,6 @@ def make_ubatch_contexts(
             forward_context=forward_contexts[i],
             ready_barrier=ready_barrier,
             cpu_wait_event=cpu_events[i],
-            cpu_signal_event=cpu_events[(i + 1) % num_micro_batches],
             gpu_comm_done_event=gpu_comm_done_events[i],
             gpu_compute_done_event=gpu_compute_done_events[i],
             schedule=schedule,
