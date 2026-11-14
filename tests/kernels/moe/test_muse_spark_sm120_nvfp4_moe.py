@@ -790,6 +790,8 @@ def test_sm120_layer_keeps_the_checkpoint_layout_without_the_muse_c_extension(
         raise RuntimeError("nvcc: out of luck")
 
     monkeypatch.setattr(muse_c, "load", cannot_build)
+    # An earlier test may have loaded the library in this process.
+    monkeypatch.setattr(muse_c, "_loaded", False)
     problem = _Problem()
     norm = _make_norm()
     expert_bias = torch.linspace(-0.5, 0.5, E, dtype=torch.float32, device="cuda")
@@ -843,6 +845,8 @@ def test_sm120_layer_without_a_usable_b12x_runs_cutlass_only(
     monkeypatch.setattr(
         muse_c, "load", lambda: pytest.fail("the extension has no use here")
     )
+    # An earlier test may have loaded the library in this process.
+    monkeypatch.setattr(muse_c, "_loaded", False)
     problem = _Problem()
     norm = _make_norm()
     expert_bias = torch.linspace(-0.5, 0.5, E, dtype=torch.float32, device="cuda")
@@ -1209,6 +1213,92 @@ def test_sm120_expert_parallel_without_local_routes(
     assert out.shape == x.shape
     assert torch.count_nonzero(out) == 0 and torch.isfinite(out).all()
     assert row_layouts == [False]
+
+
+@pytest.fixture
+def prefill_ops(monkeypatch) -> list[str]:
+    """The sort and the quantization of GEMM1's activations of every CUTLASS
+    ``apply``: ``route`` and ``gather`` on the local routes, ``sort`` and
+    ``shuffle`` for the stock ops."""
+    seen: list[str] = []
+    for label, owner, name in (
+        ("route", muse_c, "moe_route_local"),
+        ("gather", muse_c, "gather_scaled_fp4_experts_quant"),
+        ("sort", ops, "get_cutlass_moe_mm_data"),
+        ("shuffle", ops, "scaled_fp4_experts_quant"),
+    ):
+
+        def spy(*args, _kernel=getattr(owner, name), _label=label, **kwargs):
+            seen.append(_label)
+            return _kernel(*args, **kwargs)
+
+        monkeypatch.setattr(owner, name, spy)
+    return seen
+
+
+@pytest.mark.parametrize("up_gate", [True, False])
+@pytest.mark.parametrize("num_tokens", [16, 700])
+@torch.inference_mode()
+def test_sm120_local_rows_leave_the_layer_output_bitwise_unchanged(
+    dist_init, workspace_init, prefill_ops, num_tokens, up_gate
+) -> None:
+    """The routing and the quantization of GEMM1's activations run on the local
+    routes where the extension is loaded, and the finalized output is that of the
+    stock sort, shuffle and quantization, bit for bit, with routes that are local,
+    remote and absent."""
+    muse_c.load()
+    problem = _Problem()
+    norm = _make_norm()
+    local_experts = torch.tensor(
+        [1, 2, 4, 7, 8, 11, 13, 14], dtype=torch.long, device="cuda"
+    )
+    remote_experts = torch.tensor(
+        [0, 3, 5, 6, 9, 10, 12, 15], dtype=torch.long, device="cuda"
+    )
+    topk_ids, topk_weights = _routes(num_tokens, 8, remote_experts, remote_tokens=3)
+    x = torch.randn(num_tokens, K, device="cuda").to(torch.bfloat16)
+    experts = _Experts(problem, norm, local_experts, 8, up_gate=up_gate)
+    assert experts.experts.local_rows
+
+    local_out = experts.apply(x, topk_ids, topk_weights)
+    experts.experts.local_rows = False
+    stock_out = experts.apply(x, topk_ids, topk_weights)
+    experts.experts.local_rows = True
+    assert prefill_ops == ["route", "gather", "sort", "shuffle"]
+    valid = experts.expert_map[topk_ids.long()] >= 0
+    assert not valid[:3].any() and valid[3:].any() and not valid.all()
+    assert torch.isfinite(local_out).all() and local_out.abs().max() > 0
+    assert torch.equal(local_out, stock_out)
+    # The order of the rows inside an expert is not fixed from run to run; the
+    # output does not depend on it.
+    assert torch.equal(experts.apply(x, topk_ids, topk_weights), local_out)
+
+
+@torch.inference_mode()
+def test_sm120_local_rows_need_the_loaded_extension(
+    dist_init, workspace_init, prefill_ops, monkeypatch
+) -> None:
+    """A host whose extension is not loaded keeps the stock ops, and so do a hidden
+    size the kernels do not take and the opt-out."""
+    problem = _Problem()
+    norm = _make_norm()
+    local_experts = torch.arange(E // 2, dtype=torch.long, device="cuda")
+    topk_ids, topk_weights = _routes(32, 8, None, remote_tokens=0)
+    x = torch.randn(32, K, device="cuda").to(torch.bfloat16)
+    experts = _Experts(problem, norm, local_experts, 8)
+    monkeypatch.setattr(muse_c, "is_loaded", lambda: False)
+    out = experts.apply(x, topk_ids, topk_weights)
+    assert prefill_ops == ["sort", "shuffle"]
+    monkeypatch.setattr(muse_c, "is_loaded", lambda: True)
+    assert experts.experts._local_rows_usable(K, E // 2)
+    assert not experts.experts._local_rows_usable(K + 128, E // 2)
+    assert not experts.experts._local_rows_usable(K, 1024)
+    experts.experts.local_rows = False
+    assert not experts.experts._local_rows_usable(K, E // 2)
+    experts.experts.local_rows = True
+    muse_c.load()
+    assert torch.equal(experts.apply(x, topk_ids, topk_weights), out)
+    assert prefill_ops == ["sort", "shuffle", "route", "gather"]
 
 
 @pytest.mark.parametrize("exact", [True, False], ids=["exact", "folded"])
@@ -2042,23 +2132,20 @@ def test_muse_c_preflight_names_what_is_missing(monkeypatch, muse_c_build) -> No
     assert "nvcc was not found" in muse_c.preflight()
 
 
-@pytest.mark.parametrize("num_local_experts", [8, 32])
-@pytest.mark.parametrize("num_tokens", [8, 4096])
-@torch.inference_mode()
-def test_muse_c_quantization_is_bit_identical_to_the_stock_kernel(
-    num_tokens: int, num_local_experts: int
-) -> None:
-    """The [up | gate] kernel on the exchanged halves gives the bytes of the
-    stock kernel, for the offsets of one rank of an 8-way EP deployment: a few
-    rows per expert take the low-latency path, thousands the grid-stride one."""
-    muse_c.load()
-    num_experts, top_k, hidden, intermediate = num_local_experts * 8, 8, 512, 1024
-    g = torch.Generator(device="cuda").manual_seed(num_tokens)
+def _rank_routing(
+    num_tokens: int,
+    num_local_experts: int,
+    hidden: int,
+    intermediate: int,
+    generator: torch.Generator,
+) -> SimpleNamespace:
+    """The routing data one rank of an 8-way EP deployment (rank 3, a contiguous
+    range of experts) hands to the grouped GEMMs, as the stock op builds it."""
+    num_experts, top_k = num_local_experts * 8, 8
     topk_ids = torch.randint(
         0, num_experts, (num_tokens, top_k), dtype=torch.int32, device="cuda",
-        generator=g,
+        generator=generator,
     )  # fmt: skip
-    # Rank 3 holds a contiguous range.
     expert_map = torch.full((num_experts,), -1, dtype=torch.int32, device="cuda")
     expert_map[3 * num_local_experts : 4 * num_local_experts] = torch.arange(
         num_local_experts, dtype=torch.int32, device="cuda"
@@ -2090,6 +2177,34 @@ def test_muse_c_quantization_is_bit_identical_to_the_stock_kernel(
     )
     local_rows = expert_offsets[-1].item()
     assert 0 < local_rows < num_routes
+    return SimpleNamespace(
+        num_routes=num_routes,
+        local_rows=local_rows,
+        expert_offsets=expert_offsets,
+        blockscale_offsets=blockscale_offsets,
+        a_map=a_map,
+        c_map=c_map,
+    )
+
+
+@pytest.mark.parametrize("num_local_experts", [8, 32])
+@pytest.mark.parametrize("num_tokens", [8, 4096])
+@torch.inference_mode()
+def test_muse_c_quantization_is_bit_identical_to_the_stock_kernel(
+    num_tokens: int, num_local_experts: int
+) -> None:
+    """The [up | gate] kernel on the exchanged halves gives the bytes of the
+    stock kernel, for the offsets of one rank of an 8-way EP deployment: a few
+    rows per expert take the low-latency path, thousands the grid-stride one."""
+    muse_c.load()
+    hidden, intermediate = 512, 1024
+    g = torch.Generator(device="cuda").manual_seed(num_tokens)
+    routing = _rank_routing(num_tokens, num_local_experts, hidden, intermediate, g)
+    num_routes, local_rows = routing.num_routes, routing.local_rows
+    expert_offsets, blockscale_offsets = (
+        routing.expert_offsets,
+        routing.blockscale_offsets,
+    )
     gate_up = torch.randn(
         num_routes, 2 * intermediate, device="cuda", generator=g, dtype=torch.float32
     ).to(torch.bfloat16)
@@ -2185,3 +2300,205 @@ def test_muse_c_split_gemm1_prepare(sizes: list[int], spare_rows: int) -> None:
     assert torch.equal(wrapped[3].cpu(), sizes_x2)
     assert torch.equal(wrapped[0][:local_rows], a_fp4[:local_rows])
     assert torch.equal(wrapped[0][num_rows : num_rows + local_rows], a_fp4[:local_rows])
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("hidden", [256, 512, 1280])
+@pytest.mark.parametrize("num_local_experts", [8, 32])
+@pytest.mark.parametrize("num_tokens", [8, 4096])
+@torch.inference_mode()
+def test_muse_c_gather_quantization_is_bit_identical_to_the_shuffle(
+    num_tokens: int, num_local_experts: int, hidden: int, dtype: torch.dtype
+) -> None:
+    """Quantizing the token rows through the row map gives the bytes of the stock
+    quantization of the shuffled copy, in the same positions, and leaves the rows
+    past the local routes alone."""
+    muse_c.load()
+    g = torch.Generator(device="cuda").manual_seed(num_tokens + hidden)
+    routing = _rank_routing(num_tokens, num_local_experts, hidden, 1024, g)
+    num_routes, local_rows = routing.num_routes, routing.local_rows
+    x = torch.randn(
+        num_tokens, hidden, device="cuda", generator=g, dtype=torch.float32
+    ).to(dtype)
+    gscale = 300 + 600 * torch.rand(
+        num_local_experts, device="cuda", generator=g, dtype=torch.float32
+    )
+    scale_rows = num_routes + 128 * num_local_experts
+    sf_cols = hidden // 64
+
+    shuffled = torch.empty(num_routes, hidden, dtype=dtype, device="cuda")
+    sm120_nvfp4_moe._shuffle_rows_into(x, routing.a_map, shuffled)
+    stock_fp4 = torch.zeros(num_routes, hidden // 2, dtype=torch.uint8, device="cuda")
+    stock_sf = torch.zeros(scale_rows, sf_cols, dtype=torch.int32, device="cuda")
+    torch.ops._C.scaled_fp4_experts_quant(
+        stock_fp4,
+        stock_sf,
+        shuffled,
+        gscale,
+        routing.expert_offsets,
+        routing.blockscale_offsets,
+    )
+    assert stock_fp4[:local_rows].any() and stock_sf.any()
+
+    # Zero-filled like the stock buffers, so that the padding no kernel writes
+    # compares equal too.
+    fp4 = torch.zeros(num_routes, hidden // 2, dtype=torch.uint8, device="cuda")
+    sf = torch.zeros(scale_rows, sf_cols, dtype=torch.int32, device="cuda")
+    torch.ops._muse_C.gather_scaled_fp4_experts_quant(
+        fp4,
+        sf,
+        x,
+        routing.a_map,
+        gscale,
+        routing.expert_offsets,
+        routing.blockscale_offsets,
+    )
+    assert torch.equal(fp4, stock_fp4)
+    assert torch.equal(sf, stock_sf)
+
+    # The rows past the local routes are never touched.
+    fill = 0xA5
+    fp4.view(torch.uint8).fill_(fill)
+    torch.ops._muse_C.gather_scaled_fp4_experts_quant(
+        fp4,
+        sf,
+        x,
+        routing.a_map,
+        gscale,
+        routing.expert_offsets,
+        routing.blockscale_offsets,
+    )
+    assert torch.equal(fp4[:local_rows], stock_fp4[:local_rows])
+    assert (fp4[local_rows:] == fill).all()
+
+    # The wrapper allocates the scale buffer; the bytes the kernel writes are the
+    # stock ones.
+    wrapped_fp4, wrapped_sf = muse_c.gather_scaled_fp4_experts_quant(
+        x, routing.a_map, gscale, routing.expert_offsets, routing.blockscale_offsets
+    )
+    assert wrapped_fp4.shape == stock_fp4.shape and wrapped_fp4.dtype == torch.uint8
+    assert wrapped_sf.dtype == torch.float8_e4m3fn
+    assert torch.equal(wrapped_fp4[:local_rows], stock_fp4[:local_rows])
+    stock_bytes = stock_sf.view(torch.uint8)
+    wrapped_bytes = wrapped_sf.view(torch.uint8).view(-1, sf_cols * 4)
+    assert wrapped_bytes.shape[0] >= stock_bytes.shape[0]
+    written = stock_bytes != 0
+    assert written.any()
+    assert torch.equal(
+        wrapped_bytes[: stock_bytes.shape[0]][written], stock_bytes[written]
+    )
+
+
+@pytest.mark.parametrize("with_map", [True, False])
+@pytest.mark.parametrize("num_local_experts", [8, 32, 100, 256])
+@pytest.mark.parametrize("num_tokens", [1, 8, 4096])
+@torch.inference_mode()
+def test_muse_c_routing_matches_the_stock_sort(
+    num_tokens: int, num_local_experts: int, with_map: bool
+) -> None:
+    """``moe_route_local`` gives the offsets and problem sizes of the stock remap
+    and sort, the same tokens in every expert (in any order), and the inverse map
+    with -1 for the remote routes."""
+    muse_c.load()
+    top_k, hidden, intermediate = 8, 512, 1024
+    num_experts = num_local_experts * 8 if with_map else num_local_experts
+    g = torch.Generator(device="cuda").manual_seed(num_tokens + num_local_experts)
+    # Invalid ids (-1) too; the stock remap does not take ids past the map.
+    topk_ids = torch.randint(
+        -1, num_experts, (num_tokens, top_k), dtype=torch.int32, device="cuda",
+        generator=g,
+    )  # fmt: skip
+    # At least one invalid and one local route.
+    topk_ids[0, 0] = -1
+    topk_ids[0, 1] = 3 * num_local_experts if with_map else 0
+    expert_map = None
+    if with_map:
+        expert_map = torch.full((num_experts,), -1, dtype=torch.int32, device="cuda")
+        expert_map[3 * num_local_experts : 4 * num_local_experts] = torch.arange(
+            num_local_experts, dtype=torch.int32, device="cuda"
+        )
+        local_ids = remap_topk_to_local(topk_ids, expert_map, out_dtype=torch.int32)
+    else:
+        local_ids = topk_ids
+    num_routes = num_tokens * top_k
+    ref = [
+        torch.empty(num_local_experts + 1, dtype=torch.int32, device="cuda"),
+        torch.empty(num_local_experts + 1, dtype=torch.int32, device="cuda"),
+        torch.empty((num_local_experts, 3), dtype=torch.int32, device="cuda"),
+        torch.empty((num_local_experts, 3), dtype=torch.int32, device="cuda"),
+        torch.empty(num_routes, dtype=torch.int32, device="cuda"),
+        torch.empty(num_routes, dtype=torch.int32, device="cuda"),
+    ]
+    ref_offsets, ref_scale_offsets, ref_ps1, ref_ps2, ref_a, ref_c = ref
+    ops.get_cutlass_moe_mm_data(
+        local_ids,
+        ref_offsets,
+        ref_ps1,
+        ref_ps2,
+        ref_a,
+        ref_c,
+        num_local_experts,
+        intermediate,
+        hidden,
+        ref_scale_offsets,
+        is_gated=True,
+    )
+    offsets, scale_offsets, ps1, ps2, a_map, c_map = muse_c.moe_route_local(
+        topk_ids, expert_map, num_local_experts, intermediate, hidden
+    )
+    assert torch.equal(offsets, ref_offsets)
+    assert torch.equal(scale_offsets, ref_scale_offsets)
+    assert torch.equal(ps1, ref_ps1) and torch.equal(ps2, ref_ps2)
+
+    local_rows = offsets[-1].item()
+    assert local_rows == (local_ids >= 0).sum().item()
+    assert 0 < local_rows < num_routes
+    # The same tokens in every expert: sort inside the expert's rows.
+    rows = torch.arange(num_routes, device="cuda", dtype=torch.int32)
+    expert_of_row = torch.searchsorted(offsets[1:], rows, right=True)
+
+    def keyed(a):
+        keys = expert_of_row[:local_rows].long() * num_tokens + a[:local_rows]
+        return torch.sort(keys)[0]
+
+    assert torch.equal(keyed(a_map), keyed(ref_a))
+    assert (a_map[local_rows:] == -1).all()
+    # The inverse map: remote routes have no row, local ones a row of their
+    # expert that holds their token, and every local row is taken once.
+    flat_ids = local_ids.view(-1)
+    local = flat_ids >= 0
+    assert torch.equal(c_map == -1, ~local)
+    assert torch.equal(ref_c == num_routes, ~local)
+    taken = c_map[local].long()
+    assert torch.equal(torch.sort(taken)[0], torch.arange(local_rows, device="cuda"))
+    assert torch.equal(a_map[taken], (rows[local] // top_k).to(torch.int32))
+    assert torch.equal(expert_of_row[taken].to(torch.int32), flat_ids[local])
+
+
+@torch.inference_mode()
+def test_muse_c_routing_treats_ids_past_the_map_as_remote() -> None:
+    muse_c.load()
+    num_local_experts, num_experts = 4, 32
+    expert_map = torch.full((num_experts,), -1, dtype=torch.int32, device="cuda")
+    expert_map[8:12] = torch.arange(num_local_experts, dtype=torch.int32, device="cuda")
+    topk_ids = torch.tensor(
+        [[8, 9, 32, 1000], [-1, 11, 10, 8], [2**30, 8, 8, 9]],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    offsets, _, ps1, _, a_map, c_map = muse_c.moe_route_local(
+        topk_ids, expert_map, num_local_experts, 256, 512
+    )
+    assert offsets.tolist() == [0, 4, 6, 7, 8]
+    assert ps1[:, 0].tolist() == [4, 2, 1, 1]
+    assert c_map.view(3, 4)[topk_ids.view(3, 4) >= 12].eq(-1).all()
+    assert (c_map >= 0).sum().item() == 8
+    assert a_map[8:].eq(-1).all() and a_map[:8].ge(0).all()
+
+    # No local route at all.
+    offsets, _, ps1, _, a_map, c_map = muse_c.moe_route_local(
+        topk_ids[:, :1] + 100, expert_map, num_local_experts, 256, 512
+    )
+    assert offsets.tolist() == [0] * 5 and ps1[:, 0].tolist() == [0] * 4
+    assert a_map.eq(-1).all() and c_map.eq(-1).all()
+

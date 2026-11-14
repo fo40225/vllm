@@ -144,6 +144,7 @@ if TYPE_CHECKING:
         "auto"
     )
     VLLM_MUSE_SPARK_SM120_EXACT_GEMM1: bool = True
+    VLLM_MUSE_SPARK_SM120_PREFILL_LOCAL_ROWS: bool = True
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
     VLLM_ROCM_USE_AITER_LINEAR_HIPBMM: bool = False
     VLLM_ROCM_USE_AITER_MOE: bool = True
@@ -1317,6 +1318,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the weights are loaded.
     "VLLM_MUSE_SPARK_SM120_EXACT_GEMM1": lambda: bool(
         int(os.getenv("VLLM_MUSE_SPARK_SM120_EXACT_GEMM1", "1"))
+    ),
+    # Muse Spark on SM120: build the routing data of the CUTLASS grouped GEMMs
+    # (prefill, and the decode batches the engines do not serve) and quantize
+    # their activations on the local routes only, with the _muse_C routing and
+    # row-gather kernels. The stock sort and the shuffled copy of the
+    # activations spend most of their time on the remote routes (seven in eight
+    # under EP8). Bitwise identical results; set to 0 for the stock ops, e.g. for
+    # A/B tests. Needs the _muse_C extension to be loaded already (a decode
+    # engine loads it). Read once, when a layer is constructed.
+    "VLLM_MUSE_SPARK_SM120_PREFILL_LOCAL_ROWS": lambda: bool(
+        int(os.getenv("VLLM_MUSE_SPARK_SM120_PREFILL_LOCAL_ROWS", "1"))
     ),
     # use aiter linear op if aiter ops are enabled
     # The following list of related ops

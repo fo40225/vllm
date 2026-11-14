@@ -52,6 +52,36 @@ void split_gemm1_prepare(at::Tensor const& a_fp4,
                          at::Tensor& blockscale_offsets_x2,
                          at::Tensor& problem_sizes_x2);
 
+
+// The stock scaled_fp4_experts_quant of an activation matrix permuted by row_map,
+// without the permuted copy: row r of the result is the quantization of row
+// input[row_map[r]], with the global scale and scale-factor layout of the expert
+// that owns row r. input [T, K] bf16/fp16 (K a multiple of 256), row_map [M]
+// int32, output [M, K / 2] u8; only the first input_offset_by_experts[E] rows
+// are written. It gives the bytes the stock op gives on the shuffled copy.
+void gather_scaled_fp4_experts_quant(
+    at::Tensor& output, at::Tensor& output_scale, at::Tensor const& input,
+    at::Tensor const& row_map, at::Tensor const& input_global_scale,
+    at::Tensor const& input_offset_by_experts,
+    at::Tensor const& output_scale_offset_by_experts);
+
+// Routing data of the CUTLASS grouped GEMMs of one expert-parallel rank
+// (muse_moe_route.cu): what remap_topk_to_local and the stock
+// get_cutlass_moe_mm_data give for the NVFP4 path, from the global ids.
+//   topk_ids [T, top_k] int32 (global ids; -1 and ids outside the map are
+//   remote), expert_map [E_global] int32 (local id or -1; null: the ids are
+//   local already). Outputs, all int32: expert_offsets and blockscale_offsets
+//   [E + 1] (rows of every expert, and the same padded to whole 128-row tiles),
+//   problem_sizes1 [E, 3] = (m, 2n, k), problem_sizes2 [E, 3] = (m, k, n),
+//   a_map [T * top_k] (token of every local row, -1 past them) and c_map
+//   [T * top_k] (row of every route, -1 for a remote one).
+void moe_route_local(at::Tensor const& topk_ids,
+                     std::optional<at::Tensor> const& expert_map,
+                     int64_t num_local_experts, int64_t n, int64_t k,
+                     at::Tensor& expert_offsets, at::Tensor& blockscale_offsets,
+                     at::Tensor& problem_sizes1, at::Tensor& problem_sizes2,
+                     at::Tensor& a_map, at::Tensor& c_map);
+
 // NVFP4 (W4A4) MoE experts for a few tokens on SM120 (muse_nvfp4_decode_moe.cu).
 // One persistent launch: routing + activation quantization + GEMM1 + SiLU * up +
 // NVFP4 requantization into hq, then GEMM2 into route-major unweighted bf16

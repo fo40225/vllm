@@ -42,6 +42,7 @@ _SOURCES = (
     "muse_c_bindings.cpp",
     "muse_nvfp4_experts_quant.cu",
     "muse_nvfp4_split_gemm1.cu",
+    "muse_moe_route.cu",
     "muse_nvfp4_decode_moe.cu",
     "muse_spark_mul_tanh_soft_cap.cu",
     "muse_spark_qknorm_rope_kv_insert.cu",
@@ -316,6 +317,47 @@ def _register_fakes() -> None:
         _fakes_registered.add("fused_muse_spark_qknorm_rope_kv_insert")
 
 
+def _register_prefill_moe_fakes() -> None:
+    """Fakes of the prefill MoE ops (they only write their arguments)."""
+    if "gather_scaled_fp4_experts_quant" not in _fakes_registered and _op_defined(
+        "gather_scaled_fp4_experts_quant"
+    ):
+
+        @torch.library.register_fake("_muse_C::gather_scaled_fp4_experts_quant")
+        def _gather_scaled_fp4_experts_quant_fake(
+            output: torch.Tensor,
+            output_scale: torch.Tensor,
+            input: torch.Tensor,
+            row_map: torch.Tensor,
+            input_global_scale: torch.Tensor,
+            input_offset_by_experts: torch.Tensor,
+            output_scale_offset_by_experts: torch.Tensor,
+        ) -> None:
+            return None
+
+        _fakes_registered.add("gather_scaled_fp4_experts_quant")
+
+    if "moe_route_local" not in _fakes_registered and _op_defined("moe_route_local"):
+
+        @torch.library.register_fake("_muse_C::moe_route_local")
+        def _moe_route_local_fake(
+            topk_ids: torch.Tensor,
+            expert_map: torch.Tensor | None,
+            num_local_experts: int,
+            n: int,
+            k: int,
+            expert_offsets: torch.Tensor,
+            blockscale_offsets: torch.Tensor,
+            problem_sizes1: torch.Tensor,
+            problem_sizes2: torch.Tensor,
+            a_map: torch.Tensor,
+            c_map: torch.Tensor,
+        ) -> None:
+            return None
+
+        _fakes_registered.add("moe_route_local")
+
+
 def _register_decode_fakes() -> None:
     """Fakes of the NVFP4 decode MoE ops (they only write their arguments)."""
     if "nvfp4_decode_moe" in _fakes_registered or not _op_defined("nvfp4_decode_moe"):
@@ -382,6 +424,7 @@ def load() -> None:
     try:
         _register_fakes()
         _register_decode_fakes()
+        _register_prefill_moe_fakes()
     except Exception:
         logger.warning("Could not register _muse_C fake ops", exc_info=True)
 
@@ -409,6 +452,130 @@ def _allocate_experts_quant_outputs(
         MAX_TOKENS_PER_EXPERT * topk, padded_k, dtype=torch.int32, device=device
     )
     return output, output_scales
+
+
+
+def moe_route_local(
+    topk_ids: torch.Tensor,
+    expert_map: torch.Tensor | None,
+    num_local_experts: int,
+    intermediate_size: int,
+    hidden_size: int,
+) -> tuple[torch.Tensor, ...]:
+    """Routing data of the CUTLASS grouped GEMMs of one expert-parallel rank.
+
+    What ``remap_topk_to_local`` and ``vllm._custom_ops.get_cutlass_moe_mm_data``
+    (the NVFP4 flavour, with block-scale offsets) give together, from the global
+    ids, in three short kernels and with no work per remote route.
+
+    Args:
+        topk_ids: [num_tokens, top_k] int32 global expert ids, contiguous
+        expert_map: [num_global_experts] int32 local id or -1, or None if the ids
+            are local already
+    Returns:
+        ``(expert_offsets, blockscale_offsets, problem_sizes1, problem_sizes2,
+        a_map, c_map)``, all int32: the first row of every expert [E + 1], the
+        same with every expert padded to whole 128-row tiles [E + 1], the
+        (m, 2n, k) and (m, k, n) problem sizes of the two GEMMs [E, 3], the token
+        of every local row (-1 past the local rows) [num_routes], and the row of
+        every route (-1 for a remote one) [num_routes].
+    """
+    load()
+    device = topk_ids.device
+    num_routes = topk_ids.numel()
+    expert_offsets = torch.empty(
+        num_local_experts + 1, dtype=torch.int32, device=device
+    )
+    blockscale_offsets = torch.empty_like(expert_offsets)
+    problem_sizes1 = torch.empty(
+        (num_local_experts, 3), dtype=torch.int32, device=device
+    )
+    problem_sizes2 = torch.empty_like(problem_sizes1)
+    a_map = torch.empty(num_routes, dtype=torch.int32, device=device)
+    c_map = torch.empty_like(a_map)
+    torch.ops._muse_C.moe_route_local(
+        topk_ids,
+        expert_map,
+        num_local_experts,
+        intermediate_size,
+        hidden_size,
+        expert_offsets,
+        blockscale_offsets,
+        problem_sizes1,
+        problem_sizes2,
+        a_map,
+        c_map,
+    )
+    return (
+        expert_offsets,
+        blockscale_offsets,
+        problem_sizes1,
+        problem_sizes2,
+        a_map,
+        c_map,
+    )
+
+
+def is_loaded() -> bool:
+    """Whether ``load()`` has succeeded in this process. Never builds."""
+    return _loaded
+
+
+def gather_scaled_fp4_experts_quant(
+    input_tensor: torch.Tensor,
+    row_map: torch.Tensor,
+    input_global_scale: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    blockscale_offsets: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``vllm._custom_ops.scaled_fp4_experts_quant`` of ``input_tensor[row_map]``.
+
+    The permuted activation matrix is never built: row ``r`` of the result is the
+    quantization of ``input_tensor[row_map[r]]`` with the scale and the
+    scale-factor layout of the expert that owns row ``r``, and only the first
+    ``expert_offsets[-1]`` rows (the local routes) are computed. The bytes are
+    those of the stock op on the shuffled copy.
+
+    Args:
+        input_tensor: Activations [num_tokens, k], bf16 or fp16, k % 256 == 0
+        row_map: [num_routes] int32 source row of every permuted row; only the
+            entries below ``expert_offsets[-1]`` are read
+        input_global_scale: A per-expert scaling factor [n_experts]
+        expert_offsets: The expert offsets tensor [n_experts+1]
+        blockscale_offsets: The blockscale offsets tensor [n_experts+1]
+    Outputs:
+        output: The quantized tensor in NVFP4 [num_routes, k/2]
+        output_scales: The blockscale tensor in FP8-E4M3
+    """
+    load()
+    assert input_tensor.ndim == 2, (
+        f"input.ndim needs to be == 2, but got {input_tensor.ndim}."
+    )
+    num_routes = row_map.shape[0]
+    k = input_tensor.shape[1]
+    padded_k = (k // 16 + (4 - 1)) // 4
+    num_experts = input_global_scale.shape[0]
+    # output is uint8 and packed fp4 values
+    output = torch.empty(
+        num_routes, k // 2, device=input_tensor.device, dtype=torch.uint8
+    )
+    # Each expert's scales start at a multiple of 128 rows.
+    output_scales = torch.empty(
+        num_routes + 128 * num_experts,
+        padded_k,
+        dtype=torch.int32,
+        device=input_tensor.device,
+    )
+    torch.ops._muse_C.gather_scaled_fp4_experts_quant(
+        output,
+        output_scales,
+        input_tensor,
+        row_map,
+        input_global_scale,
+        expert_offsets,
+        blockscale_offsets,
+    )
+    return output, output_scales.view(torch.float8_e4m3fn)
 
 
 def mul_and_silu_scaled_fp4_experts_quant(

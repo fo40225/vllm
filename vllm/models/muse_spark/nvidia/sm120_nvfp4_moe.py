@@ -28,6 +28,10 @@ the weights, and its CUTLASS path quantizes the intermediate with the fused
 ``_muse_C`` kernel that reads the halves in that order. The JIT-built extension
 (nvcc and ninja) is needed only where a decode engine runs.
 ``MuseSparkSm120NvFp4Experts.up_gate_layout`` says which layout a layer holds.
+
+Where the extension is loaded, the CUTLASS path also sorts and quantizes the
+local routes only (``_local_rows_usable``): an EP rank owns about one route in
+eight, and the stock sort and shuffle spend their time on the rest.
 """
 
 from typing import NamedTuple
@@ -87,6 +91,11 @@ logger = init_logger(__name__)
 # The grouped GEMM tiles are 128 wide in N and K, and the block scales are
 # swizzled in 128 x 4 tiles.
 _SHAPE_ALIGNMENT = 128
+# The row-gather quantization converts 8 elements per thread and needs whole
+# warps on a row.
+_GATHER_QUANT_ALIGNMENT = 256
+# The routing kernel scans the experts in one block.
+_MAX_ROUTE_EXPERTS = 1024
 # Bounds the temporary copy of one half while the gate / up halves are swapped.
 _SWAP_CHUNK_BYTES = 32 << 20
 # The grouped GEMM sets up its groups with one thread block of one thread each.
@@ -475,6 +484,7 @@ class MuseSparkSm120NvFp4Experts(mk.FusedMoEExpertsModular):
         # ``process_weights_after_loading``.
         self.exact_gemm1 = False
         self.exact_scales: ExactGemm1Scales | None = None
+        self.local_rows = envs.VLLM_MUSE_SPARK_SM120_PREFILL_LOCAL_ROWS
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         # The layer tensors seen here are not always the ones ``apply`` receives:
@@ -824,7 +834,8 @@ class MuseSparkSm120NvFp4Experts(mk.FusedMoEExpertsModular):
 
     def _gemm1_exact(
         self,
-        permuted_in: torch.Tensor,
+        a_fp4: torch.Tensor,
+        a_blockscale: torch.Tensor,
         w1: torch.Tensor,
         expert_offsets: torch.Tensor,
         blockscale_offsets: torch.Tensor,
@@ -832,8 +843,9 @@ class MuseSparkSm120NvFp4Experts(mk.FusedMoEExpertsModular):
         workspace2: torch.Tensor,
         top_k: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Quantizes the permuted activations, runs GEMM1 with the gate and up
-        halves apart, then quantizes SiLU * up.
+        """Runs GEMM1 on the quantized, permuted activations (``a_fp4`` and its
+        swizzled ``a_blockscale``) with the gate and up halves apart, then
+        quantizes SiLU * up.
 
         The grouped GEMM takes one alpha per group, so every half of an expert is
         a group of its own: ``w1`` [E, 2N, K / 2] and its swizzled block scales
@@ -845,18 +857,13 @@ class MuseSparkSm120NvFp4Experts(mk.FusedMoEExpertsModular):
         quantized with the true ``1 / a2``.
         """
         assert self.exact_scales is not None and self.w1_scale is not None
-        assert self.a1_gscale is not None
         logger.info_once(
             "MuseSpark SM120 MoE: the CUTLASS grouped GEMMs run GEMM1 with the gate "
             "and up global scales apart (VLLM_MUSE_SPARK_SM120_EXACT_GEMM1=1)."
         )
-        num_routes = permuted_in.size(0)
+        num_routes = a_fp4.size(0)
         num_experts = w1.size(0)
         intermediate = w1.size(1) // 2
-        a_fp4, a_blockscale = ops.scaled_fp4_experts_quant(
-            permuted_in, self.a1_gscale, expert_offsets, blockscale_offsets, top_k
-        )
-        # `permuted_in` is dead from here on.
         a_x2, offsets, sf_offsets, sizes = muse_c.split_gemm1_prepare(
             a_fp4, expert_offsets, blockscale_offsets, problem_sizes
         )
@@ -881,6 +888,21 @@ class MuseSparkSm120NvFp4Experts(mk.FusedMoEExpertsModular):
             blockscale_offsets,
             top_k,
             gate_first=not self.up_gate_layout,
+        )
+
+    def _local_rows_usable(self, hidden: int, num_experts: int) -> bool:
+        """Whether the CUTLASS path works on the local routes only.
+
+        That is the ``_muse_C`` routing (``moe_route_local``) and the row-gather
+        quantization of GEMM1's activations. They live in the extension, which is
+        never built just for them: the layers that run a decode engine have loaded
+        it by the first forward pass, any other keeps the stock path.
+        """
+        return (
+            self.local_rows
+            and hidden % _GATHER_QUANT_ALIGNMENT == 0
+            and num_experts < _MAX_ROUTE_EXPERTS
+            and muse_c.is_loaded()
         )
 
     def _apply_cutlass(
@@ -909,39 +931,83 @@ class MuseSparkSm120NvFp4Experts(mk.FusedMoEExpertsModular):
         intermediate = w2.size(2) * 2
         device = hidden_states.device
 
-        # Non-local routes become -1 and are placed after every local row.
         topk_ids = topk_ids.contiguous()
-        if expert_map is not None:
-            local_ids = remap_topk_to_local(topk_ids, expert_map, out_dtype=torch.int32)
+        local_rows = self._local_rows_usable(hidden, num_experts)
+        if local_rows:
+            logger.info_once(
+                "MuseSpark SM120 MoE: the CUTLASS path sorts and quantizes the "
+                "local routes only."
+            )
+            # The work is on the local routes: seven in eight routes of an EP8 rank
+            # are remote, and neither the sort nor the quantization touches them
+            # more than once. a_map: permuted row -> token (-1 past the local
+            # rows); c_map: route -> permuted row (-1 for a non-local route).
+            (
+                expert_offsets,
+                blockscale_offsets,
+                problem_sizes1,
+                problem_sizes2,
+                a_map,
+                c_map,
+            ) = muse_c.moe_route_local(
+                topk_ids.to(torch.int32),
+                None if expert_map is None else expert_map.to(torch.int32),
+                num_experts,
+                intermediate,
+                hidden,
+            )
+            a_fp4, a_blockscale = muse_c.gather_scaled_fp4_experts_quant(
+                hidden_states.contiguous(),
+                a_map,
+                self.a1_gscale,
+                expert_offsets,
+                blockscale_offsets,
+            )
         else:
-            local_ids = topk_ids.to(torch.int32)
-        expert_offsets = torch.empty(num_experts + 1, dtype=torch.int32, device=device)
-        blockscale_offsets = torch.empty_like(expert_offsets)
-        problem_sizes1 = torch.empty((num_experts, 3), dtype=torch.int32, device=device)
-        problem_sizes2 = torch.empty_like(problem_sizes1)
-        # a_map: permuted row -> token (-1 for the unused tail); c_map: route
-        # -> permuted row (num_routes for a non-local route).
-        a_map = torch.empty(num_routes, dtype=torch.int32, device=device)
-        c_map = torch.empty_like(a_map)
-        ops.get_cutlass_moe_mm_data(
-            local_ids,
-            expert_offsets,
-            problem_sizes1,
-            problem_sizes2,
-            a_map,
-            c_map,
-            num_experts,
-            intermediate,
-            hidden,
-            blockscale_offsets,
-            is_gated=True,
-        )
-
-        permuted_in = _resize_cache(workspace2, (num_routes, hidden))
-        _shuffle_rows_into(hidden_states.contiguous(), a_map, permuted_in)
+            # Non-local routes become -1 and are placed after every local row.
+            if expert_map is not None:
+                local_ids = remap_topk_to_local(
+                    topk_ids, expert_map, out_dtype=torch.int32
+                )
+            else:
+                local_ids = topk_ids.to(torch.int32)
+            expert_offsets = torch.empty(
+                num_experts + 1, dtype=torch.int32, device=device
+            )
+            blockscale_offsets = torch.empty_like(expert_offsets)
+            problem_sizes1 = torch.empty(
+                (num_experts, 3), dtype=torch.int32, device=device
+            )
+            problem_sizes2 = torch.empty_like(problem_sizes1)
+            # a_map: permuted row -> token (-1 for the unused tail); c_map: route
+            # -> permuted row (num_routes for a non-local route).
+            a_map = torch.empty(num_routes, dtype=torch.int32, device=device)
+            c_map = torch.empty_like(a_map)
+            ops.get_cutlass_moe_mm_data(
+                local_ids,
+                expert_offsets,
+                problem_sizes1,
+                problem_sizes2,
+                a_map,
+                c_map,
+                num_experts,
+                intermediate,
+                hidden,
+                blockscale_offsets,
+                is_gated=True,
+            )
+            permuted_in = _resize_cache(workspace2, (num_routes, hidden))
+            _shuffle_rows_into(hidden_states.contiguous(), a_map, permuted_in)
+            # NOTE: the op allocates a fixed-size scale buffer on every call; it
+            # has no preallocated variant in the Python wrapper.
+            a_fp4, a_blockscale = ops.scaled_fp4_experts_quant(
+                permuted_in, self.a1_gscale, expert_offsets, blockscale_offsets, top_k
+            )
+            # `permuted_in` is dead from here on.
         if self.exact_scales is not None and 2 * num_experts <= _MAX_GEMM_GROUPS:
             h_fp4, h_blockscale = self._gemm1_exact(
-                permuted_in,
+                a_fp4,
+                a_blockscale,
                 w1,
                 expert_offsets,
                 blockscale_offsets,
@@ -950,12 +1016,6 @@ class MuseSparkSm120NvFp4Experts(mk.FusedMoEExpertsModular):
                 top_k,
             )
         else:
-            # NOTE: the op allocates a fixed-size scale buffer on every call; it
-            # has no preallocated variant in the Python wrapper.
-            a_fp4, a_blockscale = ops.scaled_fp4_experts_quant(
-                permuted_in, self.a1_gscale, expert_offsets, blockscale_offsets, top_k
-            )
-            # `permuted_in` is dead from here on.
             gemm1_out = _resize_cache(workspace2, (num_routes, 2 * intermediate))
             ops.cutlass_fp4_moe_mm(
                 gemm1_out,
@@ -1002,11 +1062,14 @@ class MuseSparkSm120NvFp4Experts(mk.FusedMoEExpertsModular):
             ].view(num_routes, hidden)
             _shuffle_rows_into(down, c_map, rows)
             return route_major_moe_output(rows, topk_weights, topk_ids, expert_map)
-        permuted_idx = (
-            torch.where(c_map < num_routes, c_map, -1)
-            .view(num_tokens, top_k)
-            .to(torch.int32)
-        )
+        if local_rows:
+            permuted_idx = c_map.view(num_tokens, top_k)
+        else:
+            permuted_idx = (
+                torch.where(c_map < num_routes, c_map, -1)
+                .view(num_tokens, top_k)
+                .to(torch.int32)
+            )
         return UnfinalizedMoEOutput(
             gemm2_permuted=down,
             expert_weights=topk_weights,

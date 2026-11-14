@@ -930,6 +930,8 @@ def test_layer_without_the_extension_runs_cutlass_only(
         raise RuntimeError("no compiler today")
 
     monkeypatch.setattr(muse_c, "load", failing_load)
+    # An earlier test may have loaded the library in this process.
+    monkeypatch.setattr(muse_c, "_loaded", False)
     router, runner, vllm_config = _build_layer(layer)
     routed = runner.routed_experts
     quant_method = routed.quant_method
