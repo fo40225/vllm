@@ -430,6 +430,35 @@ def test_threshold_follows_the_sequence_parallel_minimum_of_the_model() -> None:
     assert parallel.dbo_prefill_token_threshold == 2050
 
 
+def test_split_point_lies_beyond_the_decode_and_verify_rows() -> None:
+    """The decode-like rows of a step (verify rows of 1 + K tokens, up to
+    max_num_seqs of them) must fit in the first microbatch: the threshold keeps the
+    split point past them, whatever the model's own minimum is."""
+    from vllm.v1.worker.gpu.ubatch_utils import fit_prefill_threshold_to_model
+
+    model = SimpleNamespace(min_tokens_per_ubatch=385)
+    # The production line (mns 128, K = 7: 1,024 verify tokens): the floor of the
+    # launch (2,050) already clears it, nothing changes.
+    parallel = _parallel()
+    fit_prefill_threshold_to_model(parallel, model, max_decode_tokens=128 * 8)
+    assert parallel.dbo_prefill_token_threshold == 2050
+    # mns 128 with K = 15 (2,048 verify tokens) and mns 512 with K = 7 (4,096).
+    for mns, dql in ((128, 16), (512, 8), (256, 8)):
+        parallel = _parallel()
+        fit_prefill_threshold_to_model(parallel, model, max_decode_tokens=mns * dql)
+        assert parallel.dbo_prefill_token_threshold == 2 * (mns * dql + 1)
+        # A split batch at the threshold puts all verify tokens in the first half.
+        assert parallel.dbo_prefill_token_threshold // 2 > mns * dql
+    # A model without a minimum is held to the same rule ...
+    parallel = _parallel()
+    fit_prefill_threshold_to_model(parallel, object(), max_decode_tokens=4096)
+    assert parallel.dbo_prefill_token_threshold == 2 * 4097
+    # ... but generic microbatching (the DP path) keeps its own threshold.
+    parallel = _parallel(ubatch_overlap_tp_collectives=False)
+    fit_prefill_threshold_to_model(parallel, object(), max_decode_tokens=4096)
+    assert parallel.dbo_prefill_token_threshold == 2050
+
+
 def test_threshold_is_left_alone_for_a_model_without_a_minimum() -> None:
     from vllm.models.muse_spark.nvidia.model import MuseSpark1xForCausalLM
     from vllm.v1.worker.gpu.ubatch_utils import fit_prefill_threshold_to_model

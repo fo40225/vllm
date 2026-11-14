@@ -630,7 +630,7 @@ class UBatchRunner:
 
 
 def fit_prefill_threshold_to_model(
-    parallel_config: ParallelConfig, model: Any
+    parallel_config: ParallelConfig, model: Any, max_decode_tokens: int = 0
 ) -> None:
     """Split a batch only where every microbatch takes the model path of the batch.
 
@@ -640,19 +640,35 @@ def fit_prefill_threshold_to_model(
     configuration is final). The prefill threshold is raised to that many tokens
     per microbatch. Microbatches that take different paths still run (the
     hand-off tolerates unequal collective counts) but overlap less.
+
+    For microbatches that only overlap tensor-parallel collectives, the split point
+    must also lie beyond every decode-like row. ``max_decode_tokens`` is the most
+    tokens those rows can hold (``max_num_seqs * decode_query_len``: decodes and
+    speculative verify rows lead the sorted batch, at most ``decode_query_len``
+    tokens each). They then always run whole in the first microbatch, so that
+    no verify row is cut by a split and none can sit behind a prefix reader (see
+    ``GPUModelRunner._splits_prefix_from_writer``). With the usual launch lines
+    this is already the case (``max_num_seqs * (1 + K)`` is below the sequence-parallel
+    minimum); a launch with more verify tokens than that has fewer split batches.
     """
     min_tokens = getattr(model, "min_tokens_per_ubatch", 0)
-    if not isinstance(min_tokens, int) or min_tokens <= 0:
+    if not isinstance(min_tokens, int) or min_tokens < 0:
+        min_tokens = 0
+    if parallel_config.ubatch_overlap_tp_collectives and max_decode_tokens > 0:
+        min_tokens = max(min_tokens, max_decode_tokens + 1)
+    if min_tokens <= 0:
         return
     floor = get_num_ubatches(parallel_config) * min_tokens
     if parallel_config.dbo_prefill_token_threshold < floor:
         logger.info(
             "Microbatching of prefill batches starts at %d tokens (was %d): every "
             "microbatch must hold at least %d tokens to take the model's "
-            "large-batch path.",
+            "large-batch path and the split point must lie beyond the decode and "
+            "verify rows of a step (at most %d tokens).",
             floor,
             parallel_config.dbo_prefill_token_threshold,
             min_tokens,
+            max_decode_tokens,
         )
         parallel_config.dbo_prefill_token_threshold = floor
 

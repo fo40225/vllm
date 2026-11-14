@@ -1591,13 +1591,18 @@ def _step(
     scheduled: dict[str, int],
     new_computed: dict[str, int] | None = None,
     resumed_computed: dict[str, int] | None = None,
+    num_drafts: dict[str, int] | None = None,
 ) -> Any:
-    """A scheduler output with the given per-request token counts."""
+    """A scheduler output with the given per-request token counts (``num_drafts``:
+    the draft tokens among them, a speculative verify row)."""
     new_computed = new_computed or {}
     resumed_computed = resumed_computed or {}
     cached_ids = [r for r in scheduled if r not in new_computed]
     return SimpleNamespace(
         num_scheduled_tokens=scheduled,
+        scheduled_spec_decode_tokens={
+            r: [0] * n for r, n in (num_drafts or {}).items()
+        },
         scheduled_new_reqs=[
             SimpleNamespace(req_id=r, num_computed_tokens=n)
             for r, n in new_computed.items()
@@ -1627,6 +1632,60 @@ def test_prefix_reader_and_writer_of_one_step_are_never_split():
     assert splits(_step({"a": 4000, "b": 4000}, {"b": 0}, {"a": 2048}))
     # A one-token reader (the whole prompt was cached) with a prefill beside it.
     assert splits(_step({"a": 1, "b": 4000}, {"a": 4095}))
+
+
+def _verify_chunk_slices(verify_lens: list[int], chunk: int, threshold: int):
+    """The slices of a sorted step (verify rows first, then one prefill chunk)."""
+    from vllm.v1.worker.gpu.model_runner import sort_batch_req_ids
+
+    scheduled = {f"v{i}": n for i, n in enumerate(verify_lens)}
+    scheduled["chunk"] = chunk
+    drafts = {r: [0] * (n - 1) for r, n in scheduled.items() if r != "chunk"}
+    order = sort_batch_req_ids(scheduled, drafts, max(verify_lens))
+    assert order[-1] == "chunk"
+    tokens = np.array([scheduled[r] for r in order], dtype=np.int32)
+    total = int(tokens.sum())
+    assert total >= threshold
+    sliced, _ = maybe_create_ubatch_slices(True, tokens, total, len(tokens), 2)
+    return tokens, sliced
+
+
+def test_verify_rows_stay_whole_in_the_first_microbatch():
+    """A sorted verify + chunk batch splits inside the chunk, never in a verify
+    row, for every batch the launch threshold lets through (K = 7, mns 128)."""
+    for verify_lens in ([8] * 128, [8] * 31, [8] * 100 + [4, 3, 2, 1] * 5, [8]):
+        for chunk in (2050 - sum(verify_lens), 4000, 7168, 8192 - sum(verify_lens)):
+            if chunk <= 1 or sum(verify_lens) + chunk < 2050:
+                continue
+            tokens, (first, second) = _verify_chunk_slices(verify_lens, chunk, 2050)
+            n_verify = len(verify_lens)
+            assert first.token_slice.stop == second.token_slice.start
+            # The split point is past the verify tokens: inside the chunk.
+            assert first.token_slice.stop > sum(verify_lens)
+            # The verify rows are in the first microbatch only; the chunk
+            # straddles (it is the one request both microbatches hold).
+            assert first.request_slice == slice(0, n_verify + 1)
+            assert second.request_slice == slice(n_verify, n_verify + 1)
+
+
+def test_speculative_verify_rows_are_no_prefix_writers():
+    """A verify row (1 + K tokens) writes only the tail block of its own request:
+    beside prefix readers the step still splits, as a plain decode does."""
+    splits = GPUModelRunner._splits_prefix_from_writer
+    verify = {f"v{i}": 8 for i in range(20)}
+    drafts = {r: 7 for r in verify}
+    # One prefill with a prefix hit and 20 verify rows: nothing to separate.
+    assert not splits(_step({"a": 5000, **verify}, {"a": 1000}, num_drafts=drafts))
+    # The same on a resumed request, and with verify rows of different lengths.
+    uneven = {**verify, "v0": 4, "v1": 1 + 3, "v2": 2}
+    uneven_drafts = {**drafts, "v0": 3, "v1": 3, "v2": 1}
+    assert not splits(_step({"a": 5000, **uneven}, {}, {"a": 2048}, uneven_drafts))
+    assert not splits(_step({"a": 5000, **uneven}, {"a": 8}, num_drafts=uneven_drafts))
+    # A second prefill still counts, with or without verify rows beside it.
+    two_prefills = {"a": 4000, "b": 4000, **verify}
+    assert splits(_step(two_prefills, {"a": 128}, num_drafts=drafts))
+    # A prefill of exactly 1 + K tokens without drafts is a writer.
+    assert splits(_step({"a": 4000, "p": 8, **verify}, {"a": 128}, num_drafts=drafts))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="DBO needs a GPU")

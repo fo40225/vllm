@@ -756,7 +756,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.max_num_reqs,
         )
         if self.ubatch_runner is not None:
-            fit_prefill_threshold_to_model(self.parallel_config, self.model)
+            fit_prefill_threshold_to_model(
+                self.parallel_config,
+                self.model,
+                max_decode_tokens=self.max_num_reqs * self.decode_query_len,
+            )
         if self.speculator is not None:
             self.speculator.pcp_manager = self.pcp_manager
         initialize_mamba_ssu_backend(
@@ -2038,8 +2042,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         writer in the second has not filled yet. Blocks of earlier steps are
         complete, so only a request admitted (or resumed) with computed tokens
         counts as a reader, and only another prefill of the step as its writer.
+
+        A decode row, and a speculative verify row (the token to verify plus its
+        draft tokens), is no writer for a reader's hit: the block it writes is the
+        partial tail block of its own request, which no other request can hit. The
+        batch is sorted decode-like rows first and the split point lies beyond all
+        of them (see ``fit_prefill_threshold_to_model``), so those rows always run in
+        the first microbatch, ahead of any reader.
         """
         scheduled = scheduler_output.num_scheduled_tokens
+        drafts = scheduler_output.scheduled_spec_decode_tokens
         readers = {
             new_req.req_id
             for new_req in scheduler_output.scheduled_new_reqs
@@ -2053,8 +2065,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         if not readers:
             return False
-        # A decode writes the one slot of its own, still unshared, block.
-        prefills = {req_id for req_id, n in scheduled.items() if n > 1}
+        # A decode writes the one slot of its own, still unshared, block; a verify
+        # row is a decode of 1 + len(drafts) tokens.
+        prefills = {
+            req_id
+            for req_id, n in scheduled.items()
+            if n - len(drafts.get(req_id, ())) > 1
+        }
         return len(prefills | readers) > 1
 
     @torch.inference_mode()
