@@ -155,12 +155,12 @@ void l2_prefetch(std::vector<at::Tensor> const& tensors, int64_t num_ctas,
 // (muse_spark_expert_prefetch.cu): maps topk_ids [T, 8] (T <= 8, global expert
 // ids; expert_map is the global-to-local map, null if the ids are local) to the
 // distinct local experts and prefetches their w13 / sf13 / w2 / sf2 slices (the
-// layout of nvfp4_decode_moe) in the order that kernel consumes them, GEMM1 of all
-// entries first, up to budget_bytes. With pdl it is launched as a programmatic
-// dependent of the kernel in front of it in the stream (the routing kernel) and
-// waits for it before it reads the ids. Reads the ids, writes nothing. For tests,
-// `dump` (int64) receives the (address, size) pairs of the requests, 2 words each,
-// in place of the prefetches.
+// layout of nvfp4_decode_moe) in the order that kernel consumes them, GEMM1 of
+// all entries first, up to budget_bytes. With pdl it is launched as a
+// programmatic dependent of the kernel in front of it in the stream (the
+// routing kernel) and waits for it before it reads the ids. Reads the ids,
+// writes nothing. For tests, `dump` (int64) receives the (address, size) pairs
+// of the requests, 2 words each, in place of the prefetches.
 void expert_prefetch(at::Tensor const& topk_ids,
                      std::optional<at::Tensor> const& expert_map,
                      at::Tensor const& w13, at::Tensor const& sf13,

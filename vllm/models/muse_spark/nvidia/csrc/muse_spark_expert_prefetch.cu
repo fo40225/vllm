@@ -12,12 +12,13 @@
 // only moves cache lines and writes nothing.
 //
 // Consumption order of one expert (see muse_nvfp4_decode_persist.cuh): the 256
-// GEMM1 units of 16 rows in groups of 8 (one group = 128 consecutive rows of the
-// up half, of the gate half, and the 32 KiB of block scales of each), then the
-// 256 GEMM2 units in groups of 8 (128 consecutive rows of w2 and their 32 KiB of
-// block scales). A group is cut into requests of 64 KiB (the rows) and 32 KiB (a
-// block of scales), the unit of the prefetch: the CTAs issue the requests one
-// thread each, so fewer, larger requests reach the memory system sooner.
+// GEMM1 units of 16 rows in groups of 8 (one group = 128 consecutive rows of
+// the up half, of the gate half, and the 32 KiB of block scales of each), then
+// the 256 GEMM2 units in groups of 8 (128 consecutive rows of w2 and their
+// 32 KiB of block scales). A group is cut into requests of 64 KiB (the rows)
+// and 32 KiB (a block of scales), the unit of the prefetch: the CTAs issue the
+// requests one thread each, so fewer, larger requests reach the memory system
+// sooner.
 
 // Only c10 headers: <ATen/cuda/CUDAContext.h> needs cusparse.h and
 // cusolverDn.h, which the stock runtime images do not ship.
@@ -38,7 +39,7 @@ namespace expert_pf {
 constexpr int kHidden = 4096;
 constexpr int kInter = 4096;
 constexpr int kTopK = 8;
-constexpr int kRowBytes = kHidden / 2;          // packed fp4 bytes of a weight row
+constexpr int kRowBytes = kHidden / 2;          // packed fp4 bytes of a row
 constexpr int kW13Rows = 2 * kInter;
 constexpr int kSfCols = kHidden / 16;           // block scale bytes of a row
 constexpr int kMaxRoutes = 64;                  // 8 tokens x top-8
@@ -58,7 +59,7 @@ constexpr int kExpertReqs2 = kGroups * kReqs2;  // 160 (9 MiB)
 constexpr int kGroupBytes1 = 2 * kRowReqs * kRowReqBytes + 2 * kScaleReqBytes;
 constexpr int kGroupBytes2 = kRowReqs * kRowReqBytes + kScaleReqBytes;
 static_assert(kSfCols * kRowsPerGroup == kScaleReqBytes,
-              "the scales of a 128-row group are one block of the swizzled layout");
+              "the scales of a 128-row group are one swizzled-layout block");
 
 struct Params {
   const int* topk_ids;      // [T, 8] global expert ids
@@ -73,7 +74,7 @@ struct Params {
   int up_first;
   int64_t budget_bytes;
   int wait_for_primary;
-  int64_t* dump;            // tests: (address, size) of the requests, not prefetched
+  int64_t* dump;            // tests: (address, size) of the requests, unused
   int64_t dump_size;
 };
 
@@ -101,8 +102,9 @@ __device__ __forceinline__ int64_t bytes_before(int n, int k) {
 
 // The address and size of request `k` of the consumption order of `n` entries
 // whose local experts are `expert[0..n)`.
-__device__ __forceinline__ const uint8_t* request(const Params& p, const int* expert,
-                                                  int n, int k, uint32_t* len) {
+__device__ __forceinline__ const uint8_t* request(const Params& p,
+                                                  const int* expert, int n,
+                                                  int k, uint32_t* len) {
   const int n1 = n * kExpertReqs1;
   if (k < n1) {
     const int g = k / kExpertReqs1;
@@ -117,13 +119,15 @@ __device__ __forceinline__ const uint8_t* request(const Params& p, const int* ex
     if (j < 2 * kRowReqs) {
       const int base = j < kRowReqs ? up_base : gate_base;
       *len = kRowReqBytes;
-      return w + (static_cast<int64_t>(base) + kRowsPerGroup * group) * kRowBytes +
+      return w +
+             (static_cast<int64_t>(base) + kRowsPerGroup * group) * kRowBytes +
              static_cast<int64_t>(j % kRowReqs) * kRowReqBytes;
     }
     // Swizzled scales: the 128-row block b of a half is 32 KiB at b * 32 KiB.
     const int base = (j == 2 * kRowReqs) ? up_base : gate_base;
     *len = kScaleReqBytes;
-    return sf + static_cast<int64_t>(base / kRowsPerGroup + group) * kScaleReqBytes;
+    return sf +
+           static_cast<int64_t>(base / kRowsPerGroup + group) * kScaleReqBytes;
   }
   const int k2 = k - n1;
   const int g = k2 / kExpertReqs2;
@@ -134,7 +138,8 @@ __device__ __forceinline__ const uint8_t* request(const Params& p, const int* ex
   if (j < kRowReqs) {
     *len = kRowReqBytes;
     return p.w2 +
-           (e * kHidden + static_cast<int64_t>(kRowsPerGroup) * group) * kRowBytes +
+           (e * kHidden + static_cast<int64_t>(kRowsPerGroup) * group) *
+               kRowBytes +
            static_cast<int64_t>(j) * kRowReqBytes;
   }
   *len = kScaleReqBytes;
@@ -150,8 +155,8 @@ __global__ void __launch_bounds__(kBlockThreads)
   __shared__ int n_entries;
 
   const int tid = threadIdx.x;
-  // The ids are written by the routing kernel in front of this one in the stream.
-  // Nothing above touches global memory.
+  // The ids are written by the routing kernel in front of this one in the
+  // stream. Nothing above touches global memory.
   if (p.wait_for_primary) {
     asm volatile("griddepcontrol.wait;" ::: "memory");
   }
@@ -167,9 +172,10 @@ __global__ void __launch_bounds__(kBlockThreads)
   }
   lid[tid] = l;
   __syncthreads();
-  // One entry per distinct local expert, in order of first appearance (the order
-  // of the kernel's plan; an expert with more routes than the kernel's column
-  // limit only adds entries of the same expert, which are the same bytes).
+  // One entry per distinct local expert, in order of first appearance (the
+  // order of the kernel's plan; an expert with more routes than the kernel's
+  // column limit only adds entries of the same expert, which are the same
+  // bytes).
   bool creator = l >= 0;
   for (int j = 0; creator && j < tid; ++j) {
     creator = lid[j] != l;
@@ -206,8 +212,8 @@ __global__ void __launch_bounds__(kBlockThreads)
   if (p.dump != nullptr && 2 * static_cast<int64_t>(limit) > p.dump_size) {
     limit = static_cast<int>(p.dump_size / 2);
   }
-  // CTA b issues the requests b, b + G, b + 2 G, ...: they reach the memory system
-  // in consumption order across the CTAs.
+  // CTA b issues the requests b, b + G, b + 2 G, ...: they reach the memory
+  // system in consumption order across the CTAs.
   for (int k = blockIdx.x; k < limit; k += gridDim.x) {
     uint32_t len = 0;
     const uint8_t* src = request(p, expert, n, k, &len);
@@ -216,12 +222,14 @@ __global__ void __launch_bounds__(kBlockThreads)
       p.dump[2 * k + 1] = len;
       continue;
     }
-    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(src), "r"(len)
+    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(src),
+                 "r"(len)
                  : "memory");
   }
 }
 
-void check_u8(at::Tensor const& t, char const* name, int64_t rows, int64_t cols) {
+void check_u8(at::Tensor const& t, char const* name, int64_t rows,
+              int64_t cols) {
   TORCH_CHECK(t.is_cuda() && t.is_contiguous(), name,
               " must be a contiguous CUDA tensor");
   TORCH_CHECK(t.element_size() == 1 && t.dim() == 3 && t.size(1) == rows &&
@@ -263,8 +271,8 @@ void expert_prefetch(at::Tensor const& topk_ids,
   p.num_global = 0;
   if (expert_map.has_value()) {
     const at::Tensor& m = *expert_map;
-    TORCH_CHECK(m.is_cuda() && m.is_contiguous() && m.scalar_type() == at::kInt &&
-                    m.dim() == 1,
+    TORCH_CHECK(m.is_cuda() && m.is_contiguous() &&
+                    m.scalar_type() == at::kInt && m.dim() == 1,
                 "expert_map must be a contiguous int32 CUDA vector");
     p.expert_map = reinterpret_cast<const int*>(m.data_ptr());
     p.num_global = static_cast<int>(m.size(0));
@@ -300,7 +308,8 @@ void expert_prefetch(at::Tensor const& topk_ids,
   attr[0].val.programmaticStreamSerializationAllowed = 1;
   if (pdl) {
     // A programmatic dependent of the routing kernel: it is launched while that
-    // kernel finishes, and waits for it (griddepcontrol.wait) before it reads the ids.
+    // kernel finishes, and waits for it (griddepcontrol.wait) before it reads
+    // the ids.
     cfg.attrs = attr;
     cfg.numAttrs = 1;
   }

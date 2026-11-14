@@ -465,6 +465,34 @@ def test_the_prefetch_needs_the_muse_kernel_and_the_aux_routing(capturing):
     assert not _moe(prefetch=True, fp32_input=True).wants_cast_router_input(1)
 
 
+def test_the_op_has_a_fake_implementation():
+    """The module registers fakes for its ops so that a torch.compile trace of the
+    model can pass them (``expert_prefetch`` only hints the cache and returns
+    nothing)."""
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    def u8(*shape):
+        return torch.empty(shape, dtype=torch.uint8, device=DEVICE)
+
+    muse_c.load()
+    with FakeTensorMode():
+        ids = torch.zeros(1, TOP_K, dtype=torch.int32, device=DEVICE)
+        out = torch.ops._muse_C.expert_prefetch(
+            ids,
+            None,
+            u8(2, 8192, 2048),
+            u8(2, 8192, 256),
+            u8(2, 4096, 2048),
+            u8(2, 4096, 256),
+            True,
+            EXPERT_PREFETCH_CTAS,
+            EXPERT_PREFETCH_BYTES,
+            False,
+            None,
+        )
+    assert out is None
+
+
 def test_an_eager_forward_neither_prefetches_nor_fuses_the_cast(monkeypatch):
     """Eager decode (enforce-eager, an uncaptured small mixed batch) queues no
     prefetch, so its boundary must not pay for the fused router cast either."""

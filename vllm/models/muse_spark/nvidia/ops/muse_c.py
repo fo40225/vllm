@@ -450,6 +450,30 @@ def _register_l2_prefetch_fake() -> None:
     _fakes_registered.add("l2_prefetch")
 
 
+def _register_expert_prefetch_fake() -> None:
+    """Fake of the expert prefetch op (it only hints the cache)."""
+    if "expert_prefetch" in _fakes_registered or not _op_defined("expert_prefetch"):
+        return
+
+    @torch.library.register_fake("_muse_C::expert_prefetch")
+    def _expert_prefetch_fake(
+        topk_ids: torch.Tensor,
+        expert_map: torch.Tensor | None,
+        w13: torch.Tensor,
+        sf13: torch.Tensor,
+        w2: torch.Tensor,
+        sf2: torch.Tensor,
+        up_first: bool,
+        num_ctas: int,
+        budget_bytes: int,
+        pdl: bool,
+        dump: torch.Tensor | None = None,
+    ) -> None:
+        return None
+
+    _fakes_registered.add("expert_prefetch")
+
+
 def load() -> None:
     """Load the `_muse_C` library, building it on the first use of a cache dir.
 
@@ -479,6 +503,7 @@ def load() -> None:
         _register_decode_fakes()
         _register_prefill_moe_fakes()
         _register_l2_prefetch_fake()
+        _register_expert_prefetch_fake()
     except Exception:
         logger.warning("Could not register _muse_C fake ops", exc_info=True)
 
