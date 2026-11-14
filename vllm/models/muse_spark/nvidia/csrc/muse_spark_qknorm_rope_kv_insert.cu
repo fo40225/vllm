@@ -378,6 +378,10 @@ fusedMuseSparkQKNormRopeKVInsertKernel(
   // PDL is not enabled on the launch.
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
   cudaGridDependencySynchronize();
+  // Let the successor (the attention kernel, which waits for this kernel to
+  // finish before it reads q and the KV cache) launch now rather than when the
+  // last block is done: its launch and setup overlap this kernel.
+  cudaTriggerProgrammaticLaunchCompletion();
 #endif
 
   // Q, K and V are contiguous head slots at the head of the row, so the slot
@@ -492,11 +496,6 @@ fusedMuseSparkQKNormRopeKVInsertKernel(
       }
     }
   }
-
-  // PDL: let a dependent successor launch early.
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
-  cudaTriggerProgrammaticLaunchCompletion();
-#endif
 }
 
 template <typename scalar_t, typename cache_t, KVCacheDtype kv_dt,
