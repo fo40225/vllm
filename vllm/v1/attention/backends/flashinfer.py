@@ -857,6 +857,37 @@ class FlashInferMetadata:
     """
 
 
+def host_seq_lens_plan(
+    level: int,
+    *,
+    use_dcp: bool,
+    all_uses_trtllm: bool,
+    num_prefills: int,
+    num_decodes: int,
+    prefill_use_trtllm: bool,
+    decode_with_flashinfer_trtllm_api: bool,
+    num_speculative_tokens: int,
+    has_upper_bound: bool,
+) -> tuple[bool, bool]:
+    """Decide how a build gets the sequence lengths on the host.
+
+    Returns (needs_seq_lens_cpu, use_upper_bound). The levels are those of
+    VLLM_MUSE_SPARK_SM120_FI_HOST_LENS; level 0 is the behaviour before the flag.
+    """
+    if level <= 0:
+        needs = use_dcp or not all_uses_trtllm
+        return needs, needs and num_speculative_tokens == 0 and has_upper_bound
+    # Rows that run the native FlashInfer prefill or decode wrappers read the host
+    # lengths (page counts and the plan); XQA / trtllm decode and trtllm prefill use
+    # the device lengths and the block table.
+    host_prefill_rows = num_prefills > 0 and not prefill_use_trtllm
+    host_decode_rows = num_decodes > 0 and not decode_with_flashinfer_trtllm_api
+    needs = use_dcp or host_prefill_rows or host_decode_rows
+    # The host upper bound over-counts the draft tokens of a decode row that the
+    # verify step rejects, so under speculation the exact lengths are fetched.
+    return needs, needs and num_speculative_tokens == 0 and has_upper_bound
+
+
 class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
     kv_cache_spec: AttentionSpec
     reorder_batch_threshold: int = 1
@@ -873,6 +904,12 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self.model_config = vllm_config.model_config
         self.attention_config = vllm_config.attention_config
         self._num_speculative_tokens = vllm_config.num_speculative_tokens
+        self._host_lens_level = envs.VLLM_MUSE_SPARK_SM120_FI_HOST_LENS
+        if self._host_lens_level not in (0, 1):
+            raise ValueError(
+                "VLLM_MUSE_SPARK_SM120_FI_HOST_LENS must be 0 or 1, got "
+                f"{self._host_lens_level}"
+            )
         self._workspace_buffer = None
         self._prefill_wrapper: (
             BatchPrefillWithPagedKVCacheWrapper | BatchDCPPrefillWrapper | None
@@ -1666,12 +1703,19 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # When all attention (both prefill and decode) uses TRTLLM,
         # seq_lens_cpu is not needed since TRTLLM paths use GPU tensors
         # (block_tables, seq_lens) directly.
-        needs_seq_lens_cpu = self.use_dcp or not all_uses_trtllm
+        needs_seq_lens_cpu, use_seq_lens_upper_bound = host_seq_lens_plan(
+            self._host_lens_level,
+            use_dcp=self.use_dcp,
+            all_uses_trtllm=all_uses_trtllm,
+            num_prefills=num_prefills,
+            num_decodes=num_decodes,
+            prefill_use_trtllm=prefill_use_trtllm,
+            decode_with_flashinfer_trtllm_api=decode_with_flashinfer_trtllm_api,
+            num_speculative_tokens=self._num_speculative_tokens,
+            has_upper_bound=common_attn_metadata.seq_lens_cpu_upper_bound is not None,
+        )
         if needs_seq_lens_cpu:
-            if (
-                self._num_speculative_tokens == 0
-                and common_attn_metadata.seq_lens_cpu_upper_bound is not None
-            ):
+            if use_seq_lens_upper_bound:
                 # No speculative token accounting, so the upper bound is exact.
                 seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
             else:

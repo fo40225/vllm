@@ -172,6 +172,7 @@ if TYPE_CHECKING:
     VLLM_MUSE_SPARK_SM120_TOPK_LOGITS_MIN_TOKENS: int = 2
     VLLM_MUSE_SPARK_SM120_VERIFY_TOPK_LOGITS: int = 3
     VLLM_MUSE_SPARK_SM120_DRAFT_FC_SHARD: int = 2
+    VLLM_MUSE_SPARK_SM120_FI_HOST_LENS: int = 0
     VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT: bool = True
     VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT_TABLE: str | None = None
     VLLM_MUSE_SPARK_SM120_DENSE_Q: bool = True
@@ -1845,6 +1846,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Read once, when the draft model is constructed.
     "VLLM_MUSE_SPARK_SM120_DRAFT_FC_SHARD": lambda: int(
         os.getenv("VLLM_MUSE_SPARK_SM120_DRAFT_FC_SHARD", "2")
+    ),
+    # Muse Spark on SM120: when the FlashInfer metadata builder reads the sequence
+    # lengths back from the device (seq_lens.cpu(): a pageable DtoH that synchronizes
+    # the stream). A build fetched them whenever any row of its batch could take a
+    # native FlashInfer path, and for every non-causal batch, although the non-causal
+    # draft of DFlash decodes on the XQA kernel, which reads the device lengths: the
+    # fetched value was never used. The sync makes the worker wait for all queued GPU
+    # work, so the draft launch and the next step's input and metadata preparation
+    # start only after the verify step is done (GPU idle time between the two).
+    # 0 = as before. 1 = fetch only when a row takes a path that reads host lengths
+    # (XQA / trtllm decode and trtllm prefill never do). The metadata is bitwise the
+    # same for both levels. Values other than 0 and 1 are rejected when the builder is
+    # constructed (the value is read there, once).
+    "VLLM_MUSE_SPARK_SM120_FI_HOST_LENS": lambda: int(
+        os.getenv("VLLM_MUSE_SPARK_SM120_FI_HOST_LENS", "0")
     ),
     # Muse Spark on SM120: place the experts of every MoE layer on the EP ranks by the
     # table of the model snapshot (vllm/models/muse_spark/nvidia/data/
