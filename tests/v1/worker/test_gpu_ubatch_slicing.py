@@ -675,10 +675,8 @@ def test_ubatch_runner_names_the_microbatch_that_failed(failed_ubatch):
 
     The first recorded failure is reported, not microbatch 0's later error from
     registering a recv hook on the exited microbatch 1. A microbatch that fails
-    *while its sibling is parked at a yield* hangs the step instead -- the
-    shared handoff protocol in `ubatching.py` has no way to unwind a parked
-    microbatch, and the V1 runner has the same gap. Fixing that means changing
-    `ubatching.py`, which is out of scope for the V2 runner.
+    while its sibling is parked at a handoff wakes it (`dbo_abort`): see
+    `test_failing_microbatch_unwinds_its_parked_sibling`.
     """
     vllm_config = _make_dbo_config()
     device = torch.device("cuda:0")
@@ -1375,3 +1373,41 @@ def test_prefix_reader_and_writer_of_one_step_are_never_split():
     assert splits(_step({"a": 4000, "b": 4000}, {"b": 0}, {"a": 2048}))
     # A one-token reader (the whole prompt was cached) with a prefill beside it.
     assert splits(_step({"a": 1, "b": 4000}, {"a": 4095}))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="DBO needs a GPU")
+def test_collective_input_block_is_reused_only_after_the_collective():
+    """The input of a collective is allocated on the compute stream and not
+    recorded on the comm stream: its block may be reused as soon as the call
+    returns, because the compute stream has waited for the collective by then."""
+    vllm_config = VllmConfig(parallel_config=_tp_only_parallel_config())
+    device = torch.device("cuda:0")
+    runner = _make_execution_runner(vllm_config)
+
+    class _ReusingInputModel(torch.nn.Module):
+        def forward(self, input_ids, positions, intermediate_tensors=None, **kw):
+            ctx = dbo_overlapping_context()
+            assert ctx is not None
+            x = torch.full((4, 1 << 18), 7.0, device=input_ids.device)
+
+            def slow_double(t: torch.Tensor) -> torch.Tensor:
+                torch.cuda._sleep(100_000_000)  # the collective is still running
+                return t * 2
+
+            y = ctx.run_collective(slow_double, x)
+            del x
+            # The same-size allocation can take the freed block: it is written
+            # only after the collective has finished reading it.
+            z = torch.full((4, 1 << 18), -1.0, device=input_ids.device)
+            return (y + z)[:, :1]
+
+    model_inputs = _make_model_inputs(16, device)
+    ubatch_state = _make_ubatch_state(
+        vllm_config,
+        [
+            UBatchSlice(slice(0, 4), slice(0, 8)),
+            UBatchSlice(slice(4, 8), slice(8, 16)),
+        ],
+    )
+    output = runner.run(_ReusingInputModel(), model_inputs, ubatch_state)
+    torch.testing.assert_close(output, torch.full((8, 1), 13.0, device=device))

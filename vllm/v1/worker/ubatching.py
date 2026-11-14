@@ -181,16 +181,18 @@ class UBatchContext:
         the threads hand off, which is the same on every rank.
 
         The caching allocator frees a block for reuse once the stream that
-        allocated it is done with it, so the result (allocated on the comm stream
-        while the compute stream reads it) and the input (allocated on the compute
-        stream while the comm stream reads it) are recorded on the other stream.
+        allocated it is done with it, so a result allocated on the comm stream while
+        the compute stream reads it is recorded on the compute stream. The input
+        needs no such record: it is allocated on the compute stream, and that
+        stream waits for the collective before any later kernel that could reuse
+        its block (a record would hold the blocks of every collective the CPU has
+        enqueued ahead of the GPU, hundreds of MiB, until the GPU gets to them).
         """
         compute_stream = self.compute_stream
         assert current_stream() == compute_stream
         self._signal_compute_done()
         self.update_stream(self.comm_stream)
         self._wait_compute_done()
-        input_.record_stream(self.comm_stream)
         self.collective_output_stream = compute_stream
         try:
             output = collective(input_)
