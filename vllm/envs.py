@@ -1758,20 +1758,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # candidates each, 1 for a step of greedy requests only) instead of the gathered
     # [rows, vocab] logits, their fp32 copy and the full-vocabulary passes of the
     # rejection sampler. 0: the full verification; 1: steps in which every request is
-    # greedy (the argmax of each row: the tokens of the full path, bit for bit); 2: also
-    # steps with requests of temperature > 0 and top_k <= K (the default top_k of the
-    # Muse Spark checkpoint is 64), with the block method and a draft distribution (the
-    # production drafter): the accepted length and the resampled token are drawn with
-    # the uniforms and Gumbel noise of the full path from the candidates, which carry
-    # all the target probability under the top-k mask, so the tokens are those of the
-    # full path up to fp32 rounding of the sums. A step takes the full path (all ranks
-    # decide alike, from the request state) when any request asks for logprobs,
-    # penalties, logit bias / allowed token ids / bad words, a thinking budget, a
-    # grammar bitmask, or, at temperature > 0, min_p, top_p, or a top_k above K, and
-    # for adaptive verification, a watermark or synthetic acceptance rates (launch).
-    # Needs VLLM_MUSE_SPARK_SM120_TOPK_LOGITS=1. The share of verified steps on the path
-    # and the reasons of the others are logged every 30 s. Read once, when the model
-    # runner is constructed.
+    # greedy (the argmax of each row: for finite logits the tokens of the full path,
+    # bit for bit); 2: also steps with requests of temperature > 0 and
+    # top_k <= K (the default top_k of the Muse Spark checkpoint is 64), with the block
+    # method and a draft distribution as wide as the vocabulary (the production
+    # drafter): the accepted length and the resampled token are drawn with the uniforms
+    # and Gumbel noise of the full path from the candidates, which carry all the target
+    # probability under the top-k mask, so the tokens are those of the full path up to
+    # fp32 rounding of the sums (the distribution of the output is the same). A step
+    # takes the full path (all ranks decide alike, from the request state) when any
+    # request asks for logprobs, penalties, logit bias / allowed token ids / bad words,
+    # a thinking budget, a grammar bitmask, or, at temperature > 0, min_p, top_p, or a
+    # top_k above K: ONE such request sends all the rows of its step to the full path.
+    # The whole path is off for adaptive verification, a watermark, synthetic
+    # acceptance rates, a rejection sampler of another class, and a draft distribution
+    # narrower than the vocabulary; with a draft distribution of another width than
+    # the vocabulary, or without one, only the greedy steps take it. Needs
+    # VLLM_MUSE_SPARK_SM120_TOPK_LOGITS=1. The share of verified steps on the path and
+    # the reasons of the others are logged every 30 s ("steps with drafts"; those steps
+    # do not count in the lines of the top-k logits sampling). Read once, in load_model.
     "VLLM_MUSE_SPARK_SM120_VERIFY_TOPK_LOGITS": lambda: int(
         os.getenv("VLLM_MUSE_SPARK_SM120_VERIFY_TOPK_LOGITS", "0")
     ),

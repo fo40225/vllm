@@ -1195,10 +1195,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         It builds on the top-k logits path (candidates per rank) and the plain
         rejection sampler of a speculative launch that verifies with fixed step
-        boundaries. Sampled rows need the block method and a draft distribution exactly
-        as wide as the target vocabulary (the full path restricts every sum to the
-        narrower of the two, which the candidates cannot do for a wider draft);
-        otherwise only the greedy steps are verified from the candidates.
+        boundaries (a subclass may override the verification this path replaces). The
+        full path restricts every pass, the greedy argmax included, to the narrower of
+        the target vocabulary and the draft distribution, which the candidates cannot
+        do for a narrower draft: such a launch verifies from the full logits. Sampled
+        rows need the block method and a draft distribution exactly as wide as the
+        target vocabulary (also the sums over a wider draft are cut to the vocabulary
+        in the full path); otherwise only the greedy steps are verified from the
+        candidates.
         """
         level = envs.VLLM_MUSE_SPARK_SM120_VERIFY_TOPK_LOGITS
         if level <= 0:
@@ -1213,7 +1217,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         rejection_sampler = self.rejection_sampler
         if self.topk_logits_k == 0 or rejection_sampler is None:
             return 0
-        reason = rejection_sampler.topk_verify_launch_reason
+        speculator = self.speculator
+        draft_logits = None if speculator is None else speculator.draft_logits
+        if type(rejection_sampler) is not RejectionSampler:
+            reason = "the rejection sampler is not the plain RejectionSampler"
+        elif draft_logits is not None and draft_logits.shape[-1] < self.vocab_size:
+            reason = "the draft distribution is narrower than the vocabulary"
+        else:
+            reason = rejection_sampler.topk_verify_launch_reason
         if reason is not None:
             logger.warning(
                 "Verifying drafts from the top-%d logits of every TP rank is off: %s.",
@@ -1221,8 +1232,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 reason,
             )
             return 0
-        speculator = self.speculator
-        draft_logits = None if speculator is None else speculator.draft_logits
         self.topk_verify_sampled = (
             level >= 2
             and rejection_sampler.use_block_verification
@@ -1237,7 +1246,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.topk_logits_k,
             )
         self.topk_verify_stats = RouteStats(
-            self.topk_logits_k, label="verified steps", threshold_note=False
+            self.topk_logits_k,
+            label="steps with drafts",
+            threshold_note=False,
+            action="verified from",
         )
         return level
 
@@ -1279,7 +1291,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         assert self.topk_verify_stats is not None
         line = self.topk_verify_stats.record(reason)
         if line is not None:
-            logger.info("Verifying drafts from the top-k logits: %s.", line)
+            logger.info("Verifying drafts: %s.", line)
         if reason is not None:
             return None
         if not self._topk_verify_logged:

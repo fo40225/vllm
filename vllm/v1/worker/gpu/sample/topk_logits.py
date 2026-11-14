@@ -657,9 +657,11 @@ class RouteStats:
         clock: Callable[[], float] = time.monotonic,
         label: str = "sampled steps",
         threshold_note: bool = True,
+        action: str = "drew from",
     ) -> None:
         self.k = k
         self.label = label
+        self.action = action
         self.threshold_note = threshold_note
         self.taken = 0
         self.taken_threshold = 0  # of the taken steps, those that keep every tie
@@ -676,7 +678,7 @@ class RouteStats:
         steps = self.steps
         share = 100.0 * self.taken / steps
         line = (
-            f"{self.taken} of {steps} {self.label} ({share:.1f}%) drew from the "
+            f"{self.taken} of {steps} {self.label} ({share:.1f}%) {self.action} the "
             f"top-{self.k} logits of every TP rank"
         )
         if self.threshold_note:

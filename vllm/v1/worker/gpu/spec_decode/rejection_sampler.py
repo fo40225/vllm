@@ -214,9 +214,26 @@ class RejectionSampler:
         The caller has checked `Sampler.topk_verify_plan` (and, for ``has_sampled``,
         that the block method and a draft distribution are there). The accepted tokens
         and the resampled token of every request are those of `__call__` for the same
-        logits: bit for bit for a greedy request, with the same draws (the uniforms and
-        Gumbel noise are keyed by seed, position and token id) for the others.
+        finite logits: bit for bit for a greedy request, with the same draws (the
+        uniforms and Gumbel noise are keyed by seed, position and token id) for the
+        others. A NaN logit is taken as absent (a candidate of no mass).
+
+        Raises:
+            ValueError: a request with temperature > 0 has a top_k above the candidates
+                per rank (``topk.k``): its target distribution would silently be
+                truncated to the candidates. Checked on the host copies of the request
+                state, which costs no device synchronisation.
+
         """
+        states = self.sampler.sampling_states
+        if has_sampled:
+            idx_np = input_batch.idx_mapping_np
+            random = states.temperature.np[idx_np] != 0.0
+            if np.any(states.top_k.np[idx_np][random] > topk.k):
+                raise ValueError(
+                    f"A sampled request has a top_k above the {topk.k} candidates per "
+                    "TP rank: the step has to take the full path."
+                )
         draft_sampled, pos = gather_draft_sampled(
             input_batch.input_ids,
             input_batch.positions,
@@ -225,7 +242,6 @@ class RejectionSampler:
             input_batch.expanded_local_pos,
             self.sampler.req_states.prefill_len.gpu,
         )
-        states = self.sampler.sampling_states
         sampled, num_sampled = topk_verify(
             topk,
             draft_sampled,

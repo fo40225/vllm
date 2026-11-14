@@ -129,7 +129,10 @@ def test_the_launch_reason_of_the_rejection_sampler(kwargs, reason):
 
 
 def resolve(monkeypatch, level, k=K, width=VOCAB_SIZE, **sampler_kwargs):
-    monkeypatch.setenv("VLLM_MUSE_SPARK_SM120_VERIFY_TOPK_LOGITS", str(level))
+    if level is None:
+        monkeypatch.delenv("VLLM_MUSE_SPARK_SM120_VERIFY_TOPK_LOGITS", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_MUSE_SPARK_SM120_VERIFY_TOPK_LOGITS", str(level))
     runner = SimpleNamespace(
         topk_logits_k=k,
         vocab_size=VOCAB_SIZE,
@@ -152,13 +155,9 @@ def test_the_level_follows_the_flag(monkeypatch, level):
 
 
 def test_the_flag_is_off_by_default(monkeypatch):
-    monkeypatch.delenv("VLLM_MUSE_SPARK_SM120_VERIFY_TOPK_LOGITS", raising=False)
-    runner = SimpleNamespace(
-        topk_logits_k=K,
-        rejection_sampler=rejection_sampler(),
-        speculator=None,
-    )
-    assert GPUModelRunner._resolve_topk_verify_level(runner) == 0
+    got, runner = resolve(monkeypatch, None)
+    assert got == 0 and not runner.topk_verify_sampled
+    assert runner.topk_verify_stats is None
 
 
 @pytest.mark.parametrize(
@@ -170,12 +169,21 @@ def test_the_flag_is_off_by_default(monkeypatch):
         "watermark",
         "synthetic",
         "adaptive",
+        "rejection-sampler-subclass",
+        "narrow-draft-vocabulary",
     ],
 )
-def test_what_turns_the_path_off(monkeypatch, case):
-    level, k, kwargs = 2, K, {}
+@pytest.mark.parametrize("level", [1, 2])
+def test_what_turns_the_path_off(monkeypatch, case, level):
+    k, kwargs, width = K, {}, VOCAB_SIZE
     if case == "bad-level":
         level = 3
+    elif case == "rejection-sampler-subclass":
+        # A subclass may override what the path replaces: keep its full path.
+        kwargs = {"__class__": type("Sub", (RejectionSampler,), {})}
+    elif case == "narrow-draft-vocabulary":
+        # The full path cuts every pass, the greedy argmax too, to the draft's width.
+        width = VOCAB_SIZE - 1
     elif case == "no-topk-path":
         k = 0
     elif case == "watermark":
@@ -184,7 +192,7 @@ def test_what_turns_the_path_off(monkeypatch, case):
         kwargs = {"synthetic_conditional_rates": torch.ones(1)}
     elif case == "adaptive":
         kwargs = {"enable_adaptive_verification": True}
-    got, runner = resolve(monkeypatch, level, k=k, **kwargs)
+    got, runner = resolve(monkeypatch, level, k=k, width=width, **kwargs)
     if case == "no-rejection-sampler":
         runner.rejection_sampler = None
         got = GPUModelRunner._resolve_topk_verify_level(runner)
@@ -196,7 +204,6 @@ def test_what_turns_the_path_off(monkeypatch, case):
     [
         "standard-method",
         "no-draft-logits",
-        "narrow-draft-vocabulary",
         "wide-draft-vocabulary",
     ],
 )
@@ -206,8 +213,6 @@ def test_sampled_rows_need_the_block_method_and_a_draft_of_the_vocabulary_width(
     kwargs, width = {}, VOCAB_SIZE
     if case == "standard-method":
         kwargs = {"use_block_verification": False}
-    elif case == "narrow-draft-vocabulary":
-        width = VOCAB_SIZE - 1
     elif case == "wide-draft-vocabulary":
         # The full path restricts the draft sums to the target's width: not reproduced.
         width = VOCAB_SIZE + 8
@@ -268,7 +273,9 @@ def verify_runner(events: list, plan_result=(None, 1), level: int = 2, **kwargs)
         topk_logits_stats=RouteStats(K),
         topk_verify_level=level,
         topk_verify_sampled=True,
-        topk_verify_stats=RouteStats(K, label="verified steps", threshold_note=False),
+        topk_verify_stats=RouteStats(
+            K, label="steps with drafts", threshold_note=False, action="verified from"
+        ),
         _topk_verify_logged=True,
         _topk_logits_logged=True,
         adaptive_verification=None,
@@ -390,9 +397,45 @@ def test_the_step_predicate_reads_no_device_data():
 
 
 def test_the_route_stats_of_verified_steps_say_what_they_count():
-    stats = RouteStats(K, label="verified steps", threshold_note=False)
+    stats = RouteStats(
+        K, label="steps with drafts", threshold_note=False, action="verified from"
+    )
     line = stats.record(None)
-    assert line is not None and "1 of 1 verified steps (100.0%)" in line
+    assert (
+        line is not None
+        and "1 of 1 steps with drafts (100.0%) verified from the top-64" in line
+    )
     assert "FlashInfer" not in line
     line = stats.record("sampled-rows")
     assert line is not None and "sampled-rows: 1" in line
+
+
+def _verify_topk_args(temperature, top_k, k=K):
+    rs = rejection_sampler()
+    rs.sampler = SimpleNamespace(
+        sampling_states=SimpleNamespace(
+            temperature=SimpleNamespace(np=np.asarray(temperature, dtype=np.float32)),
+            top_k=SimpleNamespace(np=np.asarray(top_k, dtype=np.int32)),
+        )
+    )
+    batch = SimpleNamespace(idx_mapping_np=np.arange(len(temperature), dtype=np.intp))
+    return rs, SimpleNamespace(k=k), batch
+
+
+def test_verify_topk_refuses_a_top_k_above_the_candidates():
+    """A misrouted step must fail, not truncate the target distribution silently."""
+    rs, topk, batch = _verify_topk_args([0.0, 1.0, 1.0], [VOCAB_SIZE, K, K + 1])
+    with pytest.raises(ValueError, match="top_k above the 64 candidates"):
+        rs.verify_topk(topk, batch, None, True)
+
+
+def test_verify_topk_accepts_what_the_candidates_cover():
+    """A greedy row ignores its top_k; a sampled row at k is covered. The check passes
+    and the stub batch then fails at the first device access (the gather)."""
+    rs, topk, batch = _verify_topk_args([0.0, 1.0], [VOCAB_SIZE, K])
+    with pytest.raises(AttributeError):
+        rs.verify_topk(topk, batch, None, True)
+    # A batch without sampled rows needs no check at all.
+    rs, topk, batch = _verify_topk_args([0.0, 0.0], [VOCAB_SIZE, VOCAB_SIZE], k=1)
+    with pytest.raises(AttributeError):
+        rs.verify_topk(topk, batch, None, False)
