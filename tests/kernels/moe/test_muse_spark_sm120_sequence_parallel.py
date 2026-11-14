@@ -548,6 +548,14 @@ def test_sm120_sequence_parallel_threshold(monkeypatch) -> None:
         # The reference launch and the floor of the fused all-reduce paths.
         (256, None, 512),
         (256, 1, 257),
+        # The speculative launch (verify batches of 8 tokens per request): a smaller
+        # capture size lets the env below 513 take effect. An env value below the
+        # default list's 513 is silently raised, so the floor needs both settings.
+        (256, 264, 264),
+        (256, 384, 384),
+        (256, 512, 512),
+        (256, 520, 520),
+        (512, 384, 513),
         (128, 1, 257),
         # Eager (no graphs) and an explicit wide capture range.
         (0, 1, 257),
@@ -569,6 +577,46 @@ def test_sm120_sequence_parallel_never_takes_cuda_graph_batches(
     assert min_tokens == expected
     assert min_tokens > (max_graph_tokens or 0)
     assert min_tokens > muse_model._SHARDED_PROJECTION_MAX_TOKENS
+
+
+def test_sm120_sequence_parallel_takes_the_speculative_verify_band(
+    monkeypatch,
+) -> None:
+    """The K=7 speculative launch that shards the verify batches of 48..64 requests
+    (S1-9 lever 1): ``--max-cudagraph-capture-size 256`` together with
+    ``VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_MIN_TOKENS=384``. A verify batch has 8
+    tokens per request: 32 requests (256 tokens) are the largest graph batch, 33..47
+    requests (264..376) run eagerly on the replicated stream, from 48 requests (384)
+    on the stream is sharded. Every such batch is a multiple of the world size, so
+    no rank carries a padded row."""
+    monkeypatch.setenv(MIN_TOKENS, "384")
+    floor = muse_model.sm120_sequence_parallel_min_tokens(
+        _vllm_config(max_graph_tokens=256)
+    )
+    assert floor == 384
+    for requests, sharded in (
+        (1, False),
+        (16, False),
+        (32, False),
+        (33, False),
+        (47, False),
+        (48, True),
+        (64, True),
+        (65, True),
+        (128, True),
+    ):
+        num_tokens = 8 * requests
+        assert num_tokens % 8 == 0
+        assert is_sequence_parallel_active(True, num_tokens, floor) == sharded, requests
+    # The default capture list (graphs up to 512 tokens) keeps the batches of up to
+    # 64 requests in graphs, off the stream, whatever the env says: the env is only
+    # half of the launch.
+    default_floor = muse_model.sm120_sequence_parallel_min_tokens(
+        _vllm_config(max_graph_tokens=512)
+    )
+    assert default_floor == 513
+    assert not is_sequence_parallel_active(True, 8 * 64, default_floor)
+    assert is_sequence_parallel_active(True, 8 * 65, default_floor)
 
 
 def test_sequence_parallel_activation_threshold(dist_init) -> None:
@@ -756,7 +804,7 @@ def test_fp32_split_k_reduction_restores_the_flag() -> None:
 
 
 @requires_sm120
-@pytest.mark.parametrize("num_tokens", [512, 1024, 1503, 3000, 4096, 8192])
+@pytest.mark.parametrize("num_tokens", [384, 512, 1024, 1503, 3000, 4096, 8192])
 def test_sequence_parallel_row_gate_matches_the_real_projections(
     num_tokens: int, dist_init
 ) -> None:
@@ -808,8 +856,10 @@ HIDDEN = 1024
 BRANCH_KINDS = ("nvfp4_cutlass", "bf16_triton", "nvfp4_marlin")
 # The ones that take an expert placement (see muse_moe_runner.expert_placement_blocker).
 PLACEMENT_BRANCH_KINDS = ("nvfp4_cutlass", "bf16_triton")
-# 257 is the smallest batch the stream takes (33 rows per rank, the last padded).
-BRANCH_TOKENS = (1024, 700, 257)
+# 257 is the smallest batch the stream takes by default (33 rows per rank, the last
+# padded); 384 and 512 are the verify batches of 48 and 64 requests of the speculative
+# launch that lowers the minimum to 384 (48 and 64 rows per rank).
+BRANCH_TOKENS = (1024, 700, 512, 384, 257)
 
 
 def _marlin_checkpoint() -> dict[str, torch.Tensor]:
