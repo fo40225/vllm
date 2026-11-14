@@ -15,6 +15,7 @@ import torch.nn.functional as F
 import vllm.models.muse_spark.nvidia.model as model_ops
 from vllm.models.muse_spark.nvidia.ops import muse_c
 from vllm.models.muse_spark.nvidia.ops.l2_prefetch import (
+    AFTER_EXPERTS_CTAS,
     L2_BUDGET_FRACTION,
     L2Prefetcher,
     l2_budget_bytes,
@@ -102,6 +103,30 @@ def test_graph_side_stream(evict_last):
     with torch.cuda.graph(graph):
         y = F.linear(x, w_qkv)
         prefetcher.launch([w_qkv, w_o])
+        out = F.linear(y[:, :1024], w_o)
+        prefetcher.join()
+    for _ in range(3):
+        graph.replay()
+    torch.accelerator.synchronize()
+    assert torch.equal(out, ref)
+
+
+@pytest.mark.parametrize("num_ctas", [None, 1, AFTER_EXPERTS_CTAS])
+def test_graph_launch_with_its_own_cta_count(num_ctas):
+    """The launch behind the experts takes its own CTA count; the default stays."""
+    w_qkv, w_o = _weights()
+    x = torch.randn(4, QKV_SHAPE[1], device=DEVICE, dtype=torch.bfloat16)
+    prefetcher = L2Prefetcher()
+    ref = F.linear(F.linear(x, w_qkv)[:, :1024], w_o)
+    warm = torch.cuda.Stream()
+    with torch.cuda.stream(warm):
+        F.linear(x, w_qkv)
+    torch.accelerator.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        y = F.linear(x, w_qkv)
+        prefetcher.launch([w_qkv, w_o], num_ctas=num_ctas)
         out = F.linear(y[:, :1024], w_o)
         prefetcher.join()
     for _ in range(3):

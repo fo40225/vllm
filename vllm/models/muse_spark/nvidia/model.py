@@ -124,6 +124,7 @@ from vllm.models.muse_spark.nvidia.ops.cute_dsl.qk_norm import (
     supports_qk_norm,
 )
 from vllm.models.muse_spark.nvidia.ops.l2_prefetch import (
+    AFTER_EXPERTS_CTAS,
     L2_PREFETCH_MAX_TOKENS,
     L2Prefetcher,
 )
@@ -2158,7 +2159,8 @@ class MuseSpark1xModel(LlamaModel):
                             *moe.sharded_weights(num_tokens, moe.unpooler),
                             next_attn.qkv_proj.weight.data,
                             next_attn.o_proj.weight.data,
-                        ]
+                        ],
+                        num_ctas=AFTER_EXPERTS_CTAS,
                     )
 
             return hook

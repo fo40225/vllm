@@ -14,9 +14,13 @@ written and no kernel output changes.
 The branch exists only inside a CUDA graph capture. Its join sits at the end of
 the model forward: the GEMMs need no ordering after the prefetch (it is a hint),
 and a join in front of them would stall the rank that finishes its MoE last. The
-prefetch is deliberately slow (4 CTAs, about 100 us for the 55 MB of the
-attention weights): issued as a burst (8 to 16 CTAs) it competes with the latency
-bound NCCL kernels for HBM and loses a part of the gain (16 CTAs: half of it).
+prefetch is throttled to a few CTAs (``AFTER_EXPERTS_CTAS`` for the 62 MB of the
+next attention weights): issued as a burst (12 to 16 CTAs) it competes with the
+latency bound collectives for HBM and loses the gain, but it must also be done
+before its readers. The launches share one stream, so a prefetch still running when
+the next one is due delays that one, and the pooler and router weights, queued
+behind the attention weights, arrived after their GEMVs in half of the layers when
+the launch took 113 us (4 CTAs).
 """
 
 from collections.abc import Sequence
@@ -33,6 +37,14 @@ logger = init_logger(__name__)
 L2_PREFETCH_MAX_TOKENS = 256
 # What one ``_muse_C::l2_prefetch`` launch takes.
 _MAX_TENSORS = 4
+# CTAs of the launch behind the experts of a layer (the unpooler, QKV and O weights of
+# the next layer, 62 MB at TP8). Host-tied tuning constant (8 RTX PRO 6000 on PCIe, muse
+# collectives, real weights, TPOT at batch 1 over 60 layers): 4 CTAs 10.69 ms, 8 CTAs
+# 9.85; with the expert prefetch on, 7 CTAs 9.94, 8 9.73, 9 9.65, 10 10.07 (12 CTAs
+# 10.65 without it). Too few finish behind the attention all-reduce and late for the
+# GEMMs; too many load HBM while the MoE all-reduce, which is latency bound, runs.
+# 8 keeps a margin to the slow 7 and 10.
+AFTER_EXPERTS_CTAS = 8
 # The most that one launch pulls into L2, as a share of the cache. The weights share
 # it with the activations, the KV blocks of the attention in flight, the NCCL buffers
 # and the weights of the op that is running, and a prefetch of more than the cache
@@ -110,8 +122,11 @@ class L2Prefetcher:
                 break
         return chosen
 
-    def launch(self, tensors: Sequence[torch.Tensor]) -> None:
-        """Prefetch ``tensors`` after the work queued on the current stream."""
+    def launch(
+        self, tensors: Sequence[torch.Tensor], num_ctas: int | None = None
+    ) -> None:
+        """Prefetch ``tensors`` after the work queued on the current stream, with
+        ``num_ctas`` CTAs (default: the prefetcher's)."""
         if not self._active():
             return
         tensors = self.select(tensors)
@@ -121,7 +136,7 @@ class L2Prefetcher:
         with torch.cuda.stream(self._stream):
             self._fork.wait()
             torch.ops._muse_C.l2_prefetch(
-                tensors, self.num_ctas, self.chunk_kib, self.evict_last
+                tensors, num_ctas or self.num_ctas, self.chunk_kib, self.evict_last
             )
         self._forked = True
         logger.info_once("MuseSpark: L2 weight prefetch captured into a CUDA graph.")
