@@ -869,7 +869,11 @@ PLACEMENT_BRANCH_KINDS = ("nvfp4_cutlass", "bf16_triton")
 # launch that lowers the minimum to 384 (48 and 64 rows per rank, no padded row). 387 is
 # a mixed batch of that launch in the same band (a prefill chunk next to the decoders:
 # 49 rows per rank, the last rank carries five zero rows that are sliced off again).
-BRANCH_TOKENS = (1024, 700, 512, 387, 384, 257)
+# The sizes of the stream inside the FULL decode graphs (S1-9 L11): 136 is the smallest
+# batch above the muse decode engine (1..128 tokens, which cannot take the sharded
+# path), 200 and 264 are not multiples of 16, 272 and 400 are capture sizes of the
+# default grid above 256, 137 and 263 carry padded rows on the last rank.
+BRANCH_TOKENS = (1024, 700, 512, 400, 387, 384, 272, 264, 257, 200, 137, 136)
 
 
 def _marlin_checkpoint() -> dict[str, torch.Tensor]:
@@ -1625,3 +1629,196 @@ def test_forward_takes_the_graph_floor_in_a_full_decode_graph_only(
         if not sharded:
             assert torch.equal(output, (x.float() + 2.0 / 3.0).to(torch.bfloat16))
         assert muse_model._SP_FLOOR_OVERRIDE.get() is None
+
+
+# The batches of the K = 7 speculative launch inside the graphs of a capture list that
+# reaches 512 (the default grid: steps of 8 up to 256, of 16 above), and sizes with
+# padded rows on the last rank.
+GRAPH_SP_TOKENS = (136, 137, 200, 256, 263, 264, 272, 376, 384, 400, 512)
+GRAPH_SP_REPLAYS = 20000
+
+
+def _graph_stream_worker(rank: int, world: int, port: int, out_path: str) -> None:
+    from vllm.config import ParallelConfig, VllmConfig
+    from vllm.distributed import (
+        get_tp_group,
+        init_distributed_environment,
+        initialize_model_parallel,
+        tensor_model_parallel_all_gather,
+        tensor_model_parallel_all_reduce,
+    )
+    from vllm.distributed.parallel_state import graph_capture
+    from vllm.models.common.ops.sequence_parallel import sp_all_gather
+
+    torch.cuda.set_device(rank)
+    if os.environ.get("MUSE_TOPO_ENABLE") == "1":
+        # The host plugin patches the TP communicator (the collectives of production).
+        from vllm.plugins import load_general_plugins
+
+        load_general_plugins()
+    config = VllmConfig(parallel_config=ParallelConfig(tensor_parallel_size=world))
+    with set_current_vllm_config(config):
+        init_distributed_environment(
+            world_size=world,
+            rank=rank,
+            local_rank=rank,
+            distributed_init_method=f"tcp://127.0.0.1:{port}",
+            backend="nccl",
+        )
+        initialize_model_parallel(tensor_model_parallel_size=world)
+
+    hidden, local_width = 8192, 1024
+    g = torch.Generator(device="cuda").manual_seed(100 + rank)
+    weight = (
+        torch.randn(hidden, local_width, generator=g, device="cuda") / local_width**0.5
+    ).to(torch.bfloat16)
+
+    class OProj:
+        # The row-parallel o_proj without its reduction: this rank's partial sum.
+        reduce_results = False
+
+        def __call__(self, x):
+            return torch.nn.functional.linear(x, weight), None
+
+    attention = SimpleNamespace(
+        is_sequence_parallel_output=True,
+        sp_min_tokens=384,
+        sp_row_gate=None,
+        gemm_rs=None,
+        o_proj=OProj(),
+    )
+    flagged = _decode_context(True)
+    eager_context = _decode_context(False)
+
+    def project(x, flagged_pass: bool):
+        """The attention output projection of a batch as the pass of a decode graph
+        (the warm-up and the capture pass) or an eager forward runs it."""
+        with override_forward_context(flagged if flagged_pass else eager_context):
+            floor = 136 if flagged_pass else None
+            with muse_model._sequence_parallel_graph_floor(floor):
+                return muse_model.MuseSpark1xAttention._project_output(
+                    attention, x, False
+                )
+
+    def chain(x, layers: int = 3):
+        """A few layers' worth of projection, reduce-scatter and gather in a row, each
+        taking the rows of the one before (what the replay of a decode graph runs)."""
+        out = x
+        for _ in range(layers):
+            rows = project(out, True)
+            full = sp_all_gather(rows)[: x.shape[0]]
+            out = (full[:, :local_width] * 0.5).to(torch.bfloat16).contiguous()
+        return out
+
+    results = {}
+    for num_tokens in GRAPH_SP_TOKENS:
+        x = torch.randn(num_tokens, local_width, generator=g, device="cuda").to(
+            torch.bfloat16
+        )
+        other = torch.randn(512, local_width, generator=g, device="cuda").to(
+            torch.bfloat16
+        )
+        with torch.inference_mode():
+            # An eager forward (no graph): replicated below the floor, all-reduced rows.
+            replicated = project(x, False)
+            reference = tensor_model_parallel_all_reduce(
+                torch.nn.functional.linear(x, weight)
+            )
+            # The warm-up pass of the graph (eager, flagged), and the same call again.
+            warm = project(x, True)
+            warm_again = project(x, True)
+            warm_chain = chain(x)
+            torch.cuda.synchronize()
+            graph, chain_graph = torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()
+            with graph_capture(device=torch.device("cuda", rank)) as capture:
+                with torch.cuda.graph(graph, stream=capture.stream):
+                    captured = project(x, True)
+                with torch.cuda.graph(chain_graph, stream=capture.stream):
+                    captured_chain = chain(x)
+            graph.replay()
+            chain_graph.replay()
+            torch.cuda.synchronize()
+            first, first_chain = captured.clone(), captured_chain.clone()
+            gathered = sp_all_gather(warm)[:num_tokens]
+            # Replays next to eager calls of other sizes: the collectives of one
+            # communicator are ordered on one stream, and a replay advances their
+            # counter on the device.
+            soak_equal = soak_chain_equal = True
+            replays = GRAPH_SP_REPLAYS if num_tokens in (136, 272) else 200
+            for i in range(replays):
+                graph.replay()
+                chain_graph.replay()
+                if i % 97 == 0:
+                    project(other, False)
+                    project(other[: 136 + i % 5], True)
+                if i % 1999 == 0 or i == replays - 1:
+                    torch.cuda.synchronize()
+                    soak_equal &= bool(torch.equal(captured, first))
+                    soak_chain_equal &= bool(torch.equal(captured_chain, first_chain))
+            torch.cuda.synchronize()
+            everyone = tensor_model_parallel_all_gather(first_chain.reshape(1, -1), 0)
+        diff = gathered.float() - reference.float()
+        results[str(num_tokens)] = dict(
+            replicated_rows=int(replicated.shape[0]),
+            sharded_rows=int(warm.shape[0]),
+            rows=-(-num_tokens // world),
+            rel_l2=float(diff.norm() / reference.float().norm()),
+            bitwise_vs_all_reduce=bool(torch.equal(gathered, reference)),
+            warm_repeats=bool(torch.equal(warm, warm_again)),
+            graph_equal=bool(torch.equal(first, warm)),
+            chain_graph_equal=bool(torch.equal(first_chain, warm_chain)),
+            soak_equal=soak_equal,
+            soak_chain_equal=soak_chain_equal,
+            same_on_all_ranks=bool((everyone == everyone[0]).all()),
+            replays=replays,
+            finite=bool(torch.isfinite(first.float()).all()),
+        )
+        torch.distributed.barrier()
+    if rank == 0:
+        topo = getattr(get_tp_group().device_communicator, "topo_comm", None)
+        results["_collectives"] = "muse_topo" if topo is not None else "nccl"
+        with open(out_path, "w") as f:
+            json.dump(results, f)
+    torch.distributed.barrier()
+
+
+@requires_sm120
+@pytest.mark.skipif(torch.cuda.device_count() < 8, reason="Requires 8 GPUs")
+def test_sharded_stream_replays_from_a_full_decode_graph(tmp_path) -> None:
+    """The attention-output reduce-scatter and gather of the sharded stream, captured
+    in CUDA graphs of 136..512 tokens (multiples of 8 and padded sizes) under the floor
+    of the graphs, on the collectives of the launch (the host plugin's when
+    MUSE_TOPO_ENABLE=1): the replay gives the bits of the warm-up pass and 20,000
+    replays next to eager calls of other sizes give them again (the collectives keep
+    their state on the device), the rows are the all-reduce up to rounding, and the
+    same projection of an eager forward stays replicated below 384 tokens."""
+    world = 8
+    out_path = str(tmp_path / "results.json")
+    port = 29900 + os.getpid() % 1000
+    mp.spawn(_graph_stream_worker, args=(world, port, out_path), nprocs=world)
+    with open(out_path) as f:
+        results = json.load(f)
+    collectives = results.pop("_collectives")
+    print(f"collectives: {collectives}; {json.dumps(results)}")
+    if os.environ.get("MUSE_TOPO_ENABLE") == "1":
+        assert collectives == "muse_topo", "the host plugin has no collectives"
+    assert set(results) == {str(t) for t in GRAPH_SP_TOKENS}
+    for tokens, result in results.items():
+        t = int(tokens)
+        assert result["finite"], (tokens, result)
+        assert result["sharded_rows"] == result["rows"], (tokens, result)
+        # Not a decode graph (an eager forward): replicated below the floor of 384.
+        assert result["replicated_rows"] == (result["rows"] if t >= 384 else t), (
+            tokens,
+            result,
+        )
+        assert result["warm_repeats"], (tokens, result)
+        assert result["graph_equal"] and result["chain_graph_equal"], (tokens, result)
+        assert result["soak_equal"] and result["soak_chain_equal"], (tokens, result)
+        assert result["same_on_all_ranks"], (tokens, result)
+        # Reduce-scatter + gather against the all-reduce of the same partial sums: the
+        # same bits on the host plugin's collectives (their reduce-scatter equals their
+        # all-reduce), rounding on NCCL.
+        if collectives == "muse_topo":
+            assert result["bitwise_vs_all_reduce"], (tokens, result)
+        assert result["rel_l2"] < 1e-2, (tokens, result)
