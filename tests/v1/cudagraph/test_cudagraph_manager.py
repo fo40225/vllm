@@ -639,3 +639,145 @@ def test_divisor_query_len_dispatch_is_unchanged(
         assert desc.cg_mode == CUDAGraphMode.FULL, num_tokens
         assert desc.num_tokens == expected, num_tokens
         assert desc.num_reqs == expected // decode_query_len, num_tokens
+
+
+@pytest.mark.parametrize(
+    "desc, expected",
+    [
+        # Decode-only graphs: uniform decode, and varlen decode (bounded query length).
+        (
+            BatchExecutionDescriptor(
+                cg_mode=CUDAGraphMode.FULL,
+                num_tokens=272,
+                num_reqs=34,
+                uniform_token_count=8,
+            ),
+            True,
+        ),
+        (
+            BatchExecutionDescriptor(
+                cg_mode=CUDAGraphMode.FULL,
+                num_tokens=272,
+                num_reqs=34,
+                max_query_len=8,
+            ),
+            True,
+        ),
+        # FULL graphs of mixed batches, PIECEWISE graphs and eager batches are not.
+        (
+            BatchExecutionDescriptor(
+                cg_mode=CUDAGraphMode.FULL, num_tokens=272, num_reqs=128
+            ),
+            False,
+        ),
+        (
+            BatchExecutionDescriptor(
+                cg_mode=CUDAGraphMode.PIECEWISE, num_tokens=272, num_reqs=None
+            ),
+            False,
+        ),
+        (
+            BatchExecutionDescriptor(
+                cg_mode=CUDAGraphMode.PIECEWISE,
+                num_tokens=272,
+                num_reqs=None,
+                uniform_token_count=8,
+            ),
+            False,
+        ),
+        (
+            BatchExecutionDescriptor(
+                cg_mode=CUDAGraphMode.NONE, num_tokens=272, num_reqs=34
+            ),
+            False,
+        ),
+    ],
+)
+def test_full_decode_graph_descriptors(desc, expected):
+    assert desc.is_full_decode_graph is expected
+
+
+def test_model_capture_flags_the_pass_of_a_full_decode_graph(monkeypatch):
+    """The warm-up and the capture pass of a FULL decode graph run the model with
+    cudagraph_runtime_mode NONE; the flag of the forward context is the only thing that
+    tells them from an eager forward. PIECEWISE passes and the FULL graphs of mixed
+    batches never carry it."""
+    from vllm.forward_context import get_forward_context, is_forward_context_available
+
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    monkeypatch.setattr(
+        gpu_cudagraph_utils.current_platform, "get_global_graph_pool", lambda: object()
+    )
+    monkeypatch.setattr(gpu_cudagraph_utils, "has_compiled_submodule", lambda _m: True)
+    monkeypatch.setattr(
+        gpu_cudagraph_utils, "prepare_inputs_to_capture", lambda *a, **k: (None, {})
+    )
+    vllm_config = _create_decode_vllm_config([8, 16, 24], max_num_seqs=8)
+    manager = gpu_cudagraph_utils.ModelCudaGraphManager(
+        vllm_config=vllm_config,
+        device=torch.device("cpu"),
+        cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+        decode_query_len=8,
+    )
+    manager.use_breakable_cg = False
+    created = {}
+
+    def record_create_forward_fn(self, create_forward_fn, progress_bar_desc):
+        created["create_forward_fn"] = create_forward_fn
+
+    monkeypatch.setattr(
+        gpu_cudagraph_utils.CudaGraphManager, "capture", record_create_forward_fn
+    )
+    seen: list[tuple[bool, CUDAGraphMode, int]] = []
+
+    def model(**inputs):
+        context = get_forward_context()
+        seen.append(
+            (
+                context.full_decode_graph,
+                context.cudagraph_runtime_mode,
+                inputs["input_ids"].shape[0],
+            )
+        )
+        return torch.zeros(inputs["input_ids"].shape[0], 4)
+
+    input_buffers = SimpleNamespace(
+        input_ids=torch.zeros(64, dtype=torch.int64),
+        positions=torch.zeros(64, dtype=torch.int64),
+        is_padding=torch.zeros(64, dtype=torch.bool),
+    )
+    manager.capture(
+        model,
+        SimpleNamespace(prepare_dummy_inputs=lambda num_reqs, num_tokens: {}),
+        input_buffers,
+        None,
+        None,
+        [],
+        None,
+    )
+    create_forward_fn = created["create_forward_fn"]
+    decode = BatchExecutionDescriptor(
+        cg_mode=CUDAGraphMode.FULL, num_tokens=16, num_reqs=2, uniform_token_count=8
+    )
+    mixed = BatchExecutionDescriptor(
+        cg_mode=CUDAGraphMode.FULL, num_tokens=16, num_reqs=8
+    )
+    piecewise = BatchExecutionDescriptor(
+        cg_mode=CUDAGraphMode.PIECEWISE, num_tokens=16, num_reqs=None
+    )
+    # The warm-up pass and the capture pass of a FULL graph call the model with NONE.
+    for warmup in (True, False):
+        create_forward_fn(decode, warmup)(CUDAGraphMode.NONE)
+        assert not is_forward_context_available()
+    create_forward_fn(mixed, True)(CUDAGraphMode.NONE)
+    create_forward_fn(piecewise, False)(CUDAGraphMode.PIECEWISE)
+    assert seen == [
+        (True, CUDAGraphMode.NONE, 16),
+        (True, CUDAGraphMode.NONE, 16),
+        (False, CUDAGraphMode.NONE, 16),
+        (False, CUDAGraphMode.PIECEWISE, 16),
+    ]

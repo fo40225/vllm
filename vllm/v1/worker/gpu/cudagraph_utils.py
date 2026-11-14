@@ -84,6 +84,14 @@ class BatchExecutionDescriptor:
     # Number of microbatches the batch is split into (DBO). 1 means no splitting.
     num_ubatches: int = 1
 
+    @property
+    def is_full_decode_graph(self) -> bool:
+        """A FULL graph of decode-only batches (uniform or varlen decode), the only
+        kind a mixed prefill batch is never dispatched to."""
+        return self.cg_mode == CUDAGraphMode.FULL and (
+            self.uniform_token_count is not None or self.max_query_len is not None
+        )
+
 
 def make_cudagraph_stats(
     batch_desc: BatchExecutionDescriptor, num_tokens: int
@@ -792,6 +800,9 @@ class ModelCudaGraphManager(CudaGraphManager):
                     slot_mapping=slot_mappings,
                     batch_descriptor=batch_descriptor,
                     is_padding=is_padding,
+                    # The warm-up and the capture pass of a decode graph both run the
+                    # model with cg_mode NONE; the flag is what tells them from eager.
+                    full_decode_graph=desc.is_full_decode_graph,
                 ):
                     if cg_mode == CUDAGraphMode.PIECEWISE:
                         # PIECEWISE graph (compiled PW or breakable, chosen inside

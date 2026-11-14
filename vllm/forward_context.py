@@ -167,6 +167,14 @@ class ForwardContext:
     # If True, bypass the compiled model call, e.g. by using .forward() directly
     skip_compiled: bool = False
 
+    # True while the warm-up or the capture pass of a FULL decode CUDA graph runs the
+    # model. Such a pass is told from an eager one by nothing else: the graph manager
+    # calls the model with cudagraph_runtime_mode NONE inside the capture, and a
+    # replay runs no Python. A model whose batch layout depends on whether the batch
+    # is served from a captured decode graph (the Muse Spark sequence-parallel
+    # stream) reads this flag.
+    full_decode_graph: bool = False
+
     # For torch.compile cold start times, we need to avoid hard-coding
     # any strings into the graph. Right now, the vllm.moe_forward
     # and vllm.moe_forward_shared custom operators hard-code strings into
@@ -227,6 +235,12 @@ def in_piecewise_cudagraph() -> bool:
     )
 
 
+def in_full_decode_graph() -> bool:
+    """Whether the current forward is the warm-up or the capture pass of a FULL decode
+    CUDA graph (see ``ForwardContext.full_decode_graph``)."""
+    return is_forward_context_available() and get_forward_context().full_decode_graph
+
+
 def create_forward_context(
     attn_metadata: Any,
     vllm_config: VllmConfig,
@@ -238,6 +252,7 @@ def create_forward_context(
     additional_kwargs: dict[str, Any] | None = None,
     skip_compiled: bool = False,
     is_padding: torch.Tensor | None = None,
+    full_decode_graph: bool = False,
 ):
     if vllm_config.compilation_config.fast_moe_cold_start:
         all_moe_layers = vllm_config.compilation_config.static_all_moe_layers
@@ -256,6 +271,7 @@ def create_forward_context(
         skip_compiled=skip_compiled,
         additional_kwargs=additional_kwargs or {},
         is_padding=is_padding,
+        full_decode_graph=full_decode_graph,
     )
 
 
@@ -286,6 +302,7 @@ def set_forward_context(
     slot_mapping: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None,
     skip_compiled: bool = False,
     is_padding: torch.Tensor | None = None,
+    full_decode_graph: bool = False,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -353,6 +370,7 @@ def set_forward_context(
         additional_kwargs,
         skip_compiled,
         is_padding=is_padding,
+        full_decode_graph=full_decode_graph,
     )
 
     try:
