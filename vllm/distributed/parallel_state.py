@@ -746,10 +746,28 @@ class GroupCoordinator:
         else:
             return self._all_reduce_out_place(input_)
 
+    def _on_comm_stream(
+        self, collective: Callable[[torch.Tensor], torch.Tensor], input_: torch.Tensor
+    ) -> torch.Tensor:
+        """Run a collective of the TP group on the microbatch comm stream.
+
+        Only inside a microbatch thread that overlaps its tensor-parallel
+        collectives (the V2 runner with data parallel size 1): the collective then
+        runs on the comm stream while the other microbatch computes. Anywhere else
+        this is the plain call.
+        """
+        if self.unique_name.split(":")[0] == "tp":
+            from vllm.v1.worker.ubatching import dbo_overlapping_context
+
+            ctx = dbo_overlapping_context()
+            if ctx is not None:
+                return ctx.run_collective(collective, input_)
+        return collective(input_)
+
     def _all_reduce_out_place(self, input_: torch.Tensor) -> torch.Tensor:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
-        return self.device_communicator.all_reduce(input_)
+        return self._on_comm_stream(self.device_communicator.all_reduce, input_)
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         world_size = self.world_size
@@ -770,7 +788,9 @@ class GroupCoordinator:
     def _all_gather_out_place(self, input_: torch.Tensor, dim: int) -> torch.Tensor:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
-        return self.device_communicator.all_gather(input_, dim)
+        return self._on_comm_stream(
+            lambda x: self.device_communicator.all_gather(x, dim), input_
+        )
 
     def all_gatherv(
         self,
@@ -821,7 +841,9 @@ class GroupCoordinator:
     def _reduce_scatter_out_place(self, input_: torch.Tensor, dim: int) -> torch.Tensor:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
-        return self.device_communicator.reduce_scatter(input_, dim)
+        return self._on_comm_stream(
+            lambda x: self.device_communicator.reduce_scatter(x, dim), input_
+        )
 
     def gather(
         self, input_: torch.Tensor, dst: int = 0, dim: int = -1

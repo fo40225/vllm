@@ -21,7 +21,7 @@ from vllm.distributed.device_communicators.pynccl_allocator import (
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
-from ..utils import StatelessProcessGroup
+from ..utils import StatelessProcessGroup, collective_empty
 from .aiter_custom_all_reduce import AiterCustomAllreduce
 from .base_device_communicator import DeviceCommunicatorBase
 
@@ -481,9 +481,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
         input_size = input_.size()
         output_size = (input_size[0] * self.world_size,) + input_size[1:]
-        output_tensor = torch.empty(
-            output_size, dtype=input_.dtype, device=input_.device
-        )
+        output_tensor = collective_empty(output_size, input_.dtype, input_.device)
         pynccl_comm.all_gather(output_tensor, input_.contiguous())
         output_tensor = output_tensor.reshape((self.world_size,) + input_size)
         output_tensor = output_tensor.movedim(0, dim)
@@ -522,8 +520,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
         elif should_nccl_symm_mem_ag_rs():
             output = self._reduce_scatter_symm_mem(input_tensor)
         else:
-            output = torch.empty(
-                output_shape, dtype=input_tensor.dtype, device=input_tensor.device
+            output = collective_empty(
+                output_shape, input_tensor.dtype, input_tensor.device
             )
             pynccl_comm.reduce_scatter(output, input_tensor)
 

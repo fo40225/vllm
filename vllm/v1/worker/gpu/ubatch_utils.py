@@ -33,7 +33,11 @@ from vllm.v1.worker.ubatch_utils import (
     create_sm_control_context,
     maybe_create_ubatch_slices,
 )
-from vllm.v1.worker.ubatching import make_ubatch_contexts
+from vllm.v1.worker.ubatching import (
+    UBatchAborted,
+    dbo_abort,
+    make_ubatch_contexts,
+)
 from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
@@ -324,7 +328,15 @@ class UBatchRunner:
             else None
             for _ in range(self.num_ubatches)
         ]
-        self.comm_stream = torch.cuda.Stream(device=device)
+        # Without data parallelism there is no expert all-to-all to hand off at: the
+        # microbatches alternate at the tensor-parallel collectives instead, which
+        # run on the comm stream (see UBatchContext.run_collective). That stream
+        # has a high priority: a collective is a few CTAs that spin on their
+        # peers, and they must get an SM as soon as a compute CTA retires.
+        self.overlap_collectives = self.parallel_config.data_parallel_size == 1
+        self.comm_stream = torch.cuda.Stream(
+            device=device, priority=-1 if self.overlap_collectives else 0
+        )
         # Threads and graph capture must use the same compute stream.
         self.capture_stream = torch.cuda.Stream(device=device)
         # The microbatch threads plus the thread that starts them.
@@ -404,21 +416,24 @@ class UBatchRunner:
         The expert all-to-all runs once per microbatch, so each context's DP
         metadata carries that microbatch's token count. Microbatching pads every
         DP rank alike, so each rank can assume that count for the others too.
+        Without data parallelism there is no DP metadata.
         """
         dp_size = self.parallel_config.data_parallel_size
         forward_contexts = []
         for i, ubatch_slice in enumerate(ubatch_slices):
             num_tokens = ubatch_slice.num_tokens
-            num_tokens_across_dp = torch.full(
-                (dp_size,), num_tokens, dtype=torch.int32, device="cpu"
-            )
+            dp_metadata = None
+            if dp_size > 1:
+                dp_metadata = DPMetadata.make(
+                    self.parallel_config,
+                    num_tokens,
+                    torch.full((dp_size,), num_tokens, dtype=torch.int32, device="cpu"),
+                )
             forward_contexts.append(
                 create_forward_context(
                     attn_metadata[i],
                     self.vllm_config,
-                    dp_metadata=DPMetadata.make(
-                        self.parallel_config, num_tokens, num_tokens_across_dp
-                    ),
+                    dp_metadata=dp_metadata,
                     cudagraph_runtime_mode=CUDAGraphMode.NONE,
                     slot_mapping=slot_mappings_by_layer[i],
                     is_padding=is_padding[i],
@@ -454,6 +469,14 @@ class UBatchRunner:
         ubatch_slices = ubatch_state.slices
         assert len(ubatch_slices) == len(ubatch_state.forward_contexts)
         assert len(ubatch_slices) == self.num_ubatches
+        logger.info_once(
+            "First microbatched step: %s tokens in %d microbatches, %s.",
+            tuple(s.num_tokens for s in ubatch_slices),
+            self.num_ubatches,
+            "tensor-parallel collectives overlap on a side stream"
+            if self.overlap_collectives
+            else "handing off at the expert all-to-all",
+        )
 
         compute_stream = self.capture_stream if for_capture else current_stream()
         ubatch_contexts = make_ubatch_contexts(
@@ -463,6 +486,7 @@ class UBatchRunner:
             forward_contexts=ubatch_state.forward_contexts,
             ready_barrier=self.ready_barrier,
             token_offsets=[s.token_slice.start for s in ubatch_slices],
+            overlap_collectives=self.overlap_collectives,
         )
 
         outputs: dict[int, Any] = {}
@@ -482,13 +506,11 @@ class UBatchRunner:
                     outputs[ubatch_context.id] = model(**inputs)
             except BaseException as e:  # noqa: BLE001
                 # Recorded so the join below can report which microbatch broke.
-                # Note the siblings are not told to unwind: microbatches hand
-                # control to each other, so one that dies mid-forward leaves
-                # the others parked on a handoff that never comes and the step
-                # hangs. The V1 runner behaves the same way; fixing it means
-                # changing the shared handoff protocol in ubatching.py, which
-                # is deliberately out of scope here.
+                # Microbatches hand control to each other, so one that dies
+                # mid-forward would leave the others parked on a handoff that
+                # never comes: wake them, and they unwind with an error.
                 errors[ubatch_context.id] = e
+                dbo_abort()
 
         # Threads own the forward context; keep it cleared and SMs reserved
         # until finish joins them.
@@ -521,7 +543,11 @@ class UBatchRunner:
                 stack.close()
 
             if errors:
-                failed = next(iter(errors))
+                # Report the microbatch that failed first, not those it woke up.
+                failed = next(
+                    (i for i, e in errors.items() if not isinstance(e, UBatchAborted)),
+                    next(iter(errors)),
+                )
                 raise RuntimeError(
                     f"Microbatch {failed} of {self.num_ubatches} failed"
                 ) from errors[failed]
@@ -552,11 +578,13 @@ def maybe_build_ubatch_runner(
 ) -> UBatchRunner | None:
     """Build the microbatch runner, or None when DBO is not in use.
 
-    Microbatching needs the DP handshake to agree on it, so it is only
-    available with more than one DP rank (as in the V1 runner).
+    With more than one DP rank, the ranks agree on microbatching in the DP
+    handshake. With one, every rank of the tensor-parallel group sees the same batch
+    and decides alike, so there is nothing to agree on; the microbatches then
+    overlap the tensor-parallel collectives (eager batches only).
     """
     parallel_config = vllm_config.parallel_config
-    if not parallel_config.use_ubatching or parallel_config.data_parallel_size <= 1:
+    if not parallel_config.use_ubatching:
         return None
 
     logger.info_once("Dual batch overlap is enabled.")

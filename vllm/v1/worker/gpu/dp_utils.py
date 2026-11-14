@@ -290,6 +290,19 @@ def dispatch_cg_and_sync_dp(
         )
 
     if dp_size == 1:
+        if (
+            allow_ubatching
+            and parallel_config is not None
+            and batch_desc.cg_mode == CUDAGraphMode.NONE
+            and check_ubatch_thresholds(
+                parallel_config, batch_desc.num_tokens, uniform_decode=uniform_decode
+            )
+        ):
+            # No handshake: the ranks of a tensor-parallel group run the same
+            # batch. Eager only, as the microbatch threads are not captured.
+            batch_desc = replace(
+                batch_desc, num_ubatches=get_num_ubatches(parallel_config)
+            )
         return batch_desc, None
 
     if dp_sync_state is not None:

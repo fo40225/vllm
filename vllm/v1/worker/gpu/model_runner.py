@@ -1760,6 +1760,36 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.ec_connector.no_forward(scheduler_output).ec_connector_output,
         )
 
+    @staticmethod
+    def _splits_prefix_from_writer(scheduler_output: SchedulerOutput) -> bool:
+        """Whether splitting the step could put a prefix-cache reader before its writer.
+
+        A request admitted this step on a prefix cache hit can read blocks that
+        another request of the same step is only computing now. Run whole, a
+        layer issues every KV write before any attention read and the hit holds;
+        split, a reader in the first microbatch would attend over blocks the
+        writer in the second has not filled yet. Blocks of earlier steps are
+        complete, so only a request admitted (or resumed) with computed tokens
+        counts as a reader, and only another prefill of the step as its writer.
+        """
+        scheduled = scheduler_output.num_scheduled_tokens
+        readers = {
+            new_req.req_id
+            for new_req in scheduler_output.scheduled_new_reqs
+            if new_req.num_computed_tokens
+        }
+        cached = scheduler_output.scheduled_cached_reqs
+        readers.update(
+            req_id
+            for req_id, num_computed in zip(cached.req_ids, cached.num_computed_tokens)
+            if req_id in cached.resumed_req_ids and num_computed
+        )
+        if not readers:
+            return False
+        # A decode writes the one slot of its own, still unshared, block.
+        prefills = {req_id for req_id, n in scheduled.items() if n > 1}
+        return len(prefills | readers) > 1
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -1841,7 +1871,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_active_loras=num_active_loras,
             parallel_config=self.parallel_config,
             allow_ubatching=(
-                self.ubatch_runner is not None and not skip_attn_for_dummy_run
+                self.ubatch_runner is not None
+                # The memory profile (no attention metadata) runs whole: its peak
+                # is what the KV cache is sized against, and the allocator needs
+                # the room of the full batch when the microbatches interleave.
+                and not skip_attn_for_dummy_run
+                and (dummy_run or not self._splits_prefix_from_writer(scheduler_output))
             ),
             uniform_decode=uniform_tok_count == self.decode_query_len,
             allow_skip_drafts=scheduler_output.skip_drafts,

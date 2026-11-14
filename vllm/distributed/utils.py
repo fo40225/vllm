@@ -264,6 +264,25 @@ def create_tcp_store(
         raise
 
 
+def collective_empty(
+    size: Sequence[int], dtype: torch.dtype, device: torch.device
+) -> torch.Tensor:
+    """``torch.empty`` for the result of a collective.
+
+    Inside a microbatched prefill the collective runs on the comm stream; its
+    result is then allocated on the compute stream (see
+    ``vllm.v1.worker.ubatching.dbo_collective_output_stream``), so that it comes
+    from the pool the model allocates from. Anywhere else this is ``torch.empty``.
+    """
+    from vllm.v1.worker.ubatching import dbo_collective_output_stream
+
+    stream = dbo_collective_output_stream()
+    if stream is None:
+        return torch.empty(size, dtype=dtype, device=device)
+    with torch.cuda.stream(stream):
+        return torch.empty(size, dtype=dtype, device=device)
+
+
 @dataclasses.dataclass
 class StatelessProcessGroup:
     """A dataclass to hold a metadata store, and the rank, world_size of the

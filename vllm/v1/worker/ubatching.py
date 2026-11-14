@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import threading
+from collections.abc import Callable
 
 import torch
 
@@ -15,6 +16,13 @@ _THREAD_ID_TO_CONTEXT: dict = {}
 # Here we hardcode the number of microbatches to 2 for default.
 _NUM_UBATCHES: int = 2
 _CURRENT_CONTEXTS: list["UBatchContext | None"] = []
+# Set when one microbatch thread fails, so that the others do not wait for a handoff
+# that never comes.
+_ABORTED = threading.Event()
+
+
+class UBatchAborted(RuntimeError):
+    """Raised in a microbatch thread that another microbatch's failure woke up."""
 
 
 class UBatchContext:
@@ -33,6 +41,7 @@ class UBatchContext:
         gpu_compute_done_event: torch.Event,
         schedule: str = "default",
         token_offset: int = 0,
+        overlap_collectives: bool = False,
     ):
         self.id = id
         self.comm_stream = comm_stream
@@ -46,6 +55,12 @@ class UBatchContext:
         self.gpu_compute_done_event = gpu_compute_done_event
         self.schedule = schedule
         self.token_offset = token_offset
+        # Run the tensor-parallel collectives of this microbatch on the comm stream
+        # (see run_collective); the expert all-to-all of DeepEP does its own handoff.
+        self.overlap_collectives = overlap_collectives
+        # Set while a collective runs on the comm stream: the compute stream the
+        # communicator should allocate its result on (see dbo_collective_output_stream).
+        self.collective_output_stream: torch.cuda.Stream | None = None
         self.recv_hook = None
 
     def __enter__(self):
@@ -57,6 +72,7 @@ class UBatchContext:
 
         self.cpu_wait_event.wait()
         self.cpu_wait_event.clear()
+        self._check_not_aborted()
         self._restore_context()
         # Assume we want to start on the compute stream
         self.update_stream(self.compute_stream)
@@ -102,7 +118,13 @@ class UBatchContext:
         self.cpu_signal_event.set()
         self.cpu_wait_event.wait()
         self.cpu_wait_event.clear()
+        self._check_not_aborted()
         self._restore_context()
+
+    @staticmethod
+    def _check_not_aborted():
+        if _ABORTED.is_set():
+            raise UBatchAborted("Microbatch aborted: another microbatch failed")
 
     def switch_to_comm(self):
         self.update_stream(self.comm_stream)
@@ -146,9 +168,87 @@ class UBatchContext:
         self.update_stream(self.compute_stream)
         self._wait_comm_done()
 
+    def run_collective(
+        self, collective: Callable[[torch.Tensor], torch.Tensor], input_: torch.Tensor
+    ) -> torch.Tensor:
+        """Run ``collective(input_)`` on the comm stream, beside the sibling's compute.
+
+        The collective is enqueued on the comm stream as soon as the compute stream
+        has produced its input. The thread then hands off, so the other microbatch
+        enqueues its compute behind what this one has queued (and its own collective
+        behind this one), and this microbatch continues once the collective is
+        done. Every collective of a step goes on the one comm stream in the order
+        the threads hand off, which is the same on every rank.
+
+        The caching allocator frees a block for reuse once the stream that
+        allocated it is done with it, so the result (allocated on the comm stream
+        while the compute stream reads it) and the input (allocated on the compute
+        stream while the comm stream reads it) are recorded on the other stream.
+        """
+        compute_stream = self.compute_stream
+        assert current_stream() == compute_stream
+        self._signal_compute_done()
+        self.update_stream(self.comm_stream)
+        self._wait_compute_done()
+        input_.record_stream(self.comm_stream)
+        self.collective_output_stream = compute_stream
+        try:
+            output = collective(input_)
+        finally:
+            self.collective_output_stream = None
+        output.record_stream(compute_stream)
+        self._signal_comm_done()
+        self.update_stream(compute_stream)
+        self._cpu_yield()
+        self._wait_comm_done()
+        return output
+
+
+def dbo_abort() -> None:
+    """Wake the parked microbatch threads so that they unwind with an error."""
+    _ABORTED.set()
+    for ctx in _CURRENT_CONTEXTS:
+        if ctx is not None:
+            ctx.cpu_wait_event.set()
+
 
 def dbo_enabled() -> bool:
     return len(_THREAD_ID_TO_CONTEXT) > 0
+
+
+def dbo_overlapping_context() -> "UBatchContext | None":
+    """The calling thread's microbatch context if it overlaps its TP collectives."""
+    if len(_THREAD_ID_TO_CONTEXT) == 0:
+        return None
+    ctx_idx = _THREAD_ID_TO_CONTEXT.get(threading.get_ident())
+    if ctx_idx is None:
+        return None
+    ctx = _CURRENT_CONTEXTS[ctx_idx]
+    if ctx is None or not ctx.overlap_collectives:
+        return None
+    # An aux-stream branch of the model stays where it is.
+    return ctx if current_stream() == ctx.compute_stream else None
+
+
+def dbo_collective_output_stream() -> "torch.cuda.Stream | None":
+    """Where a collective that runs on the comm stream should allocate its result.
+
+    The compute stream, inside ``UBatchContext.run_collective``, else None. A block
+    belongs to the pool of the stream that allocated it, so a result allocated on
+    the comm stream sits in a pool of its own that the compute stream cannot reuse
+    (and that holds its blocks until the compute stream is done with them): the
+    two pools together outgrow a GPU that is nearly full, and the allocator then
+    frees and re-allocates them over and over. A result allocated on the compute
+    stream and written by the comm stream needs neither: the compute stream only
+    reads it after the collective, and reuses it only after those reads.
+    """
+    if len(_THREAD_ID_TO_CONTEXT) == 0:
+        return None
+    ctx_idx = _THREAD_ID_TO_CONTEXT.get(threading.get_ident())
+    if ctx_idx is None:
+        return None
+    ctx = _CURRENT_CONTEXTS[ctx_idx]
+    return None if ctx is None else ctx.collective_output_stream
 
 
 def dbo_current_ubatch_id() -> int:
@@ -218,9 +318,11 @@ def make_ubatch_contexts(
     ready_barrier: threading.Barrier,
     schedule: str = "default",
     token_offsets: list[int] | None = None,
+    overlap_collectives: bool = False,
 ) -> list[UBatchContext]:
     global _NUM_UBATCHES, _CURRENT_CONTEXTS
     assert num_micro_batches > 1, "num_micro_batches must be greater than 1"
+    _ABORTED.clear()
 
     _NUM_UBATCHES = num_micro_batches
     # Ensure the global context list is large enough
@@ -248,6 +350,7 @@ def make_ubatch_contexts(
             gpu_compute_done_event=gpu_compute_done_events[i],
             schedule=schedule,
             token_offset=token_offsets[i] if token_offsets else 0,
+            overlap_collectives=overlap_collectives,
         )
         ctxs.append(ctx)
 

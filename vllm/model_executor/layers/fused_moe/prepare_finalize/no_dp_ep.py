@@ -39,6 +39,11 @@ def _quantize_input(
 
 
 class MoEPrepareAndFinalizeNoDPEPModular(mk.FusedMoEPrepareAndFinalizeModular):
+    def supports_dbo(self) -> bool:
+        # Nothing moves between ranks here, so there is no handoff to make: the
+        # synchronous prepare and finalize run as they are under DBO.
+        return True
+
     def supports_deferred_moe_finalize(self) -> bool:
         # finalize() here is the top-k weight-and-reduce and nothing else,
         # which is exactly the work a deferring consumer takes over.

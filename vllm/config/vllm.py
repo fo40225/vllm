@@ -2177,7 +2177,12 @@ class VllmConfig:
                 f"cudagraph_mode={self.compilation_config.cudagraph_mode}"
             )
 
-        if self.parallel_config.use_ubatching:
+        # Microbatches of a data-parallel-free launch only overlap the tensor-parallel
+        # collectives; there is no expert all-to-all for the backend check to guard.
+        if (
+            self.parallel_config.use_ubatching
+            and self.parallel_config.data_parallel_size > 1
+        ):
             a2a_backend = self.parallel_config.all2all_backend
             if current_platform.is_rocm():
                 supported_backends = [
@@ -3219,6 +3224,18 @@ class VllmConfig:
                 f"{'; '.join(blockers)}."
             )
 
+    @staticmethod
+    def _mm_inputs_disabled(model_config: ModelConfig) -> bool:
+        """Whether every modality is capped at zero items per prompt, so that a
+        multimodal model only ever sees token ids."""
+        mm_config = model_config.multimodal_config
+        if mm_config is None or mm_config.language_model_only:
+            return True
+        limits = mm_config.limit_per_prompt
+        return bool(limits) and all(
+            mm_config.get_limit_per_prompt(modality) == 0 for modality in limits
+        )
+
     def _get_dbo_unsupported_features(self) -> list[str]:
         """Collect what the V2 model runner cannot combine with DBO.
 
@@ -3228,8 +3245,13 @@ class VllmConfig:
         """
         # TODO: DBO with model runner V2 is under development.
         # It should be enabled with explicit VLLM_USE_V2_MODEL_RUNNER environ.
-        # Remove it when stable.
-        if envs.VLLM_USE_V2_MODEL_RUNNER is None:
+        # Remove it when stable. Without data parallelism (the microbatches only
+        # overlap the tensor-parallel collectives of eager batches) the runner
+        # needs no environ.
+        if (
+            envs.VLLM_USE_V2_MODEL_RUNNER is None
+            and self.parallel_config.data_parallel_size > 1
+        ):
             return ["dual batch overlap"]
 
         unsupported: list[str] = []
@@ -3248,7 +3270,11 @@ class VllmConfig:
         ):
             unsupported.append("dual batch overlap with context parallelism")
         if model_config is not None and (
-            model_config.is_multimodal_model or model_config.is_encoder_decoder
+            (
+                model_config.is_multimodal_model
+                and not self._mm_inputs_disabled(model_config)
+            )
+            or model_config.is_encoder_decoder
         ):
             unsupported.append("dual batch overlap with multimodal models")
         if model_config is not None and model_config.is_hybrid:

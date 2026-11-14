@@ -21,7 +21,7 @@ from vllm.distributed.device_communicators.pynccl_wrapper import (
     ncclRedOpTypeEnum,
     ncclUniqueId,
 )
-from vllm.distributed.utils import StatelessProcessGroup
+from vllm.distributed.utils import StatelessProcessGroup, collective_empty
 from vllm.logger import init_logger
 from vllm.utils.torch_utils import current_stream
 
@@ -288,7 +288,11 @@ class PyNcclCommunicator:
         )
 
         if out_tensor is None:
-            out_tensor = torch.empty_like(in_tensor)
+            out_tensor = (
+                collective_empty(in_tensor.shape, in_tensor.dtype, in_tensor.device)
+                if in_tensor.is_contiguous()
+                else torch.empty_like(in_tensor)
+            )
 
         if stream is None:
             stream = current_stream()

@@ -28,10 +28,13 @@ from vllm.config import (
     ParallelConfig,
     VllmConfig,
 )
+from vllm.config.multimodal import MultiModalConfig
+from vllm.distributed.utils import collective_empty
 from vllm.forward_context import create_forward_context
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
 )
+from vllm.utils.torch_utils import current_stream
 from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker import gpu_ubatch_wrapper as legacy_gpu_ubatch_wrapper
@@ -42,6 +45,7 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
     CudaGraphManager,
 )
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.ubatch_utils import (
     UBatchRunner,
@@ -56,7 +60,9 @@ from vllm.v1.worker.ubatch_utils import (
     split_attn_metadata,
 )
 from vllm.v1.worker.ubatching import (
+    dbo_collective_output_stream,
     dbo_current_ubatch_id,
+    dbo_overlapping_context,
     dbo_register_recv_hook,
     dbo_yield,
 )
@@ -1002,3 +1008,370 @@ def test_microbatched_graph_needs_every_rank_to_reach_the_split():
     assert desc.cg_mode == CUDAGraphMode.NONE
     assert desc.num_ubatches == 2
     assert dp_sync_state is not None and dp_sync_state.eager
+
+
+# Microbatching without data parallelism: the microbatches alternate at the
+# tensor-parallel collectives, which run on the comm stream. Every rank of the
+# TP group sees the same batch, so there is no handshake and no CUDA graph.
+
+
+def _tp_only_parallel_config() -> ParallelConfig:
+    return ParallelConfig(
+        ubatch_size=2,
+        dbo_decode_token_threshold=2**31 - 1,
+        dbo_prefill_token_threshold=PREFILL_THRESHOLD,
+    )
+
+
+def _dispatch_tp_only(
+    num_tokens: int,
+    *,
+    uniform_token_count: int | None = None,
+    allow_ubatching: bool = True,
+    need_eager: bool = True,
+    cudagraph_manager: Any = None,
+) -> BatchExecutionDescriptor:
+    desc, sync = dp_utils.dispatch_cg_and_sync_dp(
+        cudagraph_manager,
+        num_reqs=4,
+        num_tokens=num_tokens,
+        uniform_token_count=uniform_token_count,
+        dp_size=1,
+        dp_rank=0,
+        need_eager=need_eager,
+        parallel_config=_tp_only_parallel_config(),
+        allow_ubatching=allow_ubatching,
+        uniform_decode=uniform_token_count == DECODE_QUERY_LEN,
+    )
+    assert sync is None
+    return desc
+
+
+def test_tp_only_microbatching_is_decided_locally():
+    """Without DP ranks to agree with, an eager batch above the threshold splits."""
+    big = _dispatch_tp_only(PREFILL_THRESHOLD)
+    assert big.num_ubatches == 2
+    assert big.cg_mode == CUDAGraphMode.NONE
+    assert big.num_tokens == PREFILL_THRESHOLD
+    assert _dispatch_tp_only(PREFILL_THRESHOLD - 1).num_ubatches == 1
+    assert _dispatch_tp_only(PREFILL_THRESHOLD, allow_ubatching=False).num_ubatches == 1
+
+
+def test_tp_only_decode_batches_never_split():
+    """The decode threshold is unreachable, so a decode of any size stays whole."""
+    assert (
+        _dispatch_tp_only(
+            4 * PREFILL_THRESHOLD, uniform_token_count=DECODE_QUERY_LEN
+        ).num_ubatches
+        == 1
+    )
+
+
+def test_tp_only_cudagraph_batches_never_split():
+    """A batch that a CUDA graph replays keeps its graph: only eager batches split."""
+
+    class _GraphManager:
+        def dispatch(self, num_reqs, num_tokens, *args, **kwargs):
+            return BatchExecutionDescriptor(
+                cg_mode=CUDAGraphMode.FULL,
+                num_tokens=num_tokens,
+                num_reqs=num_reqs,
+            )
+
+    desc = _dispatch_tp_only(
+        4 * PREFILL_THRESHOLD, need_eager=False, cudagraph_manager=_GraphManager()
+    )
+    assert desc.cg_mode == CUDAGraphMode.FULL
+    assert desc.num_ubatches == 1
+
+
+def _dbo_support_stub(parallel_config: ParallelConfig, model_config: Any):
+    return SimpleNamespace(
+        parallel_config=parallel_config,
+        model_config=model_config,
+        lora_config=None,
+        speculative_config=None,
+        compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.FULL),
+        is_mm_encoder_only=False,
+        _mm_inputs_disabled=VllmConfig._mm_inputs_disabled,
+    )
+
+
+def _text_only_multimodal_model_config(**limits: int) -> Any:
+    return SimpleNamespace(
+        is_multimodal_model=True,
+        is_encoder_decoder=False,
+        is_hybrid=False,
+        multimodal_config=MultiModalConfig(limit_per_prompt=limits),
+    )
+
+
+def test_tp_only_launch_needs_no_runner_environ(monkeypatch):
+    """Without DP ranks the V2 runner is picked by default, as for any other launch."""
+    monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
+    support = _dbo_support_stub(
+        _tp_only_parallel_config(),
+        _text_only_multimodal_model_config(image=0, audio=0, video=0),
+    )
+    assert VllmConfig._get_dbo_unsupported_features(support) == []
+
+    # Data parallel DBO is still gated behind the explicit environ.
+    dp_support = _dbo_support_stub(
+        ParallelConfig(enable_dbo=True, data_parallel_size=2), None
+    )
+    assert VllmConfig._get_dbo_unsupported_features(dp_support) == [
+        "dual batch overlap"
+    ]
+
+
+def test_dbo_still_rejects_a_model_that_takes_multimodal_inputs(monkeypatch):
+    monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
+    support = _dbo_support_stub(
+        _tp_only_parallel_config(), _text_only_multimodal_model_config(image=4)
+    )
+    assert VllmConfig._get_dbo_unsupported_features(support) == [
+        "dual batch overlap with multimodal models"
+    ]
+
+
+class _CollectiveModel(torch.nn.Module):
+    """Toy model whose only collective runs through the microbatch context."""
+
+    def __init__(self, trace: list[tuple[str, int, int]]):
+        super().__init__()
+        self.trace = trace
+
+    def forward(self, input_ids, positions, intermediate_tensors=None, **kwargs):
+        ubatch_id = dbo_current_ubatch_id()
+        ctx = dbo_overlapping_context()
+        assert ctx is not None
+        x = input_ids.float().unsqueeze(-1) + positions.float().unsqueeze(-1)
+        self.trace.append(("enter", ubatch_id, current_stream().cuda_stream))
+
+        def collective(t: torch.Tensor) -> torch.Tensor:
+            self.trace.append(("collective", ubatch_id, current_stream().cuda_stream))
+            return t * 2
+
+        out = ctx.run_collective(collective, x)
+        self.trace.append(("exit", ubatch_id, current_stream().cuda_stream))
+        return out + 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="DBO needs a GPU")
+def test_tp_only_runner_runs_the_collectives_on_the_comm_stream():
+    """Microbatches alternate at the collective, which runs on the comm stream."""
+    vllm_config = VllmConfig(parallel_config=_tp_only_parallel_config())
+    device = torch.device("cuda:0")
+    runner = _make_execution_runner(vllm_config)
+    assert runner.overlap_collectives
+    comm = runner.comm_stream.cuda_stream
+
+    model_inputs = _make_model_inputs(16, device)
+    ubatch_state = _make_ubatch_state(
+        vllm_config,
+        [
+            UBatchSlice(slice(0, 4), slice(0, 8)),
+            UBatchSlice(slice(4, 8), slice(8, 16)),
+        ],
+    )
+    trace: list[tuple[str, int, int]] = []
+    output = runner.run(_CollectiveModel(trace), model_inputs, ubatch_state)
+
+    x = model_inputs["input_ids"].float().unsqueeze(-1) + model_inputs[
+        "positions"
+    ].float().unsqueeze(-1)
+    torch.testing.assert_close(output, x * 2 + 1)
+
+    # A microbatch enqueues its collective on the comm stream the moment it has the
+    # input, then hands off; the collectives go out in microbatch order and each
+    # microbatch resumes on a compute stream.
+    assert [(kind, ubatch) for kind, ubatch, _ in trace] == [
+        ("enter", 0),
+        ("collective", 0),
+        ("enter", 1),
+        ("collective", 1),
+        ("exit", 0),
+        ("exit", 1),
+    ]
+    collective_streams = {s for kind, _, s in trace if kind == "collective"}
+    compute_streams = {s for kind, _, s in trace if kind != "collective"}
+    assert collective_streams == {comm}
+    assert len(compute_streams) == 1
+    assert comm not in compute_streams
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="DBO needs a GPU")
+def test_collective_result_stays_valid_when_the_compute_stream_reuses_memory():
+    """The comm-stream result is recorded on the compute stream.
+
+    The block of the result belongs to the comm stream's pool: without the record
+    the allocator would hand it to the next collective while a compute kernel
+    that reads it is still queued.
+    """
+    vllm_config = VllmConfig(parallel_config=_tp_only_parallel_config())
+    device = torch.device("cuda:0")
+    runner = _make_execution_runner(vllm_config)
+
+    class _ReusingModel(torch.nn.Module):
+        def forward(self, input_ids, positions, intermediate_tensors=None, **kw):
+            ctx = dbo_overlapping_context()
+            assert ctx is not None
+            x = input_ids.float().unsqueeze(-1).expand(-1, 1 << 16).contiguous()
+            acc = torch.zeros_like(x)
+            for step in range(8):
+                y = ctx.run_collective(lambda t: t + 1, x)
+                # A slow compute-stream reader of the result, then a drop of it.
+                for _ in range(4):
+                    acc = acc + y * y
+                del y
+            return acc[:, :1]
+
+    model_inputs = _make_model_inputs(16, device)
+    ubatch_state = _make_ubatch_state(
+        vllm_config,
+        [
+            UBatchSlice(slice(0, 4), slice(0, 8)),
+            UBatchSlice(slice(4, 8), slice(8, 16)),
+        ],
+    )
+    output = runner.run(_ReusingModel(), model_inputs, ubatch_state)
+    ids = model_inputs["input_ids"].float().unsqueeze(-1)
+    torch.testing.assert_close(output, 32 * (ids + 1) ** 2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="DBO needs a GPU")
+def test_failing_microbatch_unwinds_its_parked_sibling():
+    """A microbatch that dies while its sibling is parked at a handoff does not hang."""
+    vllm_config = VllmConfig(parallel_config=_tp_only_parallel_config())
+    device = torch.device("cuda:0")
+    runner = _make_execution_runner(vllm_config)
+
+    class _FailsAfterHandoff(torch.nn.Module):
+        def forward(self, input_ids, positions, intermediate_tensors=None, **kwargs):
+            ctx = dbo_overlapping_context()
+            assert ctx is not None
+            x = input_ids.float().unsqueeze(-1)
+            y = ctx.run_collective(lambda t: t * 2, x)
+            if dbo_current_ubatch_id() == 0:
+                raise ValueError("boom")
+            # Microbatch 1 parks here for a handoff that microbatch 0 never makes.
+            return ctx.run_collective(lambda t: t * 2, y)
+
+    model_inputs = _make_model_inputs(8, device)
+    ubatch_state = _make_ubatch_state(
+        vllm_config,
+        [
+            UBatchSlice(slice(0, 2), slice(0, 4)),
+            UBatchSlice(slice(2, 4), slice(4, 8)),
+        ],
+    )
+    result: dict[str, BaseException] = {}
+
+    def _call():
+        try:
+            runner.run(_FailsAfterHandoff(), model_inputs, ubatch_state)
+        except BaseException as e:  # noqa: BLE001
+            result["error"] = e
+
+    caller = threading.Thread(target=_call, daemon=True)
+    caller.start()
+    caller.join(timeout=60.0)
+    assert not caller.is_alive(), "a parked microbatch was left waiting"
+    assert isinstance(result["error"], RuntimeError)
+    assert "Microbatch 0" in str(result["error"])
+    assert isinstance(result["error"].__cause__, ValueError)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="DBO needs a GPU")
+def test_collective_results_are_allocated_on_the_compute_stream():
+    """Inside a collective on the comm stream, results come from the compute pool."""
+    vllm_config = VllmConfig(parallel_config=_tp_only_parallel_config())
+    device = torch.device("cuda:0")
+    runner = _make_execution_runner(vllm_config)
+    seen: dict[int, tuple[Any, Any]] = {}
+
+    class _AllocatingModel(torch.nn.Module):
+        def forward(self, input_ids, positions, intermediate_tensors=None, **kwargs):
+            ctx = dbo_overlapping_context()
+            assert ctx is not None
+            assert dbo_collective_output_stream() is None
+            compute = current_stream()
+            x = input_ids.float().unsqueeze(-1)
+
+            def collective(t: torch.Tensor) -> torch.Tensor:
+                out = collective_empty(t.shape, t.dtype, t.device)
+                seen[dbo_current_ubatch_id()] = (
+                    dbo_collective_output_stream(),
+                    current_stream(),
+                )
+                out.copy_(t)
+                return out
+
+            y = ctx.run_collective(collective, x)
+            assert dbo_collective_output_stream() is None
+            assert seen[dbo_current_ubatch_id()][0] == compute
+            return y
+
+    model_inputs = _make_model_inputs(16, device)
+    ubatch_state = _make_ubatch_state(
+        vllm_config,
+        [
+            UBatchSlice(slice(0, 4), slice(0, 8)),
+            UBatchSlice(slice(4, 8), slice(8, 16)),
+        ],
+    )
+    output = runner.run(_AllocatingModel(), model_inputs, ubatch_state)
+    torch.testing.assert_close(output, model_inputs["input_ids"].float().unsqueeze(-1))
+    assert set(seen) == {0, 1}
+    for output_stream, collective_stream in seen.values():
+        assert output_stream != collective_stream
+        assert collective_stream == runner.comm_stream
+
+
+def test_collective_empty_is_plain_torch_empty_outside_a_microbatch():
+    out = collective_empty((3, 4), torch.float32, torch.device("cpu"))
+    assert out.shape == (3, 4)
+    assert out.dtype == torch.float32
+    assert dbo_collective_output_stream() is None
+
+
+def _step(
+    scheduled: dict[str, int],
+    new_computed: dict[str, int] | None = None,
+    resumed_computed: dict[str, int] | None = None,
+) -> Any:
+    """A scheduler output with the given per-request token counts."""
+    new_computed = new_computed or {}
+    resumed_computed = resumed_computed or {}
+    cached_ids = [r for r in scheduled if r not in new_computed]
+    return SimpleNamespace(
+        num_scheduled_tokens=scheduled,
+        scheduled_new_reqs=[
+            SimpleNamespace(req_id=r, num_computed_tokens=n)
+            for r, n in new_computed.items()
+        ],
+        scheduled_cached_reqs=SimpleNamespace(
+            req_ids=cached_ids,
+            resumed_req_ids=set(resumed_computed),
+            num_computed_tokens=[resumed_computed.get(r, 7) for r in cached_ids],
+        ),
+    )
+
+
+def test_prefix_reader_and_writer_of_one_step_are_never_split():
+    """A prefix-cache reader of this step may read blocks a prefill of this step
+    writes, which a split could put behind the reader."""
+    splits = GPUModelRunner._splits_prefix_from_writer
+    # No request is admitted on a prefix hit: nothing to protect.
+    assert not splits(_step({"a": 4000, "b": 4000}, {"a": 0, "b": 0}))
+    # One prefill with a prefix hit and only decodes beside it: the prefix is old.
+    assert not splits(_step({"a": 4000, "d1": 1, "d2": 1}, {"a": 128}))
+    # A reader and another prefill: the split could separate them.
+    assert splits(_step({"a": 4000, "b": 4000}, {"a": 128, "b": 0}))
+    assert splits(_step({"a": 4000, "b": 4000}, {"a": 128, "b": 256}))
+    # A request that continues a prefix hit of an earlier step is not a reader ...
+    assert not splits(_step({"a": 4000, "b": 4000}, {"b": 0}))
+    # ... but one resumed after a preemption is (its blocks were looked up again).
+    assert splits(_step({"a": 4000, "b": 4000}, {"b": 0}, {"a": 2048}))
+    # A one-token reader (the whole prompt was cached) with a prefill beside it.
+    assert splits(_step({"a": 1, "b": 4000}, {"a": 4095}))
