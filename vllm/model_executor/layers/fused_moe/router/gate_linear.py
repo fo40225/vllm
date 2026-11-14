@@ -271,6 +271,26 @@ class GateLinear(ReplicatedLinear):
             )
             self._register_ll_fp32w_warmup()
 
+    def widens_bf16_input(self) -> bool:
+        """Whether ``forward`` casts a bf16 input to fp32 ahead of the GEMM.
+
+        That is tier 6 with an fp32 weight; no specialized tier then claims the
+        input. A caller may hand over the exact fp32 copy instead, which skips
+        the cast and reaches the same F.linear.
+        """
+        return (
+            self.is_unquantized
+            and self.out_dtype is not None
+            and self.weight.dtype == torch.float32
+            and not (
+                self.allow_ll_bf16_gemm
+                or self.allow_rocm_bf16x3_router_gemm
+                or self.allow_fp32_router_gemm
+                or self.allow_bf16x3_router_gemm
+                or self.allow_cublas_router_gemm
+            )
+        )
+
     def _return(
         self, output: torch.Tensor
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:

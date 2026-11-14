@@ -358,6 +358,7 @@ def _norm_residual_norm_fwd_kernel(
     stream_ptr,
     new_stream_ptr,
     out_ptr,
+    out_fp32_ptr,
     post_w_ptr,
     pre_w_ptr,
     alpha_ptr,
@@ -375,6 +376,7 @@ def _norm_residual_norm_fwd_kernel(
     PRE_INPUT_SCALE: tl.constexpr,
     GATE_STREAM: tl.constexpr,
     PER_CHANNEL: tl.constexpr,
+    STORE_OUT_FP32: tl.constexpr,
     bT: tl.constexpr,
     bD: tl.constexpr,
     USE_PDL: tl.constexpr,
@@ -434,7 +436,11 @@ def _norm_residual_norm_fwd_kernel(
     if PRE_HAS_WEIGHT and not PRE_INPUT_SCALE:
         z = z * pre_w[None, :]
 
-    tl.store(out_ptr + idx, z.to(out_ptr.dtype.element_ty), mask=mask)
+    z_out = z.to(out_ptr.dtype.element_ty)
+    tl.store(out_ptr + idx, z_out, mask=mask)
+    if STORE_OUT_FP32:
+        # The rounded result widened, i.e. what ``out.to(torch.float32)`` yields.
+        tl.store(out_fp32_ptr + idx, z_out.to(tl.float32), mask=mask)
 
 
 def supports_norm_residual_norm(
@@ -468,6 +474,7 @@ def fused_norm_residual_norm_fwd(
     post_input_scale: bool = False,
     pre_input_scale: bool = False,
     out_dtype: torch.dtype | None = None,
+    out_fp32: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """A whole residual boundary in one kernel.
 
@@ -478,6 +485,10 @@ def fused_norm_residual_norm_fwd(
 
     Only the sum-of-squares order differs from two ``fused_rmsnorm_fwd`` calls;
     vs fp64 at D=8192, 9e-6 of the bf16 outputs differ by one ulp.
+
+    If supplied, ``out_fp32`` receives ``out.to(torch.float32)`` (the rounded
+    result widened, bit for bit) from the same kernel, saving the cast kernel
+    of a consumer that wants fp32.
     """
     input_shape = branch.shape
     assert supports_norm_residual_norm(branch, stream), (
@@ -520,6 +531,13 @@ def fused_norm_residual_norm_fwd(
 
     out = torch.empty_like(branch, dtype=out_dtype)
     new_stream = torch.empty_like(stream)
+    if out_fp32 is not None:
+        assert out_fp32.dtype is torch.float32 and out_fp32.is_contiguous(), (
+            "out_fp32 must be a contiguous float32 tensor"
+        )
+        assert out_fp32.numel() == out.numel(), (
+            f"out_fp32 {tuple(out_fp32.shape)} must hold {tuple(out.shape)}"
+        )
 
     bD = triton.next_power_of_2(D)
     bT = max(1, _BOUNDARY_TILE_ELEMS // bD)
@@ -542,6 +560,7 @@ def fused_norm_residual_norm_fwd(
         new_stream,
         out,
         # Unused pointers must be valid; constexprs keep them undereferenced.
+        out_fp32 if out_fp32 is not None else out,
         post_weight if post_weight is not None else branch,
         pre_weight if pre_weight is not None else branch,
         alpha if gate_stream else beta,
@@ -559,6 +578,7 @@ def fused_norm_residual_norm_fwd(
         PRE_INPUT_SCALE=pre_input_scale,
         GATE_STREAM=gate_stream,
         PER_CHANNEL=per_channel,
+        STORE_OUT_FP32=out_fp32 is not None,
         bT=bT,
         bD=bD,
         num_warps=num_warps,

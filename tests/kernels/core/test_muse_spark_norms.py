@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -178,6 +180,133 @@ def test_triton_residual_boundary_matches_native(monkeypatch, rows, post_input_s
 
     torch.testing.assert_close(actual_out, expected_out, rtol=0.015625, atol=0.03125)
     torch.testing.assert_close(actual_stream, expected_stream, rtol=1e-5, atol=1e-5)
+
+
+@requires_cuda
+# 256 rows is where the Triton boundary kernel switches configs on SM100.
+@pytest.mark.parametrize("rows", [1, 8, 128, 256, 257])
+@pytest.mark.parametrize("post_input_scale", [False, True])
+def test_boundary_writes_the_exact_fp32_copy(rows, post_input_scale):
+    """out_fp32 is bit for bit ``out.to(float32)`` and nothing else changes."""
+    torch.manual_seed(2000 + rows)
+    boundary, pre_norm = make_residual_boundary(rows, post_input_scale=post_input_scale)
+
+    expected_out, expected_stream = model_ops.norm_residual_then_norm(
+        boundary, pre_norm, out_dtype=torch.bfloat16
+    )
+    out_fp32 = torch.full(
+        (rows, HIDDEN), float("nan"), device="cuda", dtype=torch.float32
+    )
+    out, new_stream = model_ops.norm_residual_then_norm(
+        boundary, pre_norm, out_dtype=torch.bfloat16, out_fp32=out_fp32
+    )
+
+    assert torch.equal(out, expected_out)
+    assert torch.equal(new_stream, expected_stream)
+    assert out_fp32.dtype == torch.float32
+    assert torch.equal(out_fp32, expected_out.to(torch.float32))
+
+
+@requires_cuda
+@pytest.mark.parametrize("rows", [1, 129])
+def test_fp32_copy_fallback_is_the_same_cast(monkeypatch, rows):
+    """Without the Triton boundary the copy is made by a cast, with equal bits."""
+    torch.manual_seed(3000 + rows)
+    boundary, pre_norm = make_residual_boundary(rows)
+    monkeypatch.setattr(model_ops, "supports_norm_residual_norm", lambda *_: False)
+    out_fp32 = torch.full(
+        (rows, HIDDEN), float("nan"), device="cuda", dtype=torch.float32
+    )
+
+    out, _ = model_ops.norm_residual_then_norm(
+        boundary, pre_norm, out_dtype=torch.bfloat16, out_fp32=out_fp32
+    )
+
+    assert torch.equal(out_fp32, out.to(torch.float32))
+
+
+@requires_cuda
+@pytest.mark.parametrize("rows", [1, 33, 300])
+def test_router_reads_the_fp32_copy_like_the_cast(dist_init, rows):
+    """A router given the fp32 copy yields the logits of the router's own cast."""
+    from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
+
+    torch.manual_seed(4000 + rows)
+    router = GateLinear(
+        HIDDEN, 256, bias=False, out_dtype=torch.float32, params_dtype=torch.float32
+    ).cuda()
+    with torch.no_grad():
+        router.weight.copy_(torch.randn_like(router.weight) * 0.02)
+    boundary, pre_norm = make_residual_boundary(rows)
+    out_fp32 = torch.empty(rows, HIDDEN, device="cuda", dtype=torch.float32)
+    ffn_in, _ = model_ops.norm_residual_then_norm(
+        boundary, pre_norm, out_dtype=torch.bfloat16, out_fp32=out_fp32
+    )
+
+    # Only a router whose last tier casts bf16 input may take the copy.
+    assert router.widens_bf16_input() == (
+        not (router.allow_fp32_router_gemm or router.allow_bf16x3_router_gemm)
+    )
+    if router.widens_bf16_input():
+        assert torch.equal(router(out_fp32)[0], router(ffn_in)[0])
+
+
+def make_moe_stub(monkeypatch, *, widens=True, aux_stream=True, fp32_feature=False):
+    """A MuseSpark1xMoE with just the state the router-input predicates read."""
+    moe = object.__new__(model_ops.MuseSpark1xMoE)
+    moe.pooler = object()
+    moe._router_aux_stream = object() if aux_stream else None
+    moe.is_sequence_parallel = False
+    moe.use_sequence_parallel_moe = False
+    moe.use_mega_moe = False
+    moe.fp32_router_input = fp32_feature
+    moe.tp_size = 8
+    moe.router = SimpleNamespace(widens_bf16_input=lambda: widens)
+    monkeypatch.setattr(
+        model_ops.BreakableCUDAGraphCapture, "is_active", staticmethod(lambda: False)
+    )
+    return moe
+
+
+@pytest.mark.parametrize("rows", [1, 128, 256])
+def test_cast_router_input_is_skipped_where_the_cast_overlaps(monkeypatch, rows):
+    moe = make_moe_stub(monkeypatch)
+    assert moe.router_overlaps_pooler(rows)
+    assert not moe.wants_cast_router_input(rows)
+
+
+@pytest.mark.parametrize("rows", [257, 8192])
+def test_cast_router_input_is_wanted_on_the_critical_path(monkeypatch, rows):
+    moe = make_moe_stub(monkeypatch)
+    assert not moe.router_overlaps_pooler(rows)
+    assert moe.wants_cast_router_input(rows)
+
+
+def test_cast_router_input_in_a_breakable_capture(monkeypatch):
+    """The aux stream is off there (the branches run in order): fuse the cast."""
+    moe = make_moe_stub(monkeypatch)
+    monkeypatch.setattr(
+        model_ops.BreakableCUDAGraphCapture, "is_active", staticmethod(lambda: True)
+    )
+    assert moe.wants_cast_router_input(1)
+
+
+def test_cast_router_input_needs_a_router_that_casts(monkeypatch):
+    assert not make_moe_stub(monkeypatch, widens=False).wants_cast_router_input(8192)
+    assert not make_moe_stub(monkeypatch, aux_stream=False).router_overlaps_pooler(1)
+    assert make_moe_stub(monkeypatch, aux_stream=False).wants_cast_router_input(1)
+    moe = make_moe_stub(monkeypatch)
+    moe.is_sequence_parallel = True
+    assert not moe.wants_cast_router_input(8192)
+
+
+def test_cast_router_input_yields_to_the_unrounded_fp32_input(monkeypatch):
+    moe = make_moe_stub(monkeypatch, fp32_feature=True)
+    # 33..128 tokens take the unrounded FP32 pre-norm result instead.
+    assert moe.wants_fp32_router_input(64)
+    assert not moe.wants_cast_router_input(64)
+    assert not moe.wants_fp32_router_input(8192)
+    assert moe.wants_cast_router_input(8192)
 
 
 @requires_b300_dual_norm

@@ -48,6 +48,7 @@ except (ImportError, AttributeError):  # pragma: no cover - optional FlashInfer 
 
 import vllm.envs as envs
 from vllm import _custom_ops as ops
+from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
 from vllm.compilation.decorators import ignore_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import (
@@ -252,13 +253,17 @@ def norm_residual_then_norm(
     *,
     out_dtype: torch.dtype,
     router_input: torch.Tensor | None = None,
+    out_fp32: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Post-norm, blend and pre-norm; returns ``(out, new_stream)``.
 
     If supplied, router_input receives the unrounded FP32 pre-norm result.
+    out_fp32 instead receives ``out`` widened to FP32, bit for bit the cast of
+    the returned tensor; the Triton boundary writes it without a cast kernel.
     """
+    assert router_input is None or out_fp32 is None
     if isinstance(x, MuseSpark1xColumnShardedStream):
-        if router_input is None and (
+        if router_input is None and out_fp32 is None and (
             fused := _all_gather_norm_residual_then_norm(x, pre_norm, out_dtype)
         ):
             return fused
@@ -273,6 +278,7 @@ def norm_residual_then_norm(
     )
     pre_weight = pre_norm.weight
     post_weight_args = {"post_weight": post_norm.weight} if post_norm.has_weight else {}
+    fp32_copy_written = False
     if (
         can_fuse_boundary
         and gated_residual_next_rmsnorm is not None
@@ -343,12 +349,16 @@ def norm_residual_then_norm(
                 pre_norm.applies_weight_before_norm and pre_norm.has_weight
             ),
             out_dtype=out_dtype,
+            out_fp32=out_fp32,
         )
+        fp32_copy_written = out_fp32 is not None
     else:
         new_stream = norm_then_gated_residual(x)
         out = pre_norm(new_stream, out_dtype=out_dtype)
     if router_input is not None:
         router_input.copy_(pre_norm(new_stream, out_dtype=torch.float32))
+    if out_fp32 is not None and not fp32_copy_written:
+        out_fp32.copy_(out)
     return out, new_stream
 
 
@@ -669,6 +679,39 @@ class MuseSpark1xMoE(nn.Module):
         if self.use_sequence_parallel_moe:
             num_tokens = cdiv(num_tokens, self.tp_size)
         return 32 < num_tokens <= 128
+
+    def router_overlaps_pooler(self, num_tokens: int) -> bool:
+        """Whether the router chain runs on the aux stream beside the pooler."""
+        if (
+            self.pooler is None
+            or self._router_aux_stream is None
+            or num_tokens > _ROUTER_MULTI_STREAM_TOKEN_THRESHOLD
+        ):
+            return False
+        # maybe_execute_in_parallel runs both branches in order there.
+        return not BreakableCUDAGraphCapture.is_active()
+
+    def wants_cast_router_input(self, num_tokens: int) -> bool:
+        """Whether the boundary should also write ``ffn_in`` widened to FP32.
+
+        Without an FP32 router input the router casts its bf16 input to FP32
+        before the GEMM. The widening is exact, so the boundary that stores
+        ``ffn_in`` can produce the same tensor and save the cast kernel. That
+        pays only where the cast is on the critical path: beside the pooler it
+        hides, and the extra store would slow the boundary by about 0.5 us.
+        """
+        if not (
+            not self.is_sequence_parallel
+            and not self.wants_fp32_router_input(num_tokens)
+            and not self.router_overlaps_pooler(num_tokens)
+            and self.router.widens_bf16_input()
+        ):
+            return False
+        logger.info_once(
+            "MuseSpark MoE: the boundary kernel writes the FP32 router input where "
+            "the router would cast it on the critical path."
+        )
+        return True
 
     def _route_and_pool(
         self, hidden_states: torch.Tensor, router_input: torch.Tensor
@@ -1444,10 +1487,13 @@ class MuseSpark1xDecoderLayer(nn.Module):
         if sp_active and not self.is_sequence_parallel_input:
             stream = sp_shard(stream)
         router_input = None
-        if isinstance(
-            self.feed_forward, MuseSpark1xMoE
-        ) and self.feed_forward.wants_fp32_router_input(attn_out.shape[0]):
-            router_input = torch.empty_like(attn_out, dtype=torch.float32)
+        cast_router_input = False
+        if isinstance(self.feed_forward, MuseSpark1xMoE):
+            if self.feed_forward.wants_fp32_router_input(attn_out.shape[0]):
+                router_input = torch.empty_like(attn_out, dtype=torch.float32)
+            elif self.feed_forward.wants_cast_router_input(attn_out.shape[0]):
+                router_input = torch.empty_like(attn_out, dtype=torch.float32)
+                cast_router_input = True
         ffn_in, stream = norm_residual_then_norm(
             MuseSpark1xResidualStream(
                 stream=stream,
@@ -1457,7 +1503,8 @@ class MuseSpark1xDecoderLayer(nn.Module):
             ),
             self.pre_ffn_norm,
             out_dtype=self.default_dtype,
-            router_input=router_input,
+            router_input=None if cast_router_input else router_input,
+            out_fp32=router_input if cast_router_input else None,
         )
         if sp_active and not self.feed_forward.use_mega_moe:
             # Non-megakernel experts need every token.
