@@ -1,0 +1,149 @@
+--- a/csrc/xqa/mha.cu
++++ b/csrc/xqa/mha.cu
+@@ -15,6 +15,11 @@
+  * limitations under the License.
+  */
+ 
++// Muse Spark shadow of FlashInfer v0.7.0.post1 csrc/xqa/mha.cu (md5
++// b6dca30aa3afe606723e75f3d97ae8ae).
++// The only changes are the "Active merge" block in front of the Q load of kernel_mha_impl and
++// the nbActiveSubSeq uses in its multi-block merge; mha_active_merge.patch has the diff.
++
+ #include "cuda_hint.cuh"
+ #include "defines.h"
+ #if !(IS_MLA)
+@@ -1701,6 +1706,54 @@
+   mask += reqSeqOffset * divUp(qSeqLen, 32u);
+ #endif
+ 
++  uint32_t const cacheSeqLen = getCacheSeqLen<usePagedKVCache>(cacheList, idxReq);
++#if SLIDING_WINDOW
++  bool const rtIsReallySliding = (cacheSeqLen > slidingWinSize);
++#if SPEC_DEC && !IS_SPEC_DEC_TREE
++  // Linear (non-tree) spec-dec: draft row r sits at position
++  // cacheSeqLen - actualQSeqLen + r, so each row's window begins at
++  // winBegBase + r. Skip whole leading tiles only up to the earliest row
++  // handled by this CTA; applyMaskFromInput masks the per-row edge exactly.
++  int32_t const specDecWinBegBase =
++      int32_t(cacheSeqLen - actualQSeqLen + 1) - int32_t(slidingWinSize);
++  uint32_t const ctaTokenRowBeg = min(idxHeadTokenInGrp / headGrpSize, actualQSeqLen - 1);
++  int32_t const ctaWinBeg = specDecWinBegBase + int32_t(ctaTokenRowBeg);
++  uint32_t const nbTotalSkipTokens = (rtIsReallySliding && ctaWinBeg > 0) ? uint32_t(ctaWinBeg) : 0;
++#else
++  uint32_t const nbTotalSkipTokens = rtIsReallySliding ? cacheSeqLen - slidingWinSize : 0;
++#endif
++#else
++  constexpr bool rtIsReallySliding = false;
++  constexpr uint32_t nbTotalSkipTokens = 0;
++#endif
++  uint32_t const nbSkipLeadingTiles = nbTotalSkipTokens / ctaTile.x;
++  uint32_t const tile0NbSkipTokens = nbTotalSkipTokens % ctaTile.x;
++  uint32_t const nbPages = divUp(cacheSeqLen, tokensPerPage);
++  constexpr uint32_t nbPagesPerCtaTile = exactDiv(ctaTile.x, tokensPerPage);
++
++  uint32_t const nbSeqIters = useKVCache ? divUp(cacheSeqLen, ctaTile.x) : 0;
++#if SPEC_DEC
++  uint32_t const nbSeqItersWithoutMask = (cacheSeqLen - actualQSeqLen) / ctaTile.x;
++#endif
++
++  // Active merge (Muse Spark): sub-sequence i handles the tiles seqIterInit + k *
++  // nbSubSeqPerSeq with seqIterInit = nbSkipLeadingTiles + i, so only the first
++  // nbTilesInUse sub-sequences have any work. The grid is sized for the model's maximum
++  // length (one CTA per 256 tokens, up to one per SM), which a short sequence or the
++  // window of a sliding-window layer does not fill. The CTAs without a tile leave here,
++  // before they load anything, and the last active CTA of the sequence merges only the
++  // live partials. The partials that the plain kernel stores for an empty sub-sequence
++  // are exact zeros (row sum 0, row max safeInitRowMax), so the merged output is bitwise
++  // the same. nbActiveSubSeq depends on (idxReq, blockIdx.y) only, which is also what
++  // selects the semaphore, so all CTAs of one semaphore agree on it. A sequence without
++  // tokens keeps sub-sequence 0, so that it behaves as the plain kernel does.
++  uint32_t const nbTilesInUse =
++      nbSeqIters > nbSkipLeadingTiles ? nbSeqIters - nbSkipLeadingTiles : 0;
++  uint32_t const nbActiveSubSeq = mha::max(1u, mha::min(nbSubSeqPerSeq, nbTilesInUse));
++  if (idxSubSeqInSeq >= nbActiveSubSeq) {
++    return;
++  }
++
+   constexpr bool qkSwizzle = true;
+   // load whole Q heads into shared memory
+ #if SPEC_DEC
+@@ -1769,36 +1822,6 @@
+   }
+ #endif
+ 
+-  uint32_t const cacheSeqLen = getCacheSeqLen<usePagedKVCache>(cacheList, idxReq);
+-#if SLIDING_WINDOW
+-  bool const rtIsReallySliding = (cacheSeqLen > slidingWinSize);
+-#if SPEC_DEC && !IS_SPEC_DEC_TREE
+-  // Linear (non-tree) spec-dec: draft row r sits at position
+-  // cacheSeqLen - actualQSeqLen + r, so each row's window begins at
+-  // winBegBase + r. Skip whole leading tiles only up to the earliest row
+-  // handled by this CTA; applyMaskFromInput masks the per-row edge exactly.
+-  int32_t const specDecWinBegBase =
+-      int32_t(cacheSeqLen - actualQSeqLen + 1) - int32_t(slidingWinSize);
+-  uint32_t const ctaTokenRowBeg = min(idxHeadTokenInGrp / headGrpSize, actualQSeqLen - 1);
+-  int32_t const ctaWinBeg = specDecWinBegBase + int32_t(ctaTokenRowBeg);
+-  uint32_t const nbTotalSkipTokens = (rtIsReallySliding && ctaWinBeg > 0) ? uint32_t(ctaWinBeg) : 0;
+-#else
+-  uint32_t const nbTotalSkipTokens = rtIsReallySliding ? cacheSeqLen - slidingWinSize : 0;
+-#endif
+-#else
+-  constexpr bool rtIsReallySliding = false;
+-  constexpr uint32_t nbTotalSkipTokens = 0;
+-#endif
+-  uint32_t const nbSkipLeadingTiles = nbTotalSkipTokens / ctaTile.x;
+-  uint32_t const tile0NbSkipTokens = nbTotalSkipTokens % ctaTile.x;
+-  uint32_t const nbPages = divUp(cacheSeqLen, tokensPerPage);
+-  constexpr uint32_t nbPagesPerCtaTile = exactDiv(ctaTile.x, tokensPerPage);
+-
+-  uint32_t const nbSeqIters = useKVCache ? divUp(cacheSeqLen, ctaTile.x) : 0;
+-#if SPEC_DEC
+-  uint32_t const nbSeqItersWithoutMask = (cacheSeqLen - actualQSeqLen) / ctaTile.x;
+-#endif
+-
+   uint32_t const seqStrideIters = nbSubSeqPerSeq;
+   constexpr bool isKVCacheQuantized = (cacheElemSize < 2);
+   uint32_t const seqIterInit = nbSkipLeadingTiles + idxSubSeqInSeq;
+@@ -2756,11 +2779,11 @@
+       // increase the semaphore by 1
+       if (warpIdx.y == 0 && warpGrpIdx == 0 && warpIdxInGrp == 0 && laneId() == 0) {
+         uint32_t old;
+-        uint32_t const lastOld = nbSubSeqPerSeq - 1;
++        uint32_t const lastOld = nbActiveSubSeq - 1;
+         asm volatile("atom.acq_rel.gpu.global.inc.u32 %0, [%1], %2;\n"
+                      : "=r"(old)
+                      : "l"(&semaphores[idxSeq]), "r"(lastOld));
+-        assert(old < nbSubSeqPerSeq);
++        assert(old < nbActiveSubSeq);
+         mbsmem.isLastCta = (old == lastOld);
+       }
+       __syncthreads();
+@@ -2773,7 +2796,7 @@
+         // get row max.
+         if (warpIdx.x == 0) {
+           ThrdRegRowMax const mergedRowMax =
+-              mergeRowMax<8>(warp, rowMaxBuffers + idxBufBase, nbSubSeqPerSeq);
++              mergeRowMax<8>(warp, rowMaxBuffers + idxBufBase, nbActiveSubSeq);
+           smemRowMax.storeFromReg<false>(warp, mergedRowMax);
+         }
+         __syncthreads();
+@@ -2806,12 +2829,16 @@
+         // by mbbuf tiles and the mergeAndSaveOutTile swizzle buffer are ordered by the
+         // __syncthreads() calls inside this loop and in mergeAndSaveOutTile.
+         for (uint32_t hs = 0; hs < nbHeadSplits; hs++) {
+-          loadBufAsync(warpGrpIdx, hs);
++          // A warp group without an active partial (nbActiveSubSeq < gemm1NbWarpGrps) loads
++          // nothing: its loop below does not run, so nothing would wait for the copy.
++          if (warpGrpIdx < nbActiveSubSeq) {
++            loadBufAsync(warpGrpIdx, hs);
++          }
+           ldgsts::commitGroup();
+           WarpAcc sumAcc{};
+           ThrdRegRowMax partialMergedRowSum{};
+-          for (uint32_t n = warpGrpIdx; n < nbSubSeqPerSeq; n += gemm1NbWarpGrps) {
+-            if (n + gemm1NbWarpGrps < nbSubSeqPerSeq) {
++          for (uint32_t n = warpGrpIdx; n < nbActiveSubSeq; n += gemm1NbWarpGrps) {
++            if (n + gemm1NbWarpGrps < nbActiveSubSeq) {
+               loadBufAsync(n + gemm1NbWarpGrps, hs);
+             }
+             ldgsts::commitGroup();

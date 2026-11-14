@@ -2587,6 +2587,8 @@ class MuseSpark1xModel(LlamaModel):
         self._configure_pooler_gather()
         if sm120_sp and sm120_sequence_parallel_is_gated():
             self._configure_sequence_parallel_row_gate()
+        if envs.VLLM_MUSE_SPARK_SM120_XQA_ACTIVE_MERGE and _on_sm120():
+            self._configure_xqa_active_merge()
         self._l2_prefetcher: L2Prefetcher | None = None
         if envs.VLLM_MUSE_SPARK_SM120_L2_PREFETCH and _on_sm120():
             self._configure_l2_prefetch()
@@ -2790,6 +2792,29 @@ class MuseSpark1xModel(LlamaModel):
             prefetch.budget_bytes / (1 << 20),
             len(moes),
         )
+
+    def _configure_xqa_active_merge(self) -> None:
+        """Build the XQA decode kernels from the shadow that merges active CTAs only.
+
+        FlashInfer's XQA launches a CTA per 256 tokens of the block table width
+        (``--max-model-len``) whatever the context is; the shadow ``mha.cu`` lets the
+        CTAs without a tile return and merges the active partials only, with bitwise
+        the stock output (see ``flashinfer_shadow/xqa_active_merge.py``). It has to
+        be installed before the first XQA call (the modules are built lazily), and the
+        stock kernel runs when the shadow cannot be built.
+        """
+        try:
+            from vllm.models.muse_spark.nvidia.flashinfer_shadow import (
+                xqa_active_merge,
+            )
+
+            xqa_active_merge.install()
+        except Exception as e:
+            logger.warning_once(
+                "The XQA active merge is off: %s: %s. The stock XQA kernel runs.",
+                type(e).__name__,
+                e,
+            )
 
     def _configure_l2_prefetch(self) -> None:
         """Prefetch weights into L2 behind the collectives of the layer before.

@@ -1633,6 +1633,10 @@ package_data = {
         "models/muse_spark/nvidia/csrc/*.cu",
         "models/muse_spark/nvidia/csrc/*.cuh",
         "models/muse_spark/nvidia/csrc/*.h",
+        # Muse Spark shadow FlashInfer sources, compiled through FlashInfer's JIT
+        "models/muse_spark/nvidia/flashinfer_shadow/xqa/*.cu",
+        "models/muse_spark/nvidia/flashinfer_shadow/xqa/*.md5",
+        "models/muse_spark/nvidia/flashinfer_shadow/xqa/*.patch",
         # Built-in multimodal chat template fallbacks (registry.py)
         "transformers_utils/chat_templates/*.jinja",
         "third_party/flash_linear_attention/LICENSE",

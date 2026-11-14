@@ -160,6 +160,7 @@ if TYPE_CHECKING:
     VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP: bool = True
     VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_MIN_TOKENS: int = 2048
     VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_UBATCHES: int = 2
+    VLLM_MUSE_SPARK_SM120_XQA_ACTIVE_MERGE: bool = True
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
     VLLM_ROCM_USE_AITER_LINEAR_HIPBMM: bool = False
     VLLM_ROCM_USE_AITER_MOE: bool = True
@@ -1572,6 +1573,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP.
     "VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_UBATCHES": lambda: int(
         os.getenv("VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_UBATCHES", "2")
+    ),
+    # Muse Spark on SM120: the FlashInfer XQA decode kernel (kernel_mha, FlashInfer
+    # 0.7.0.post1) launches one CTA per 256 tokens of --max-model-len (at most one per
+    # SM) per KV head, because it takes the maximum length from the width of the block
+    # table, and its last CTA merges the partials of all of them whatever the context
+    # is: 13.4 us per layer at batch 1 for 7 us of attention on a short context. On,
+    # the kernel is built from a branch-owned patched copy of FlashInfer's mha.cu
+    # (models/muse_spark/nvidia/flashinfer_shadow) whose CTAs without a tile return
+    # and whose merge runs over the active ones only. The output is bitwise the stock
+    # kernel's. The patched module is compiled through FlashInfer's JIT under its own
+    # name at the first XQA call (a few minutes per variant, cached) and the stock
+    # kernel runs when it cannot be built or FlashInfer is not 0.7.0.post1. Read once,
+    # when the model is constructed.
+    "VLLM_MUSE_SPARK_SM120_XQA_ACTIVE_MERGE": lambda: bool(
+        int(os.getenv("VLLM_MUSE_SPARK_SM120_XQA_ACTIVE_MERGE", "1"))
     ),
     # use aiter linear op if aiter ops are enabled
     # The following list of related ops
