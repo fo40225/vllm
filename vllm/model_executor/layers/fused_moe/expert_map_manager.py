@@ -20,6 +20,10 @@ from vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe import (
 
 logger = init_logger(__name__)
 
+# What a layer reports as its placement: the strategy that computed its map, or "custom"
+# for a map installed with ``ExpertMapManager.install_expert_map``.
+EffectiveExpertPlacement = ExpertPlacementStrategy | Literal["custom"]
+
 
 def determine_expert_map(
     ep_size: int,
@@ -325,7 +329,7 @@ class ExpertMapManager:
         return self._expert_mask
 
     @property
-    def placement_strategy(self) -> ExpertPlacementStrategy | Literal["custom"]:
+    def placement_strategy(self) -> EffectiveExpertPlacement:
         """Expert placement strategy ('linear' or 'round_robin'), or 'custom' once a
         map was installed with ``install_expert_map``."""
         return "custom" if self._custom_expert_map else self._placement_strategy
@@ -393,16 +397,32 @@ class ExpertMapManager:
                 f"expert_map: expected {old.dtype} {tuple(old.shape)}, got "
                 f"{expert_map.dtype} {tuple(expert_map.shape)}"
             )
-        slots = expert_map[expert_map >= 0].sort().values
-        if slots.numel() != self._local_num_experts - self.num_fused_shared_experts or (
-            slots != torch.arange(slots.numel(), dtype=slots.dtype, device=slots.device)
-        ).any():
+        # The first global_num_experts entries are the routed experts; the entries
+        # behind them (AITER's fused shared experts) are not the placement's to change.
+        count = self.global_num_experts
+        routed = expert_map[:count]
+        slots = routed[routed >= 0].sort().values
+        n_local = self._local_num_experts - self.num_fused_shared_experts
+        if (
+            slots.numel() != n_local
+            or (
+                slots != torch.arange(n_local, dtype=slots.dtype, device=slots.device)
+            ).any()
+        ):
             raise ValueError(
-                "expert_map: the local slots must be each of 0 .. "
-                f"{self._local_num_experts - self.num_fused_shared_experts - 1} once"
+                f"expert_map: the local slots must be each of 0 .. {n_local - 1} once"
+            )
+        if not torch.equal(expert_map[count:].cpu(), old[count:].cpu()):
+            raise ValueError(
+                "expert_map: the entries of the fused shared experts moved"
             )
         # On the device the caller gives it: the layer registers it as its buffer.
         self._expert_map = expert_map.contiguous()
+        if self._expert_mask is not None:
+            # The mask (AITER) tells the experts of this rank, like the map.
+            mask = self._expert_mask.clone()
+            mask[:count] = (routed > -1).to(device=mask.device, dtype=mask.dtype)
+            self._expert_mask = mask
         self._custom_expert_map = True
 
     def update(

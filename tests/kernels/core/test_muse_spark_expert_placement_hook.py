@@ -9,12 +9,17 @@ loader premises a placement relies on. The table and its install are in
 ``test_muse_spark_expert_placement.py``.
 """
 
+import ast
+import inspect
 import json
+import os
+import textwrap
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.multiprocessing as mp
 
 import vllm.envs as envs
 from tests.kernels.core.test_muse_spark_expert_placement import (
@@ -38,7 +43,11 @@ from vllm.models.muse_spark.nvidia.muse_moe_runner import (
     MuseSparkUnquantizedFusedMoE,
     expert_placement_blocker,
 )
-from vllm.models.muse_spark.nvidia.ops.expert_placement import ExpertPlacementTable
+from vllm.models.muse_spark.nvidia.ops.expert_placement import (
+    ExpertPlacementTable,
+    check_placement_agreement,
+    install_expert_placement,
+)
 
 
 # ------------------------------------------------------------------------------
@@ -170,11 +179,61 @@ def test_flag_is_off_by_default(monkeypatch) -> None:
     assert envs.VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT_TABLE is None
 
 
-def test_the_constructor_runs_the_hook() -> None:
-    import inspect
+def _constructor() -> ast.FunctionDef:
+    tree = ast.parse(
+        textwrap.dedent(inspect.getsource(muse_model.MuseSpark1xMoE.__init__))
+    )
+    function = tree.body[0]
+    assert isinstance(function, ast.FunctionDef)
+    return function
 
-    source = inspect.getsource(muse_model.MuseSpark1xMoE.__init__)
-    assert "self._install_expert_placement(vllm_config, layer_idx)" in source
+
+def _is_hook_call(node: ast.AST) -> bool:
+    return (
+        isinstance(node, ast.Call)
+        and ast.unparse(node.func) == "self._install_expert_placement"
+        and [ast.unparse(a) for a in node.args] == ["vllm_config", "layer_idx"]
+    )
+
+
+def test_the_constructor_runs_the_hook_once_after_the_experts_are_built() -> None:
+    """The syntax of the constructor, not its text: the hook is one statement of the
+    function's own body (no branch, loop or ``try`` that a layer could skip), behind
+    every assignment of ``self.experts`` (the placement replaces the map of the built
+    experts) and nothing loads weights in the constructor (the placement has to be in
+    before the weights land)."""
+    function = _constructor()
+    calls = [n for n in ast.walk(function) if _is_hook_call(n)]
+    assert len(calls) == 1
+    top = [
+        i
+        for i, n in enumerate(function.body)
+        if isinstance(n, ast.Expr) and _is_hook_call(n.value)
+    ]
+    assert len(top) == 1, "the hook is not an unconditional statement of the body"
+    hook = function.body[top[0]]
+    experts = [
+        n
+        for n in ast.walk(function)
+        if isinstance(n, ast.Assign | ast.AnnAssign)
+        and "self.experts" in ast.unparse(n).split("=")[0]
+    ]
+    assert len(experts) == 2  # MegaMoE's and the FusedMoE runner
+    assert max(n.lineno for n in experts) < hook.lineno
+    loads = [
+        n
+        for n in ast.walk(function)
+        if isinstance(n, ast.Call) and "load_weights" in ast.unparse(n.func)
+    ]
+    assert not loads
+
+
+def test_the_hook_is_the_last_statement_of_the_constructor() -> None:
+    """Nothing the constructor does after the hook can take the experts' map from
+    the layer (a check that rereads or replaces it would see the linear one)."""
+    function = _constructor()
+    last = function.body[-1]
+    assert isinstance(last, ast.Expr) and _is_hook_call(last.value)
 
 
 def test_without_the_flag_the_hook_leaves_the_layer_alone(
@@ -236,7 +295,15 @@ def _warnings(monkeypatch) -> list[str]:
 
 
 @pytest.mark.parametrize(
-    "case", ["no snapshot", "other snapshot", "ep size", "drafter layer", "blocker"]
+    "case",
+    [
+        "no snapshot",
+        "other snapshot",
+        "ep size",
+        "drafter layer",
+        "blocker",
+        "round robin",
+    ],
 )
 def test_hook_leaves_the_layer_linear_with_the_reason(
     case, tmp_path, monkeypatch
@@ -257,15 +324,19 @@ def test_hook_leaves_the_layer_linear_with_the_reason(
         quant_method = _quant_method(
             MuseSparkModelOptNvFp4FusedMoE, use_sm120_native=False
         )
-    manager = _manager(ep_size, 1, experts)
+    strategy = "round_robin" if case == "round robin" else "linear"
+    manager = _manager(ep_size, 1, experts, strategy)
+    assert manager.placement_strategy == strategy
     stub, routed = _moe_stub(manager, quant_method)
     stub.num_experts, stub.top_k = experts, 8
     stock = manager.expert_map.clone()
     _install(stub, _vllm_config(model, layers), layer_idx=layer_idx)
     assert stub.expert_placement is None
     assert routed.updates == 0 and torch.equal(manager.expert_map, stock)
-    assert manager.placement_strategy == "linear"
-    assert len(warnings) == 1 and "keeps the linear expert placement" in warnings[0]
+    assert manager.placement_strategy == strategy
+    # The warning names the placement the layer keeps, not always "linear".
+    assert len(warnings) == 1
+    assert f"keeps its {strategy} expert placement" in warnings[0]
 
 
 def test_hook_warns_for_a_table_that_cannot_be_read(tmp_path, monkeypatch) -> None:
@@ -280,9 +351,7 @@ def test_hook_warns_for_a_table_that_cannot_be_read(tmp_path, monkeypatch) -> No
 
 
 def test_eplb_cannot_change_the_experts_of_a_placed_model() -> None:
-    placed = SimpleNamespace(
-        feed_forward=object.__new__(muse_model.MuseSpark1xMoE)
-    )
+    placed = SimpleNamespace(feed_forward=object.__new__(muse_model.MuseSpark1xMoE))
     placed.feed_forward.expert_placement = (1, 2, 3)
     linear = SimpleNamespace(feed_forward=object.__new__(muse_model.MuseSpark1xMoE))
     linear.feed_forward.expert_placement = None
@@ -301,15 +370,25 @@ def test_eplb_cannot_change_the_experts_of_a_placed_model() -> None:
 
 
 def test_megamoe_layers_return_before_the_hook() -> None:
-    """MegaMoE takes its experts from the rank number: its constructor returns ahead of
-    the placement hook (with a warning under the flag), so such a layer stays linear."""
-    import inspect
-
-    source = inspect.getsource(muse_model.MuseSpark1xMoE.__init__)
-    assert source.index("MuseSparkMegaMoEExperts(") < source.index(
-        "self._install_expert_placement("
-    )
-    assert "apply to MegaMoE" in source
+    """MegaMoE takes its experts from the rank number: the constructor returns from the
+    MegaMoE branch (with a warning under the flag) ahead of the placement hook, so such
+    a layer stays linear."""
+    function = _constructor()
+    mega = [
+        i
+        for i, n in enumerate(function.body)
+        if isinstance(n, ast.If)
+        and ast.unparse(n.test) == "self.use_mega_moe"
+        and isinstance(n.body[-1], ast.Return)
+        and "apply to MegaMoE" in ast.unparse(n)
+        and "MuseSparkMegaMoEExperts(" in ast.unparse(n)
+    ]
+    hook = [
+        i
+        for i, n in enumerate(function.body)
+        if isinstance(n, ast.Expr) and _is_hook_call(n.value)
+    ]
+    assert len(mega) == 1 and len(hook) == 1 and mega[0] < hook[0]
 
 
 # ------------------------------------------------------------------------------
@@ -333,3 +412,227 @@ def test_a_layerwise_weight_reload_keeps_the_installed_map() -> None:
     """``_expert_map`` is never moved to the meta device or reloaded, so the layer a
     reload re-materializes still holds the placement's map."""
     assert "_expert_map" in SKIP_LOAD_TENSORS
+
+
+def test_the_ep_weight_filter_is_off_under_a_placement(monkeypatch) -> None:
+    """The filter derives the experts of a rank from the linear / round-robin strategy
+    and would skip per-expert tensors of the experts the rank owns under the placement:
+    with the flag it does not compute a set at all (without it, it does)."""
+    import vllm.config
+    import vllm.distributed as distributed
+    from vllm.config.load import LoadConfig
+    from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
+
+    monkeypatch.setattr(distributed, "get_tensor_model_parallel_rank", lambda: 3)
+    model_config = SimpleNamespace(is_moe=True, get_num_experts=lambda: 256)
+    parallel = SimpleNamespace(
+        tensor_parallel_size=8,
+        data_parallel_size=1,
+        prefill_context_parallel_size=1,
+        enable_expert_parallel=True,
+        enable_ep_weight_filter=True,
+        enable_eplb=False,
+        expert_placement_strategy="linear",
+    )
+    monkeypatch.setattr(
+        vllm.config,
+        "get_current_vllm_config",
+        lambda: SimpleNamespace(parallel_config=parallel),
+    )
+
+    def local_experts() -> set[int] | None:
+        loader = DefaultModelLoader(LoadConfig())
+        loader._init_ep_weight_filter(model_config)
+        return loader.local_expert_ids
+
+    monkeypatch.setenv("VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT", "0")
+    assert local_experts() == set(range(96, 128))
+    monkeypatch.setenv("VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT", "1")
+    assert local_experts() is None
+
+
+# ------------------------------------------------------------------------------
+# The ranks must agree on the placement (a split holds experts twice or never)
+# ------------------------------------------------------------------------------
+WORLD = 4
+# 0: MoE, 1: dense layer, 2: MegaMoE, 3: MoE (EP4, 16 experts, table of 4 layers).
+MOE_LAYERS = (0, 3)
+
+
+def _moe(rank: int, table: ExpertPlacementTable | None, layer_idx: int):
+    """A MuseSpark1xMoE that went through the constructor's hook with ``table``."""
+    moe = object.__new__(muse_model.MuseSpark1xMoE)
+    moe.use_mega_moe = False
+    moe.num_experts = 16
+    moe.expert_placement = None
+    routed = _Routed(_manager(WORLD, rank, 16))
+    if table is not None:
+        moe.expert_placement = install_expert_placement(routed, table, layer_idx)
+    moe.experts = SimpleNamespace(routed_experts=routed)
+    return moe
+
+
+def _mega_moe() -> muse_model.MuseSpark1xMoE:
+    moe = object.__new__(muse_model.MuseSpark1xMoE)
+    moe.use_mega_moe = True
+    moe.num_experts = 16
+    moe.expert_placement = None
+    return moe
+
+
+def _model(rank: int, tables: dict[int, ExpertPlacementTable | None]):
+    """The layers of one rank; ``tables[i]`` is what its hook found for layer ``i``."""
+    feed_forward = [
+        _moe(rank, tables.get(0), 0),
+        object(),
+        _mega_moe(),
+        _moe(rank, tables.get(3), 3),
+    ]
+    return SimpleNamespace(
+        start_layer=0,
+        end_layer=len(feed_forward),
+        layers=[SimpleNamespace(feed_forward=ff) for ff in feed_forward],
+    )
+
+
+def _table(shift: int = 0) -> ExpertPlacementTable:
+    """A valid table of 4 layers; another ``shift`` is another table (each rank of it
+    owns the experts that rank ``shift`` before it owns in the shift 0 table)."""
+    data = _small_json(num_layers=4)
+    for entry in data["layers"].values():
+        entry["rank_of"] = [(r + shift) % WORLD for r in entry["rank_of"]]
+        del entry["new_id"]
+    return ExpertPlacementTable.from_json(data, source=f"shift{shift}.json")
+
+
+def _agreement_worker(rank: int, world: int, port: int) -> None:
+    """``_check_expert_placement`` over a real gloo group, a model per scenario."""
+    torch.distributed.init_process_group(
+        "gloo", init_method=f"tcp://127.0.0.1:{port}", world_size=world, rank=rank
+    )
+    muse_model.get_ep_group = lambda: SimpleNamespace(
+        world_size=world, cpu_group=torch.distributed.group.WORLD
+    )
+    table, other = _table(), _table(shift=1)
+    last = rank == world - 1
+    first = rank == 0
+    both = {0: table, 3: table}
+    # The same table on every rank: partition in both layers, nothing to say.
+    ok = {
+        "every rank took the table": both,
+        "no rank took it (flag on, layers blocked everywhere)": {},
+        "layer 0 only": {0: table},
+    }
+    # (what this rank's hook found, the words the error has to hold)
+    bad = {
+        "the last rank kept layer 3 linear": (
+            {0: table, 3: None if last else table},
+            "layer 3: 3 of 4 EP ranks took the placement table",
+        ),
+        "the first rank kept both linear": (
+            {} if first else both,
+            "layer 0: 3 of 4 EP ranks took the placement table",
+        ),
+        "another table on the last rank": (
+            {0: other if last else table, 3: table},
+            "layer 0: ",
+        ),
+    }
+    for tables in ok.values():
+        muse_model.MuseSpark1xModel._check_expert_placement(_model(rank, tables))
+    for name, (tables, words) in bad.items():
+        try:
+            muse_model.MuseSpark1xModel._check_expert_placement(_model(rank, tables))
+        except RuntimeError as e:
+            # Every rank raises, the one that kept the layer linear and the others.
+            assert words in str(e), (rank, name, str(e))
+            assert "EXPERT_PLACEMENT" in str(e)
+        else:
+            raise AssertionError((rank, name, "no error"))
+        # The group is still usable (every rank went through the one collective).
+        muse_model.MuseSpark1xModel._check_expert_placement(_model(rank, both))
+    torch.distributed.barrier()
+    torch.distributed.destroy_process_group()
+
+
+def test_the_placement_decision_is_agreed_over_the_ep_cpu_group() -> None:
+    """A rank that kept a layer linear while the others took the table (a failed read
+    of the file, another table on another node) is an error on every rank, before the
+    weights load, and a model on which all agree is accepted. The check is on the EP
+    group, not the TP group: here only ``get_ep_group`` is patched."""
+    port = 31700 + os.getpid() % 1000
+    mp.spawn(_agreement_worker, args=(WORLD, port), nprocs=WORLD)
+
+
+def test_one_ep_rank_has_nothing_to_agree_on(monkeypatch) -> None:
+    """EP1 (or no layer that could be placed) takes no collective and just logs."""
+    monkeypatch.setattr(
+        muse_model,
+        "get_ep_group",
+        lambda: SimpleNamespace(world_size=1, cpu_group=None),
+    )
+    seen: list[tuple] = []
+    monkeypatch.setattr(muse_model.logger, "info", lambda *args: seen.append(args))
+    model = _model(0, {0: _table()})
+    muse_model.MuseSpark1xModel._check_expert_placement(model)
+    # 3 MoE layers (MegaMoE counts, the dense one does not), 1 of them placed.
+    assert seen[-1][1:] == (1, 3)
+
+
+def test_layers_without_an_expert_map_are_not_checked(monkeypatch) -> None:
+    """Without EP (flag on, layers fall back to linear with a warning) every rank holds
+    a slice of every expert: that is no partition, and it is no error. The group is
+    not even asked (it would fail here: there is none)."""
+    monkeypatch.setattr(
+        muse_model,
+        "get_ep_group",
+        lambda: SimpleNamespace(world_size=8, cpu_group=None),
+    )
+    seen: list[tuple] = []
+    monkeypatch.setattr(muse_model.logger, "info", lambda *args: seen.append(args))
+    moe = object.__new__(muse_model.MuseSpark1xMoE)
+    moe.use_mega_moe = False
+    moe.num_experts = 16
+    moe.expert_placement = None
+    routed = _Routed(_manager(1, 0, 16))
+    assert routed.expert_map is None
+    moe.experts = SimpleNamespace(routed_experts=routed)
+    model = SimpleNamespace(
+        start_layer=0, end_layer=1, layers=[SimpleNamespace(feed_forward=moe)]
+    )
+    muse_model.MuseSpark1xModel._check_expert_placement(model)
+    assert seen[-1][1:] == (0, 1)
+
+
+def test_the_agreement_check_names_what_is_wrong(tmp_path) -> None:
+    """The pure part: a partition is accepted, a double or missing expert is not, and
+    the table-took counts must be all or nothing (single-process group of size 1 is a
+    trivial partition only when every expert is held)."""
+    path = tmp_path / "store"
+    torch.distributed.init_process_group(
+        "gloo", init_method=f"file://{path}", world_size=1, rank=0
+    )
+    try:
+        group = torch.distributed.group.WORLD
+        all_held = torch.ones(2, 4, dtype=torch.int32)
+        check_placement_agreement([5, 9], all_held, [True, False], group)
+        # The model is built under a default device that is not the CPU (the GPU): the
+        # reduced tensors still are (a "meta" default device fails any other choice).
+        with torch.device("meta"):
+            check_placement_agreement([5, 9], all_held, [True, False], group)
+        missing = all_held.clone()
+        missing[1, 2] = 0
+        with pytest.raises(RuntimeError, match=r"layer 9: 0 experts .* 1 by none"):
+            check_placement_agreement([5, 9], missing, [True, False], group)
+        # An expert held twice with none missing counts on its own (unequal ranks).
+        crowded = all_held.clone()
+        crowded[0, 0] = 2
+        with pytest.raises(
+            RuntimeError,
+            match=r"layer 5: 1 experts are held by more than one .*, 0 by none",
+        ):
+            check_placement_agreement([5, 9], crowded, [True, False], group)
+        with pytest.raises(ValueError, match="one row per layer"):
+            check_placement_agreement([5], all_held, [True], group)
+    finally:
+        torch.distributed.destroy_process_group()

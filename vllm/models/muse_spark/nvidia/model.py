@@ -126,6 +126,7 @@ from vllm.models.muse_spark.nvidia.ops.cute_dsl.qk_norm import (
     supports_qk_norm,
 )
 from vllm.models.muse_spark.nvidia.ops.expert_placement import (
+    check_placement_agreement,
     install_expert_placement,
     load_matching_table,
 )
@@ -649,8 +650,8 @@ _AUTO_SP_MOE_BACKENDS = ("auto", "cutlass")
 
 
 def _on_sm120() -> bool:
-    return (
-        current_platform.is_cuda() and current_platform.is_device_capability_family(120)
+    return current_platform.is_cuda() and current_platform.is_device_capability_family(
+        120
     )
 
 
@@ -1185,7 +1186,7 @@ class MuseSpark1xMoE(nn.Module):
 
         Runs in the constructor, so that the weights that load afterwards land in the
         slots of the new map (see ``ops/expert_placement.py``). A layer that cannot
-        take it, or a table that does not fit the model, leaves the layer linear with a
+        take it, or a table that does not fit the model, keeps its own placement with a
         warning; ``expert_placement`` says which.
         """
         if not envs.VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT:
@@ -1228,7 +1229,8 @@ class MuseSpark1xMoE(nn.Module):
                     return
         logger.warning_once(
             "MuseSpark: VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT=1, but a layer keeps "
-            "the linear expert placement: %s.",
+            "its %s expert placement: %s.",
+            manager.placement_strategy,
             why,
         )
 
@@ -2717,7 +2719,7 @@ class MuseSpark1xModel(LlamaModel):
         # After the expert prefetch: the router GEMV needs the layers that queue it.
         self._configure_router_gemv()
         if envs.VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT:
-            self._log_expert_placement()
+            self._check_expert_placement()
         if self.is_sequence_parallel:
             from vllm.models.muse_spark.nvidia.ops.gemm_rs import (
                 maybe_create_gemm_rs,
@@ -2735,14 +2737,44 @@ class MuseSpark1xModel(LlamaModel):
                     if gemm_rs.supports_projection(attn.o_proj):
                         attn.gemm_rs = gemm_rs
 
-    def _log_expert_placement(self) -> None:
-        """Say how many MoE layers run a static expert placement."""
+    def _check_expert_placement(self) -> None:
+        """Make sure the EP ranks took the same static expert placement, then say how
+        many MoE layers run it.
+
+        Every rank decides per layer on its own whether it takes the table (see
+        ``check_placement_agreement``): a split would hold an expert twice or not at all
+        and give a wrong MoE output without an error, so it is an error here, before the
+        weights load. The check runs over the EP group (the group whose ranks sum the
+        experts), whatever the TP size is, and is a collective on every rank.
+        """
         moe = [
-            layer.feed_forward
-            for layer in islice(self.layers, self.start_layer, self.end_layer)
+            (idx, layer.feed_forward)
+            for idx, layer in zip(
+                range(self.start_layer, self.end_layer),
+                islice(self.layers, self.start_layer, self.end_layer),
+            )
             if isinstance(layer.feed_forward, MuseSpark1xMoE)
         ]
-        placed = sum(m.expert_placement is not None for m in moe)
+        # Only layers with an expert map divide the experts among the ranks: MegaMoE
+        # layers never take a placement, and without EP every rank holds a slice of
+        # every expert (no partition to check).
+        checked = []
+        for idx, m in moe:
+            if not m.use_mega_moe:
+                expert_map = cast(MuseMoERunner, m.experts).routed_experts.expert_map
+                if expert_map is not None:
+                    checked.append((idx, m, expert_map))
+        group = get_ep_group()
+        if checked and group.world_size > 1:
+            check_placement_agreement(
+                [idx for idx, _, _ in checked],
+                torch.stack(
+                    [(e[: m.num_experts].cpu() >= 0).int() for _, m, e in checked]
+                ),
+                [m.expert_placement is not None for _, m, _ in checked],
+                group.cpu_group,
+            )
+        placed = sum(m.expert_placement is not None for _, m in moe)
         logger.info(
             "MuseSpark: static expert placement "
             "(VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT=1) in %d of %d MoE layers.",
@@ -3525,9 +3557,7 @@ class MuseSpark1xForCausalLM(LlamaForCausalLM, SupportsLoRA, MixtureOfExperts):
         residual-path constants here too (idempotent): dummy-weight runs then
         take the same fused residual kernels and folded router as real weights.
         """
-        already = any(
-            getattr(m, "_coefficients_ready", False) for m in self.modules()
-        )
+        already = any(getattr(m, "_coefficients_ready", False) for m in self.modules())
         n_gates = materialize_residual_path_constants(self)
         if not already:
             logger.info(

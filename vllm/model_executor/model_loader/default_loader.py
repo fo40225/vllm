@@ -13,6 +13,7 @@ import torch
 from torch import nn
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
+from vllm import envs
 from vllm.config import ModelConfig, get_current_vllm_config_or_none
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
@@ -447,6 +448,12 @@ class DefaultModelLoader(BaseModelLoader):
         # The weight loader needs to see ALL logical expert weights so it can
         # populate these redundant slots.  Skip the filter entirely.
         if parallel_config.enable_eplb:
+            return
+
+        # A static expert placement (Muse Spark on SM120) puts experts on ranks that
+        # the linear / round-robin strategy does not: the set computed below would drop
+        # the per-expert tensors of the experts a rank owns under the placement.
+        if envs.VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT:
             return
 
         num_experts = model_config.get_num_experts()

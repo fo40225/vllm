@@ -627,3 +627,56 @@ def test_install_expert_map_checks_the_map() -> None:
     assert manager.placement_strategy == "custom"
     with pytest.raises(ValueError, match="no map to replace"):
         _manager(1, 0, 16).install_expert_map(good)
+
+
+def _aiter_manager(shared: int, monkeypatch) -> ExpertMapManager:
+    from vllm.model_executor.layers.fused_moe import expert_map_manager
+
+    monkeypatch.setattr(
+        expert_map_manager, "init_aiter_topK_meta_data", lambda **kwargs: None
+    )
+    return ExpertMapManager(
+        max_num_batched_tokens=64,
+        top_k=2,
+        global_num_experts=16,
+        num_redundant_experts=0,
+        num_expert_group=None,
+        moe_parallel_config=_parallel_config(4, 0),
+        placement_strategy="linear",
+        enable_eplb=False,
+        num_fused_shared_experts=shared,
+        rocm_aiter_enabled=True,
+    )
+
+
+@pytest.mark.parametrize("shared", [0, 1])
+def test_install_expert_map_keeps_the_aiter_mask_and_shared_entries(
+    shared, monkeypatch
+) -> None:
+    """The mask of the AITER path says which experts the rank holds, like the map: it
+    follows the installed map (sentinel entry and fused shared experts untouched)."""
+    manager = _aiter_manager(shared, monkeypatch)
+    assert manager.expert_mask.shape == (17 + shared,)
+    assert manager.expert_mask[:16].tolist() == [1] * 4 + [0] * 12
+    new = manager.expert_map.clone()
+    new[:16] = -1
+    for expert, slot in {1: 2, 5: 0, 9: 3, 14: 1}.items():
+        new[expert] = slot
+    manager.install_expert_map(new)
+    mask = manager.expert_mask
+    assert mask.shape == (17 + shared,) and mask.dtype == torch.int32
+    assert mask[:16].tolist() == [int(e in (1, 5, 9, 14)) for e in range(16)]
+    assert mask[16:].tolist() == [1] * shared + [0]
+    assert torch.equal(manager.expert_map[16:], new[16:])
+    assert manager.placement_strategy == "custom"
+    if shared:
+        # The fused shared expert entry is not the placement's to move.
+        moved = new.clone()
+        moved[16] = 7
+        with pytest.raises(ValueError, match="fused shared experts"):
+            manager.install_expert_map(moved)
+        # ... and the slots check does not count it as a routed expert.
+        crowded = new.clone()
+        crowded[3] = 4
+        with pytest.raises(ValueError, match="each of 0 .. 3 once"):
+            manager.install_expert_map(crowded)

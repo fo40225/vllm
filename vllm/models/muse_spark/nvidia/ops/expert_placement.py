@@ -34,7 +34,7 @@ kernels, MegaMoE) are not eligible; see ``muse_moe_runner.expert_placement_block
 import functools
 import json
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -356,3 +356,66 @@ def install_expert_placement(
     manager.install_expert_map(table.expert_map(layer_idx, ep_rank, device))
     routed_experts.update_expert_map_info()
     return table.local_experts(layer_idx, ep_rank)
+
+
+def check_placement_agreement(
+    layers: Sequence[int],
+    owned: torch.Tensor,
+    placed: Sequence[bool],
+    group: Any,
+) -> None:
+    """Raise unless every rank of ``group`` took the same placement decision in every
+    layer and, per layer, the ranks hold each expert exactly once.
+
+    The decision to take the placement is made by every rank on its own (its own read of
+    the table, its own look-up of the snapshot), and the tokens are replicated, so the
+    all-reduced output is right only if the experts of the ranks are a partition of the
+    layer's experts. A rank that kept a layer linear while the others took the table (a
+    failed read, another table version on another node) holds some experts twice and
+    others not at all, and nothing fails until the output is wrong. Call it on every
+    rank of ``group`` with the same ``layers`` (a collective: one CPU all-reduce).
+
+    ``owned`` is int32 ``[len(layers), num_experts]`` on the CPU, 1 where this rank
+    holds the expert; ``placed[i]`` tells whether this rank installed a placement table
+    in ``layers[i]``.
+    """
+    n = len(layers)
+    if owned.shape[0] != n or len(placed) != n:
+        raise ValueError("check_placement_agreement: one row per layer expected")
+    # The CPU group reduces CPU tensors; a model is built under a default device that is
+    # the GPU, which a bare ``torch.tensor`` would follow.
+    cpu = torch.device("cpu")
+    stats = torch.cat(
+        [
+            owned.to(device=cpu, dtype=torch.int32),
+            torch.tensor(placed, dtype=torch.int32, device=cpu).view(n, 1),
+        ],
+        dim=1,
+    )
+    torch.distributed.all_reduce(stats, group=group)
+    world_size = torch.distributed.get_world_size(group)
+    held, took = stats[:, :-1], stats[:, -1]
+    problems = []
+    for i, layer in enumerate(layers):
+        if 0 < int(took[i]) < world_size:
+            problems.append(
+                f"layer {layer}: {int(took[i])} of {world_size} EP ranks took the "
+                "placement table"
+            )
+        twice = int((held[i] > 1).sum())
+        never = int((held[i] == 0).sum())
+        if twice or never:
+            problems.append(
+                f"layer {layer}: {twice} experts are held by more than one EP rank, "
+                f"{never} by none"
+            )
+    if problems:
+        raise RuntimeError(
+            "The EP ranks disagree on the static expert placement "
+            "(VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT=1), so the MoE output would be "
+            "wrong: "
+            + "; ".join(problems[:8])
+            + (f"; and {len(problems) - 8} more" if len(problems) > 8 else "")
+            + ". Check that every rank reads the same table (the file, the model "
+            "snapshot) and that none failed to read it."
+        )

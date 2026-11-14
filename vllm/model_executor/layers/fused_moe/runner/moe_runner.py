@@ -8,7 +8,6 @@ import torch
 import torch.nn.functional as F
 
 from vllm.config import VllmConfig, get_current_vllm_config
-from vllm.config.parallel import ExpertPlacementStrategy
 from vllm.distributed import (
     get_ep_group,
     get_pcp_group,
@@ -24,6 +23,9 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
+)
+from vllm.model_executor.layers.fused_moe.expert_map_manager import (
+    EffectiveExpertPlacement,
 )
 from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
     FusedMoEMethodBase,
@@ -974,7 +976,7 @@ class MoERunner(MoERunnerInterface):
         return self.routed_experts.expert_map_manager
 
     @property
-    def expert_placement_strategy(self) -> ExpertPlacementStrategy:
+    def expert_placement_strategy(self) -> EffectiveExpertPlacement:
         return self.expert_map_manager.placement_strategy
 
     @property

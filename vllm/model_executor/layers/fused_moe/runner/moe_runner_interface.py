@@ -5,9 +5,11 @@ from collections.abc import Iterable
 
 import torch
 
-from vllm.config.parallel import ExpertPlacementStrategy
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+from vllm.model_executor.layers.fused_moe.expert_map_manager import (
+    EffectiveExpertPlacement,
+)
 from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
     FusedMoEMethodBase,
 )
@@ -85,7 +87,7 @@ class MoERunnerInterface(PluggableLayer, ABC):
 
     @property
     @abstractmethod
-    def expert_placement_strategy(self) -> ExpertPlacementStrategy:
+    def expert_placement_strategy(self) -> EffectiveExpertPlacement:
         raise NotImplementedError
 
     @property
