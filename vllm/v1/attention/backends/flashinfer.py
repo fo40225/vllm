@@ -868,11 +868,15 @@ def host_seq_lens_plan(
     decode_with_flashinfer_trtllm_api: bool,
     num_speculative_tokens: int,
     has_upper_bound: bool,
+    prefill_rows_exact: bool,
 ) -> tuple[bool, bool]:
     """Decide how a build gets the sequence lengths on the host.
 
     Returns (needs_seq_lens_cpu, use_upper_bound). The levels are those of
     VLLM_MUSE_SPARK_SM120_FI_HOST_LENS; level 0 is the behaviour before the flag.
+    prefill_rows_exact: every row counted in num_prefills is a prefilling request, so
+    the host bound is exact on it (a causal batch split by the query-length threshold
+    alone: the decode rows of a speculative step have at most the threshold's tokens).
     """
     if level <= 0:
         needs = use_dcp or not all_uses_trtllm
@@ -883,9 +887,16 @@ def host_seq_lens_plan(
     host_prefill_rows = num_prefills > 0 and not prefill_use_trtllm
     host_decode_rows = num_decodes > 0 and not decode_with_flashinfer_trtllm_api
     needs = use_dcp or host_prefill_rows or host_decode_rows
-    # The host upper bound over-counts the draft tokens of a decode row that the
-    # verify step rejects, so under speculation the exact lengths are fetched.
-    return needs, needs and num_speculative_tokens == 0 and has_upper_bound
+    if num_speculative_tokens == 0:
+        return needs, needs and has_upper_bound
+    # Speculation: the upper bound over-counts the draft tokens of a decode row that
+    # the verify step rejects, but a prefilling row has no draft token (exact), and a
+    # decode row that does not read the host lengths does not care. DCP converts the
+    # lengths per rank and keeps the fetch, as does a batch whose prefill rows may
+    # include decode rows (a non-causal draft step, or a split that requires uniform
+    # query lengths).
+    exact = level >= 2 and not use_dcp and not host_decode_rows and prefill_rows_exact
+    return needs, needs and exact and has_upper_bound
 
 
 class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
@@ -905,9 +916,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self.attention_config = vllm_config.attention_config
         self._num_speculative_tokens = vllm_config.num_speculative_tokens
         self._host_lens_level = envs.VLLM_MUSE_SPARK_SM120_FI_HOST_LENS
-        if self._host_lens_level not in (0, 1):
+        if self._host_lens_level not in (0, 1, 2):
             raise ValueError(
-                "VLLM_MUSE_SPARK_SM120_FI_HOST_LENS must be 0 or 1, got "
+                "VLLM_MUSE_SPARK_SM120_FI_HOST_LENS must be 0, 1 or 2, got "
                 f"{self._host_lens_level}"
             )
         self._workspace_buffer = None
@@ -1713,10 +1724,13 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             decode_with_flashinfer_trtllm_api=decode_with_flashinfer_trtllm_api,
             num_speculative_tokens=self._num_speculative_tokens,
             has_upper_bound=common_attn_metadata.seq_lens_cpu_upper_bound is not None,
+            # The split by the query-length threshold alone (no uniform-length rule).
+            prefill_rows_exact=bool(causal)
+            and (self.use_xqa or self.use_trtllm_gen_varlen_decode),
         )
         if needs_seq_lens_cpu:
             if use_seq_lens_upper_bound:
-                # No speculative token accounting, so the upper bound is exact.
+                # The upper bound is exact for every row that reads it.
                 seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
             else:
                 with gpu_sync_allowed():

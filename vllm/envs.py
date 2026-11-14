@@ -1849,16 +1849,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Muse Spark on SM120: when the FlashInfer metadata builder reads the sequence
     # lengths back from the device (seq_lens.cpu(): a pageable DtoH that synchronizes
-    # the stream). A build fetched them whenever any row of its batch could take a
-    # native FlashInfer path, and for every non-causal batch, although the non-causal
-    # draft of DFlash decodes on the XQA kernel, which reads the device lengths: the
-    # fetched value was never used. The sync makes the worker wait for all queued GPU
-    # work, so the draft launch and the next step's input and metadata preparation
-    # start only after the verify step is done (GPU idle time between the two).
-    # 0 = as before. 1 = fetch only when a row takes a path that reads host lengths
-    # (XQA / trtllm decode and trtllm prefill never do). The metadata is bitwise the
-    # same for both levels. Values other than 0 and 1 are rejected when the builder is
-    # constructed (the value is read there, once).
+    # the stream). Under speculative decoding the host only knows an upper bound of
+    # the lengths, so every build of a step with a native-FlashInfer consumer fetched
+    # the exact ones, and the fetch also fired for builds that never read them: the
+    # non-causal draft (its decode rows run the XQA kernel on the device lengths) and,
+    # in a prefill step, every attention group of the target. The sync makes the worker
+    # wait for all queued GPU work, so everything the host does after it (the draft
+    # launch, then the next step's input and metadata preparation) is exposed as GPU
+    # idle time. 0 = as before. 1 = fetch only when a row takes a path that reads host
+    # lengths (XQA / trtllm decode and trtllm prefill never do). 2 = as 1, and the host
+    # upper bound replaces the fetch when only prefill rows read host lengths: the bound
+    # of a prefilling request is exact (num_computed_tokens plus the scheduled chunk, no
+    # acceptance involved), and the decode rows of such a batch run the XQA / trtllm
+    # decode, which reads the device lengths. Only for causal batches split by the
+    # query-length threshold alone (the target): a non-causal draft on the native
+    # wrapper, DCP and uniform-length splits keep the fetch. The attention result is
+    # bitwise the same for every level (in a mixed batch the page-index offsets of the
+    # prefill rows shift with the host bound of the decode rows in front of them, on
+    # the write and the read side alike). Values other than 0, 1 and 2 are rejected when
+    # the builder is constructed (the value is read there, once).
     "VLLM_MUSE_SPARK_SM120_FI_HOST_LENS": lambda: int(
         os.getenv("VLLM_MUSE_SPARK_SM120_FI_HOST_LENS", "0")
     ),

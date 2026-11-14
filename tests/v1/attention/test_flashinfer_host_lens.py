@@ -3,9 +3,9 @@
 """FlashInfer metadata builder: how the host gets the sequence lengths.
 
 VLLM_MUSE_SPARK_SM120_FI_HOST_LENS (level 0 = as before, 1 = fetch the exact lengths
-only when a row reads them on the host). The decision is `host_seq_lens_plan`; the
-glue in `build()` is exercised on a stub builder (no kernel runs) that counts the
-`.cpu()` calls on `seq_lens`.
+only for rows that read them on the host, 2 = host upper bound when only prefill rows
+read them). The decision is `host_seq_lens_plan`; the glue in `build()` is exercised on
+a stub builder (no kernel runs) that counts the `.cpu()` calls on `seq_lens`.
 """
 
 import itertools
@@ -48,12 +48,13 @@ GRID = list(
         (False, True),  # decode_with_flashinfer_trtllm_api
         (0, 7),  # num_speculative_tokens
         (False, True),  # has_upper_bound
+        (False, True),  # prefill_rows_exact
     )
 )
 
 
 def _plan(level, g):
-    use_dcp, causal, npf, nd, ptrt, dtrt, nspec, has_ub = g
+    use_dcp, causal, npf, nd, ptrt, dtrt, nspec, has_ub, pre_exact = g
     return host_seq_lens_plan(
         level,
         use_dcp=use_dcp,
@@ -64,19 +65,20 @@ def _plan(level, g):
         decode_with_flashinfer_trtllm_api=dtrt,
         num_speculative_tokens=nspec,
         has_upper_bound=has_ub,
+        prefill_rows_exact=pre_exact,
     )
 
 
 @pytest.mark.parametrize("g", GRID)
 def test_level_0_is_the_old_rule(g):
-    use_dcp, causal, npf, nd, ptrt, dtrt, nspec, has_ub = g
+    use_dcp, causal, npf, nd, ptrt, dtrt, nspec, has_ub, pre_exact = g
     all_trtllm = _all_uses_trtllm(causal, npf, nd, ptrt, dtrt)
     assert _plan(0, g) == _old_rule(use_dcp, all_trtllm, nspec, has_ub)
 
 
 @pytest.mark.parametrize("g", GRID)
 def test_level_1_fetches_only_what_a_host_reader_needs(g):
-    use_dcp, causal, npf, nd, ptrt, dtrt, nspec, has_ub = g
+    use_dcp, causal, npf, nd, ptrt, dtrt, nspec, has_ub, pre_exact = g
     needs, use_ub = _plan(1, g)
     host_readers = use_dcp or (npf > 0 and not ptrt) or (nd > 0 and not dtrt)
     assert needs == host_readers
@@ -92,34 +94,67 @@ def test_level_1_fetches_only_what_a_host_reader_needs(g):
         assert not needs or _old_rule(use_dcp, False, nspec, has_ub)[0]
 
 
+@pytest.mark.parametrize("g", GRID)
+def test_level_2_upper_bound_only_when_decode_rows_do_not_read_host_lengths(g):
+    use_dcp, causal, npf, nd, ptrt, dtrt, nspec, has_ub, pre_exact = g
+    needs1, ub1 = _plan(1, g)
+    needs2, ub2 = _plan(2, g)
+    assert needs2 == needs1
+    if nspec == 0:
+        assert ub2 == ub1
+        return
+    host_decode_rows = nd > 0 and not dtrt
+    assert ub2 == (
+        needs2 and has_ub and not use_dcp and not host_decode_rows and pre_exact
+    )
+    # Never worse than level 1: an upper bound is only added, never taken away.
+    assert (not ub1) or ub2
+
+
 def test_named_scenarios():
     # Non-causal draft batch, XQA decode rows only: nothing reads the host lengths.
     draft = dict(
         use_dcp=False, all_uses_trtllm=False, num_prefills=0, num_decodes=8,
         prefill_use_trtllm=False, decode_with_flashinfer_trtllm_api=True,
-        num_speculative_tokens=7, has_upper_bound=True,
+        num_speculative_tokens=7, has_upper_bound=True, prefill_rows_exact=True,
     )  # fmt: skip
     assert host_seq_lens_plan(0, **draft) == (True, False)
     assert host_seq_lens_plan(1, **draft) == (False, False)
-    # Target prefill step (native prefill, no decode row): the exact lengths are
-    # fetched under speculation.
+    assert host_seq_lens_plan(2, **draft) == (False, False)
+    # Target prefill step (native prefill, no decode row): the upper bound of the
+    # prefilling rows is exact.
     prefill = dict(draft, all_uses_trtllm=False, num_prefills=1, num_decodes=0)
     assert host_seq_lens_plan(0, **prefill) == (True, False)
     assert host_seq_lens_plan(1, **prefill) == (True, False)
+    assert host_seq_lens_plan(2, **prefill) == (True, True)
+    # Mixed step, decode rows on XQA: the decode rows' bound is only over-counted,
+    # and they read the device lengths.
+    mixed = dict(prefill, num_decodes=4)
+    assert host_seq_lens_plan(2, **mixed) == (True, True)
     # Mixed step whose decode rows take the native FlashInfer decode: they need the
-    # exact lengths.
-    native_decode = dict(
-        prefill, num_decodes=4, decode_with_flashinfer_trtllm_api=False
-    )
-    assert host_seq_lens_plan(1, **native_decode) == (True, False)
+    # exact lengths, so the fetch stays.
+    native_decode = dict(mixed, decode_with_flashinfer_trtllm_api=False)
+    assert host_seq_lens_plan(2, **native_decode) == (True, False)
     # DCP keeps the fetch (the lengths are converted per rank).
-    assert host_seq_lens_plan(1, **dict(prefill, use_dcp=True)) == (True, False)
-    # Non-causal native (non-XQA) draft: the fetch stays at every level.
+    assert host_seq_lens_plan(2, **dict(prefill, use_dcp=True)) == (True, False)
+    # No upper bound available: fetch.
+    assert host_seq_lens_plan(2, **dict(prefill, has_upper_bound=False)) == (
+        True,
+        False,
+    )
+    # Non-causal native (non-XQA) draft: every row counts as a prefill row, although
+    # they are decode rows with drafts (the bound over-counts them): fetch always.
     native_draft = dict(
-        draft, num_prefills=8, num_decodes=0, decode_with_flashinfer_trtllm_api=False
+        draft, num_prefills=8, num_decodes=0, decode_with_flashinfer_trtllm_api=False,
+        prefill_rows_exact=False,
     )  # fmt: skip
-    for level in (0, 1):
+    for level in (0, 1, 2):
         assert host_seq_lens_plan(level, **native_draft) == (True, False)
+    # A split that requires uniform query lengths may call a decode row a prefill row.
+    assert host_seq_lens_plan(2, **dict(prefill, prefill_rows_exact=False)) == (
+        True,
+        False,
+    )
 
 
 class _CountingLens(torch.Tensor):
@@ -231,7 +266,7 @@ def _build(stub, cam):
     return md, _CountingLens.calls
 
 
-@pytest.mark.parametrize("level", [0, 1])
+@pytest.mark.parametrize("level", [0, 1, 2])
 def test_draft_decode_build_fetches_only_at_level_0(level):
     """The non-causal draft: XQA decode rows read the device lengths."""
     stub, _, _ = _stub_builder(level, use_xqa=True, num_spec=7)
@@ -247,7 +282,51 @@ def test_draft_decode_build_fetches_only_at_level_0(level):
     assert torch.equal(md.decode.block_tables, ref.decode.block_tables)
 
 
-@pytest.mark.parametrize("level", [0, 1])
+@pytest.mark.parametrize("level", [0, 1, 2])
+def test_target_prefill_build_uses_the_upper_bound_at_level_2(level):
+    """A prefill chunk with the drafter: native prefill plan, no decode row."""
+    q, s = [4096, 4096], [8192 + 4096, 3000 + 4096]
+    stub, plans, kvs = _stub_builder(level, use_xqa=True, num_spec=7)
+    md, cpu_calls = _build(stub, _common(q, s, causal=True))
+    ref_stub, ref_plans, ref_kvs = _stub_builder(0, use_xqa=True, num_spec=7)
+    _build(ref_stub, _common(q, s, causal=True))
+    assert cpu_calls == (0 if level == 2 else 1)
+    assert md.num_prefills == 2 and md.num_decodes == 0
+    # The plan inputs are identical for every level (the upper bound is exact here).
+    assert len(plans) == len(ref_plans) == 1
+    for key in ("qo_indptr", "paged_kv_indptr", "paged_kv_last_page_len", "seq_lens"):
+        assert torch.equal(plans[0][key], ref_plans[0][key]), key
+    assert (kvs[0][0] == ref_kvs[0][0]).all() and (kvs[0][1] == ref_kvs[0][1]).all()
+
+
+@pytest.mark.parametrize("level", [0, 2])
+def test_mixed_step_with_xqa_decode_rows(level):
+    """Decode rows (XQA, drafts in flight: the host bound over-counts them) in front
+    of a prefilling row: the prefill row's lengths are exact at every level."""
+    q, s = [8, 8, 4096], [500, 900, 5000 + 4096]
+    cam = _common(q, s, causal=True)
+    # The host bound over-counts the two decode rows (rejected drafts of the last step).
+    cam.seq_lens_cpu_upper_bound = torch.tensor(
+        [507, 907, 5000 + 4096], dtype=torch.int32
+    )
+    stub, plans, kvs = _stub_builder(level, use_xqa=True, num_spec=7)
+    md, cpu_calls = _build(stub, cam)
+    ref_stub, ref_plans, ref_kvs = _stub_builder(0, use_xqa=True, num_spec=7)
+    _build(ref_stub, _common(q, s, causal=True))
+    assert cpu_calls == (0 if level == 2 else 1)
+    assert md.num_decodes == 2 and md.num_prefills == 1
+    # Only the prefill row is planned; its lengths and page count equal the exact ones
+    # (its page-index offset shifts with the decode rows' bound, on both sides).
+    assert kvs[0][0][2] == ref_kvs[0][0][2]
+    assert plans[0]["seq_lens"].tolist() == ref_plans[0]["seq_lens"].tolist() == [9096]
+    assert torch.equal(
+        plans[0]["paged_kv_last_page_len"], ref_plans[0]["paged_kv_last_page_len"]
+    )
+    # The decode rows read the device lengths (identical object content).
+    assert torch.equal(md.decode.seq_lens, torch.tensor(s[:2], dtype=torch.int32))
+
+
+@pytest.mark.parametrize("level", [0, 1, 2])
 def test_native_noncausal_draft_keeps_the_fetch(level):
     """A non-causal draft whose decode rows run the native wrapper (no XQA): every row
     counts as a prefill row, but they are decode rows with drafts, and the host bound
