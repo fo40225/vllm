@@ -27,14 +27,16 @@
 // SMs / (batch x KV heads) and leaves the blocks out, so that the grid has twice as many CTAs as
 // SMs (1 CTA per SM: two waves, each paying the CTA start-up and the merge of twice as many
 // partial results as a one-wave grid). When MUSE_XQA_SPEC_ONE_WAVE is 1 the launcher sizes it by
-// SMs / (batch x KV heads x blocks) instead, one wave, for a layer that streams many tiles per
-// sequence (a global layer) only at a batch of 1, and always for a layer that reads few tiles per
-// sequence (a sliding window). The batch is the one of the launch, which under CUDA graphs is the
-// padded capture size, so that a launch at a batch of 1 has no lane that is idle. At a larger
-// batch the grid is sized for sequences that are all long: a ragged batch, or a live batch below
-// the padded one (lanes of sequence length 0), leaves the long sequence with the CTAs of the one
-// wave, half of the stock split count, and the layer loses more than the wave saves. The kernel is
-// not changed; the number of splits changes the order in which the partial results are merged.
+// SMs / (batch x KV heads x blocks) instead, one wave, at a batch of 1 only (every layer type: a
+// sliding window layer reads 9 to 10 tiles per sequence there, so that its output and time do not
+// change). The batch is the one of the launch, which under CUDA graphs is the padded capture size,
+// so that a launch at a batch of 1 has no lane that is idle. At a larger batch the grid is sized
+// for lanes that are all live: a ragged batch, or a live batch below the padded one (lanes of
+// sequence length 0), leaves each live sequence with the CTAs of the one wave, half or less of the
+// stock split count, and the layer loses more than the wave saves (a global layer at 118k tokens
+// and a padded batch of 4 with one live lane: 55 -> 95 us; a sliding window layer at a padded
+// batch of 16 with 9 live lanes: 14 -> 20 us). The kernel is not changed; the number of splits
+// changes the order in which the partial results are merged.
 #ifndef MUSE_XQA_SPEC_ONE_WAVE
 #define MUSE_XQA_SPEC_ONE_WAVE 0
 #endif
@@ -3145,13 +3147,10 @@ static uint32_t configureKernel() {
 static uint32_t const hostSmemSize = configureKernel();
 
 #if SPEC_DEC && MUSE_XQA_SPEC_ONE_WAVE
-// The one-wave split count of launchMHAFlashInfer is used for a layer that streams many tiles
-// per sequence only up to this batch (the batch of the launch, the padded capture size under CUDA
-// graphs: nothing is idle there, and the grid fills all the SMs: 47 splits x 4 CTAs on 188 SMs),
-// and for a layer that reads at most this many tiles per sequence (a sliding window of 2048 tokens
-// reads 9 to 10, whatever the other lanes of the batch hold).
-constexpr uint32_t kOneWaveGlobalMaxBatch = 1;
-constexpr uint32_t kOneWaveFewTiles = 16;
+// The one-wave split count of launchMHAFlashInfer is used up to this batch: the batch of the
+// launch, the padded capture size under CUDA graphs. At a batch of 1 nothing is idle and the grid
+// fills all the SMs (47 splits x 4 CTAs on 188 SMs).
+constexpr uint32_t kOneWaveMaxBatch = 1;
 #endif
 
 void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32_t slidingWinSize,
@@ -3185,24 +3184,11 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
     }
     uint32_t nbSubSeq = std::max<uint32_t>(1U, multiProcessorCount / (batchSize * nbKHeads));
 #if SPEC_DEC && MUSE_XQA_SPEC_ONE_WAVE
-    if (nbTokenBlocksPerGrp > 1) {
+    if (nbTokenBlocksPerGrp > 1 && batchSize <= kOneWaveMaxBatch) {
       // The division above leaves the token blocks out: the grid has nbTokenBlocksPerGrp x as
       // many CTAs as SMs. Divide by them too for one wave.
-      uint32_t const nbCtasPerSubSeq = batchSize * nbKHeads * nbTokenBlocksPerGrp;
-      uint32_t const oneWave = std::max<uint32_t>(1U, multiProcessorCount / nbCtasPerSubSeq);
-#if SLIDING_WINDOW
-      // A sliding window layer reads at most the tiles of the window and one more per sequence,
-      // so a CTA of the one-wave grid reads few tiles whatever the split count is: what the
-      // layer saves is the second wave, and an SM that is idle costs little.
-      bool const fewTilesPerSeq =
-          divUp(uint64_t(slidingWinSize) + qSeqLen, uint64_t(ctaTile.x)) + 1 <= kOneWaveFewTiles;
-#else
-      constexpr bool fewTilesPerSeq = false;
-#endif
-      bool const allLanesLong = batchSize <= kOneWaveGlobalMaxBatch;
-      if (fewTilesPerSeq || allLanesLong) {
-        nbSubSeq = oneWave;
-      }
+      nbSubSeq = std::max<uint32_t>(
+          1U, multiProcessorCount / (batchSize * nbKHeads * nbTokenBlocksPerGrp));
     }
 #endif
     return std::min<uint32_t>(nbSubSeq, divUp(maxSeqLen, ctaTile.x));

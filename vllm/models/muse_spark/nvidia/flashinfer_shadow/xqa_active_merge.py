@@ -22,19 +22,21 @@ KV head) is then sized to one wave of CTAs. The stock launcher divides the SMs b
 batch and the KV heads only, ignores the 2 blocks, and launches twice as many CTAs as
 SMs (376 at a batch of 1; the kernel runs 1 CTA per SM, so that is two waves, each with
 the CTA start-up and the merge of twice as many partial results). One wave halves the
-split count (47 instead of 94 CTAs per block at a batch of 1). A global layer takes it
-at a batch of 1 only: the batch of the launch is the padded capture size under CUDA
-graphs (1, 2, 4, 8, 16, 24, ...), the grid is sized for sequences that are all long, and
-a ragged batch or a live batch below the padded one (lanes of sequence length 0) leaves
-the long sequence with half of the stock CTAs, which costs more than the wave saves. A
-sliding-window layer (9 to 10 tiles per sequence whatever the others hold) takes it at
-every batch. Only the launch of the Muse Spark shape is sized: 8 query heads per KV head
-of 64 elements and 5 to 8 query tokens (2 blocks of query rows); any other spec-dec
-module of the process (a drafter's) is the plain shadow module. The split count sets
-the order in which the partial results are merged: the output is no longer bitwise the
-stock one (rounding level, deterministic, the same on every rank) where a sequence has
-more tiles than the new split count. Where it has not, or where the stock split count is
-kept, the output is still bitwise the stock one.
+split count (47 instead of 94 CTAs per block at a batch of 1). It applies at a batch of
+1 only (every layer type; a sliding-window layer, 9 to 10 tiles per sequence, is not
+changed there): the batch of the launch is the padded capture size under CUDA graphs
+(1, 2, 4, 8, 16, 24, ...), and a larger grid is sized for lanes that are all live. A
+ragged batch or a live batch below the padded one (lanes of sequence length 0) leaves
+each live sequence with half or less of the stock CTAs, which costs more than the wave
+saves (global layer, 118k tokens, padded batch 4, one live lane: 55 -> 95 us; sliding
+window layer, padded batch 16, 9 live lanes: 14 -> 20 us). Only the launch of the Muse
+Spark shape is sized: 8 query heads per KV head of 64 elements and 5 to 8 query tokens
+(2 blocks of query rows); any other spec-dec module of the process (a drafter's) is the
+plain shadow module. The split count sets the order in which the partial results are
+merged: the output is no longer bitwise the stock one (rounding level, deterministic,
+the same on every rank) where a sequence has more tiles than the new split count. Where
+it has not, or where the stock split count is kept, the output is still bitwise the
+stock one.
 
 ``install`` routes ``flashinfer.xqa.gen_xqa_module`` through the shadow for every XQA
 module that the process builds afterwards (the model calls it when
@@ -182,9 +184,9 @@ def install(one_wave: bool = False) -> bool:
     if one_wave:
         logger.info_once(
             "MuseSpark SM120: the XQA spec-dec verify launch of 5 to 8 query tokens is "
-            "sized to one wave of CTAs at a batch of 1 (global layers) and at every "
-            "batch (sliding-window layers) (VLLM_MUSE_SPARK_SM120_XQA_SPEC_ONE_WAVE=1, "
-            "rounding-level: the partial results merge in another order)."
+            "sized to one wave of CTAs at a batch of 1 "
+            "(VLLM_MUSE_SPARK_SM120_XQA_SPEC_ONE_WAVE=1, rounding-level: the partial "
+            "results merge in another order)."
         )
     return True
 

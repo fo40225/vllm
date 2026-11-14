@@ -13,8 +13,7 @@ shadow kernel on the same inputs:
           the grid 2 waves of CTAs
   wave    the same module built with ``one_wave``
           (VLLM_MUSE_SPARK_SM120_XQA_SPEC_ONE_WAVE): SMs / (batch x KV heads x token
-          blocks), one wave, for a global layer at a batch of 1 and for the sliding
-          window layers at every batch; the shadow's split count elsewhere
+          blocks), one wave, at a batch of 1; the shadow's split count at a larger batch
 
 The stock FlashInfer module is only run for the output check (``shadow`` is bitwise the
 stock output, ``wave`` differs at rounding level where the split counts give another
