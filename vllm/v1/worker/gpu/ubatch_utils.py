@@ -405,11 +405,28 @@ class UBatchRunner:
             ),
         )
 
+    def prepare_without_attention(self, input_batch: InputBatch) -> UBatchState:
+        """Split a batch the way `prepare` does, for a run that skips attention.
+
+        The memory profile runs before the KV cache exists, so there are no block
+        tables, slot mappings or attention metadata to slice.
+        """
+        ubatch_slices = create_ubatch_slices(input_batch, self.num_ubatches)
+        return UBatchState(
+            slices=ubatch_slices,
+            forward_contexts=self._make_forward_contexts(
+                ubatch_slices,
+                [None] * len(ubatch_slices),
+                [None] * len(ubatch_slices),
+                [input_batch.is_padding[s.token_slice] for s in ubatch_slices],
+            ),
+        )
+
     def _make_forward_contexts(
         self,
         ubatch_slices: UBatchSlices,
-        attn_metadata: list[dict[str, Any]],
-        slot_mappings_by_layer: list[dict[str, torch.Tensor]],
+        attn_metadata: list[dict[str, Any] | None],
+        slot_mappings_by_layer: list[dict[str, torch.Tensor] | None],
         is_padding: list[torch.Tensor | None],
     ) -> list[ForwardContext]:
         """Build one forward context per microbatch.

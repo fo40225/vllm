@@ -982,6 +982,12 @@ class Worker(WorkerBase):
         # cuda graph capture.
         kernel_warmup(self)
 
+        if self.use_v2_model_runner and hasattr(
+            self.model_runner, "warmup_microbatches"
+        ):
+            # Size the workspace of every microbatch before the capture locks it.
+            self.model_runner.warmup_microbatches()
+
         if self.use_v2_model_runner:  # noqa: SIM102
             if self.vllm_config.kernel_config.enable_jit_warmup:
                 # A workspace resize after capture frees what the graphs point at.

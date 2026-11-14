@@ -23,7 +23,7 @@ from collections.abc import Iterable
 from contextlib import AbstractContextManager
 from copy import deepcopy
 from dataclasses import replace
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, cast
 
 import numpy as np
 import torch
@@ -186,6 +186,7 @@ from vllm.v1.worker.gpu.ubatch_utils import (
     maybe_build_ubatch_runner,
 )
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
+from vllm.v1.worker.ubatch_utils import check_ubatch_thresholds
 from vllm.v1.worker.utils import (
     KVBlockZeroer,
     clear_layer_kv_caches,
@@ -850,6 +851,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         is_profile: bool = False,
         valid_dummy_state_slots: bool = False,
         randomize_inputs: bool = False,
+        profile_ubatches: bool = False,
         **kwargs,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         if skip_attn and not is_profile:
@@ -929,6 +931,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 context_len=context_len,
                 valid_dummy_state_slots=valid_dummy_state_slots,
                 randomize_inputs=randomize_inputs,
+                profile_ubatches=profile_ubatches,
             )
         self.kv_connector.set_disabled(False)
 
@@ -993,6 +996,36 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return hidden_states, sample_hidden_states
 
     @torch.inference_mode()
+    def warmup_microbatches(self) -> None:
+        """Run the largest microbatched step once, ahead of the first real one.
+
+        Every microbatch has a workspace slot of its own (the workspace manager keys
+        them by microbatch id) that grows to what its step needs the first time it
+        runs, and the workspace is locked once the CUDA graphs are captured. The
+        memory profile never splits its batch (it has no attention metadata) and
+        the other warm-ups run on CUDA graph sizes, so without this the second slot
+        would be first sized by the first long prompt: after the lock, which fails
+        the step. (The FlashInfer autotune dummy run happens to split, but it can be
+        switched off.)
+        """
+        if (
+            self.ubatch_runner is None
+            or not self.parallel_config.ubatch_overlap_tp_collectives
+        ):
+            return
+        num_tokens = self.max_num_tokens
+        if not check_ubatch_thresholds(
+            self.parallel_config, num_tokens, uniform_decode=False
+        ):
+            # No batch is ever split.
+            return
+        logger.info("Warming up the microbatched step with %d tokens.", num_tokens)
+        self._dummy_run(
+            num_tokens, skip_eplb=True, is_profile=True, randomize_inputs=True
+        )
+        torch.accelerator.synchronize()
+
+    @torch.inference_mode()
     def _dummy_sampler_run(self, hidden_states: torch.Tensor) -> None:
         num_reqs = hidden_states.shape[0]
         logits = self.model.compute_logits(hidden_states)
@@ -1051,8 +1084,51 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         torch.accelerator.synchronize()
         del hidden_states, sample_hidden_states
+        self._profile_microbatched_step(randomize_inputs)
         self.reset_encoder_cache()
         gc.collect()
+
+    def _profile_microbatched_step(self, randomize_inputs: bool) -> None:
+        """Profile the memory of the largest batch once more, split into microbatches.
+
+        The KV cache is sized against the peak of the memory profile. Microbatches
+        that overlap hold more than the whole batch: a workspace slot per
+        microbatch and the activations of both halves at once (about 1.4 GiB per
+        rank at 8192 tokens, a launch near the memory limit has no room for them
+        after the sizing). The whole batch runs first, so that the first slot
+        keeps the size an unsplit batch needs, then this split pass. There is no
+        KV cache yet: the pass runs without attention, like the first.
+        """
+        pc = self.parallel_config
+        if not (pc.use_ubatching and pc.ubatch_overlap_tp_collectives):
+            return
+        if not check_ubatch_thresholds(pc, self.max_num_tokens, uniform_decode=False):
+            return
+        # The real runner needs the KV cache layout and is built with it, after the
+        # profile; a runner that exists already is used as it is.
+        built_here = self.ubatch_runner is None
+        if built_here:
+            self.ubatch_runner = maybe_build_ubatch_runner(
+                self.vllm_config,
+                self.device,
+                self.model_state,
+                [],
+                cast(KVCacheConfig, None),
+                self.max_num_reqs,
+            )
+        try:
+            hidden_states, _ = self._dummy_run(
+                self.max_num_tokens,
+                skip_attn=True,
+                is_profile=True,
+                randomize_inputs=randomize_inputs,
+                profile_ubatches=True,
+            )
+            torch.accelerator.synchronize()
+            del hidden_states
+        finally:
+            if built_here:
+                self.ubatch_runner = None
 
     def reset_mm_cache(self) -> None:
         if self.encoder_cache is not None:
@@ -1804,6 +1880,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         context_len: int = 0,
         valid_dummy_state_slots: bool = False,
         randomize_inputs: bool = False,
+        profile_ubatches: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         if not dummy_run:
             # Update the request states.
@@ -1875,10 +1952,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             parallel_config=self.parallel_config,
             allow_ubatching=(
                 self.ubatch_runner is not None
-                # The memory profile (no attention metadata) runs whole: its peak
-                # is what the KV cache is sized against, and the allocator needs
-                # the room of the full batch when the microbatches interleave.
-                and not skip_attn_for_dummy_run
+                # The memory profile (no attention metadata) runs whole first, and
+                # then split by profile_run (profile_ubatches): the KV cache is
+                # sized against the larger of the two peaks.
+                and (profile_ubatches or not skip_attn_for_dummy_run)
                 and (dummy_run or not self._splits_prefix_from_writer(scheduler_output))
             ),
             uniform_decode=uniform_tok_count == self.decode_query_len,
@@ -1978,14 +2055,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         ubatch_state: UBatchState | None = None
         if batch_desc.num_ubatches > 1:
             assert self.ubatch_runner is not None
-            assert block_tables is not None and slot_mappings is not None
-            ubatch_state = self.ubatch_runner.prepare(
-                input_batch,
-                block_tables,
-                slot_mappings,
-                cg_mode=batch_desc.cg_mode,
-                for_capture=dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL,
-            )
+            if skip_attn_for_dummy_run:
+                ubatch_state = self.ubatch_runner.prepare_without_attention(input_batch)
+            else:
+                assert block_tables is not None and slot_mappings is not None
+                ubatch_state = self.ubatch_runner.prepare(
+                    input_batch,
+                    block_tables,
+                    slot_mappings,
+                    cg_mode=batch_desc.cg_mode,
+                    for_capture=dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL,
+                )
         elif not (dummy_run and skip_attn_for_dummy_run):
             assert slot_mappings is not None
             slot_mappings_by_layer = build_slot_mappings_by_layer(

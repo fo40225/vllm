@@ -429,6 +429,117 @@ def test_dispatch_splits_only_big_batches_and_only_on_the_model_switch(
     assert batch_desc.num_ubatches == (2 if split else 1)
 
 
+def test_the_largest_microbatched_step_is_warmed_up_before_the_workspace_is_locked():
+    """The second microbatch's workspace slot is sized by a dummy run of the largest
+    batch, whether or not the FlashInfer autotune runs one."""
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+    runner = SimpleNamespace(
+        ubatch_runner=object(),
+        max_num_tokens=8192,
+        parallel_config=_parallel(),
+        _dummy_run=MagicMock(),
+    )
+    with patch.object(torch.accelerator, "synchronize"):
+        GPUModelRunner.warmup_microbatches(runner)
+    runner._dummy_run.assert_called_once()
+    args, kwargs = runner._dummy_run.call_args
+    assert args == (8192,)
+    # With attention (the memory profile skips it and never splits) and eager.
+    assert not kwargs.get("skip_attn", False)
+    assert kwargs["is_profile"]
+
+
+@pytest.mark.parametrize(
+    "runner_fields",
+    [
+        dict(ubatch_runner=None),
+        dict(max_num_tokens=2049),
+        # Microbatching for the all-to-all of data parallelism is not this warm-up's.
+        dict(parallel_config=_parallel(ubatch_overlap_tp_collectives=False)),
+    ],
+    ids=["no-microbatching", "no-batch-is-split", "not-collective-overlap"],
+)
+def test_nothing_is_warmed_up_where_no_batch_is_split(runner_fields):
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+    fields = dict(
+        ubatch_runner=object(),
+        max_num_tokens=8192,
+        parallel_config=_parallel(),
+        _dummy_run=MagicMock(),
+    )
+    fields.update(runner_fields)
+    runner = SimpleNamespace(**fields)
+    with patch.object(torch.accelerator, "synchronize"):
+        GPUModelRunner.warmup_microbatches(runner)
+    runner._dummy_run.assert_not_called()
+
+
+def test_the_memory_profile_also_runs_the_split_batch():
+    """The KV cache is sized against the peak of the profile: the whole batch first
+    (it sizes the first workspace slot), then the batch as microbatches."""
+    from vllm.v1.worker.gpu import model_runner as mr
+
+    profile_runner = SimpleNamespace(tag="profile-runner")
+    runner = SimpleNamespace(
+        ubatch_runner=None,
+        max_num_tokens=8192,
+        max_num_reqs=128,
+        vllm_config=object(),
+        device=object(),
+        model_state=object(),
+        parallel_config=_parallel(),
+        calls=[],
+    )
+
+    def dummy_run(num_tokens, **kwargs):
+        runner.calls.append((num_tokens, kwargs, runner.ubatch_runner))
+        return MagicMock(), None
+
+    runner._dummy_run = dummy_run
+    with (
+        patch.object(
+            mr, "maybe_build_ubatch_runner", return_value=profile_runner
+        ) as build,
+        patch.object(torch.accelerator, "synchronize"),
+    ):
+        mr.GPUModelRunner._profile_microbatched_step(runner, False)
+
+    (num_tokens, kwargs, seen_runner), = runner.calls
+    assert num_tokens == 8192 and seen_runner is profile_runner
+    assert kwargs["skip_attn"] and kwargs["is_profile"] and kwargs["profile_ubatches"]
+    # The profile runner has no attention groups or KV cache config, and does not
+    # outlive the profile: the real one is built with the KV cache layout.
+    assert build.call_args.args[3] == [] and build.call_args.args[4] is None
+    assert runner.ubatch_runner is None
+
+
+def test_the_memory_profile_stays_whole_where_no_batch_is_split():
+    from vllm.v1.worker.gpu import model_runner as mr
+
+    for parallel in (
+        _parallel(ubatch_overlap_tp_collectives=False),
+        _parallel(use_ubatching=False),
+    ):
+        runner = SimpleNamespace(
+            ubatch_runner=None,
+            max_num_tokens=8192,
+            parallel_config=parallel,
+            _dummy_run=MagicMock(),
+        )
+        mr.GPUModelRunner._profile_microbatched_step(runner, False)
+        runner._dummy_run.assert_not_called()
+    runner = SimpleNamespace(
+        ubatch_runner=None,
+        max_num_tokens=2049,
+        parallel_config=_parallel(),
+        _dummy_run=MagicMock(),
+    )
+    mr.GPUModelRunner._profile_microbatched_step(runner, False)
+    runner._dummy_run.assert_not_called()
+
+
 @pytest.mark.skipif(
     "MUSE_R2E_REAL_CONFIG" not in os.environ,
     reason="needs the Muse checkpoint config in the Hugging Face cache and 8 GPUs "

@@ -1288,6 +1288,24 @@ def test_failing_microbatch_unwinds_its_parked_sibling():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="DBO needs a GPU")
+def test_profile_batch_is_microbatched_without_attention():
+    """The memory profile runs before the KV cache exists: its microbatches are cut
+    like the real ones but carry no attention metadata or slot mappings."""
+    vllm_config = VllmConfig(parallel_config=_tp_only_parallel_config())
+    runner = _make_execution_runner(vllm_config)
+    input_batch = _make_input_batch([6, 2, 4, 4], [6, 130, 260, 4], _make_buffers())
+
+    state = runner.prepare_without_attention(input_batch)
+
+    assert state.slices == create_ubatch_slices(input_batch, 2)
+    assert len(state.forward_contexts) == 2
+    for context, ubatch_slice in zip(state.forward_contexts, state.slices):
+        assert context.attn_metadata is None
+        assert context.dp_metadata is None
+        assert context.is_padding.shape[0] == ubatch_slice.num_tokens
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="DBO needs a GPU")
 def test_collective_results_are_allocated_on_the_compute_stream():
     """Inside a collective on the comm stream, results come from the compute pool."""
     vllm_config = VllmConfig(parallel_config=_tp_only_parallel_config())
