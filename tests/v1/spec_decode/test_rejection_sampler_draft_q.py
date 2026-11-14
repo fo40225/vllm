@@ -30,7 +30,7 @@ import pytest
 import torch
 
 from vllm.triton_utils import tl, triton
-from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample, tl_rand32
+from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample, spec_step_seed, tl_rand32
 from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
 from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import CandidateSampler
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
@@ -178,20 +178,35 @@ def _ref_residual(p, q, drafts, num_drafts, tau, block):
 
 
 @triton.jit
-def _verifier_uniform_kernel(uniform_ptr, seed_ptr, pos_ptr, expanded_idx_mapping_ptr):
-    # The draw _rejection_kernel makes at each logit row.
+def _verifier_uniform_kernel(
+    uniform_ptr,
+    seed_ptr,
+    pos_ptr,
+    expanded_idx_mapping_ptr,
+    expanded_local_pos_ptr,
+    BLOCK_VERIFICATION: tl.constexpr,
+):
+    # The draw _rejection_kernel makes at each logit row. Block verification mixes the
+    # draft step into the seed (spec_step_seed), standard verification does not.
     row = tl.program_id(0)
     req_state_idx = tl.load(expanded_idx_mapping_ptr + row).to(tl.int64)
     seed = tl.load(seed_ptr + req_state_idx)
+    if BLOCK_VERIFICATION:
+        seed = spec_step_seed(seed, tl.load(expanded_local_pos_ptr + row))
     pos = tl.load(pos_ptr + row)
     tl.store(uniform_ptr + row, tl_rand32(seed, pos, includes_zero=False))
 
 
-def _verifier_uniforms(inputs):
+def _verifier_uniforms(inputs, block=False):
     rows = inputs["pos"].shape[0]
     uniforms = torch.empty(rows, dtype=torch.float32, device=inputs["pos"].device)
     _verifier_uniform_kernel[(rows,)](
-        uniforms, inputs["seed"], inputs["pos"], inputs["expanded_idx_mapping"]
+        uniforms,
+        inputs["seed"],
+        inputs["pos"],
+        inputs["expanded_idx_mapping"],
+        inputs["expanded_local_pos"],
+        BLOCK_VERIFICATION=block,
     )
     return uniforms
 
@@ -365,7 +380,9 @@ def _check_against_reference(batch, method, label):
         **inputs, num_speculative_steps=steps, use_block_verification=block
     )
     sampled, num_sampled = sampled.cpu(), num_sampled.cpu().long()
-    uniforms = _unflatten(_verifier_uniforms(inputs).cpu().double(), batch, 0.5)
+    uniforms = _unflatten(
+        _verifier_uniforms(inputs, block).cpu().double(), batch, 0.5
+    )
     uniforms = uniforms[:, :steps]
     p, q = _reference_probabilities(batch)
     drafts, num_drafts = batch.drafts, batch.num_drafts
@@ -1034,6 +1051,8 @@ def _wired_sampler(method, kernel_inputs, steps):
         num_speculative_tokens=steps,
         enable_adaptive_verification=False,
         rejection_sample_method=method,
+        fly_entropy_threshold=0.3,
+        fly_entropy_top_k=3,
     )
     return RejectionSampler(sampler, spec_config, kernel_inputs["pos"].device)
 
