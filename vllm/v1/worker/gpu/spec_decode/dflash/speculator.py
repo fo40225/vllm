@@ -408,15 +408,15 @@ class DFlashSpeculator(DraftModelSpeculator):
             assert aux_hidden_states
             start = min(num_tokens, num_graph_tokens)
             torch.cat(
-                [h[:start] for h in aux_hidden_states],
+                [h[:start].to(self.dtype) for h in aux_hidden_states],
                 dim=-1,
                 out=self._aux_staging[:start],
             )
         if start == num_tokens:
             return
         if aux_hidden_states:
-            hidden_states = self.model.combine_hidden_states(
-                torch.cat([h[start:num_tokens] for h in aux_hidden_states], dim=-1)
+            hidden_states = self.combine_aux_hidden_states(
+                [h[start:num_tokens] for h in aux_hidden_states]
             )
         else:
             hidden_states = last_hidden_states[start:num_tokens]
@@ -430,6 +430,20 @@ class DFlashSpeculator(DraftModelSpeculator):
     ) -> None:
         """Publish context features required by a draft's candidate head. Runs
         inside the FULL graph, so it must not sync with the host."""
+
+    def combine_aux_hidden_states(
+        self, aux_hidden_states: list[torch.Tensor]
+    ) -> torch.Tensor:
+        """Concatenate the target's aux taps and project them with the draft's fc.
+
+        A target may keep its taps in a wider dtype than the draft computes in
+        (Muse Spark keeps its residual stream in FP32). Each tap is cast first, so
+        the fc GEMM sees the draft dtype and the [T, num_taps * hidden] concat
+        buffer is built at that width. A no-op when the dtypes already match.
+        """
+        return self.model.combine_hidden_states(
+            torch.cat([x.to(self.dtype) for x in aux_hidden_states], dim=-1)
+        )
 
     @torch.inference_mode()
     def propose(
