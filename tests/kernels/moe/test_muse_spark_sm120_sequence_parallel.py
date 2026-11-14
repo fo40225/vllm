@@ -375,16 +375,87 @@ def _gemm_vllm_config():
 # The sharded FFN branch against the replicated one, on real expert parallelism
 # ------------------------------------------------------------------------------
 HIDDEN = 1024
+# The expert paths of the model: NVFP4 W4A4 (CUTLASS grouped GEMMs, layers 1-60),
+# BF16 (Triton, layers 0 and 61) and the Marlin W4A16 route-major experts.
+BRANCH_KINDS = ("nvfp4_cutlass", "bf16_triton", "nvfp4_marlin")
+# 257 is the smallest batch the stream takes (33 rows per rank, the last padded).
+BRANCH_TOKENS = (1024, 700, 257)
+
+
+def _marlin_checkpoint() -> dict[str, torch.Tensor]:
+    g = torch.Generator(device="cuda").manual_seed(3)
+
+    def packed(*shape):
+        return torch.randint(
+            0, 256, shape, dtype=torch.uint8, device="cuda", generator=g
+        )
+
+    def rand(*shape):
+        return torch.rand(*shape, dtype=torch.float32, device="cuda", generator=g)
+
+    return {
+        "w13_weight": packed(E, 2 * N, K // 2),
+        "w13_weight_scale": torch.ones(
+            E, 2 * N, K // 16, dtype=torch.float8_e4m3fn, device="cuda"
+        ),
+        "w13_weight_scale_2": rand(E, 2) * 0.01 + 0.01,
+        "w13_input_scale": rand(E, 2) + 0.5,
+        "w2_weight": packed(E, K, N // 2),
+        "w2_weight_scale": torch.ones(
+            E, K, N // 16, dtype=torch.float8_e4m3fn, device="cuda"
+        ),
+        "w2_weight_scale_2": rand(E) * 0.01 + 0.01,
+        "w2_input_scale": rand(E) + 0.5,
+    }
+
+
+def _branch_experts(kind: str, expert_bias, parallel):
+    """(router, runner, vllm_config) of the expert path ``kind`` under ``parallel``."""
+    if kind == "bf16_triton":
+        g = torch.Generator(device="cuda").manual_seed(1)
+        ckpt = {
+            "w13_weight": torch.randn(
+                E, 2 * N, K, dtype=torch.bfloat16, device="cuda", generator=g
+            )
+            / 10,
+            "w2_weight": torch.randn(
+                E, K, N, dtype=torch.bfloat16, device="cuda", generator=g
+            )
+            / 10,
+        }
+        quant_config, backend = None, "auto"
+    elif kind == "nvfp4_marlin":
+        ckpt = _marlin_checkpoint()
+        quant_config, backend = nvfp4_quant_config(), "marlin"
+    else:
+        from tests.kernels.moe.test_muse_spark_sm120_nvfp4_moe import _Problem
+
+        ckpt, quant_config, backend = (
+            _Problem().checkpoint(),
+            nvfp4_quant_config(),
+            "cutlass",
+        )
+    return make_runner(
+        _norm(),
+        expert_bias,
+        ckpt,
+        quant_config,
+        hidden_size=K,
+        intermediate_size=N,
+        top_k=TOPK,
+        moe_backend=backend,
+        parallel_config=parallel,
+    )
 
 
 def _sharded_branch_worker(rank: int, world: int, port: int, out_path: str) -> None:
-    from tests.kernels.moe.test_muse_spark_sm120_nvfp4_moe import _Problem
     from vllm.config import KernelConfig, ParallelConfig, VllmConfig
     from vllm.distributed import (
         init_distributed_environment,
         initialize_model_parallel,
         tensor_model_parallel_all_gather,
     )
+    from vllm.distributed.parallel_state import graph_capture
     from vllm.v1.worker.workspace import init_workspace_manager
 
     torch.cuda.set_device(rank)
@@ -403,94 +474,103 @@ def _sharded_branch_worker(rank: int, world: int, port: int, out_path: str) -> N
         initialize_model_parallel(tensor_model_parallel_size=world)
     init_workspace_manager(torch.device("cuda", rank))
     expert_bias = torch.linspace(-0.5, 0.5, E, dtype=torch.float32, device="cuda")
-    router, runner, vllm_config = make_runner(
-        _norm(),
-        expert_bias,
-        _Problem().checkpoint(),
-        nvfp4_quant_config(),
-        hidden_size=K,
-        intermediate_size=N,
-        top_k=TOPK,
-        moe_backend="cutlass",
-        parallel_config=parallel,
-    )
-    with set_current_vllm_config(vllm_config), torch.device("cuda"):
-        pooler = ReplicatedLinear(
-            HIDDEN, K, bias=False, params_dtype=torch.bfloat16, quant_config=None
-        )
-        unpooler = ReplicatedLinear(
-            K, HIDDEN, bias=False, params_dtype=torch.bfloat16, quant_config=None
-        )
-        gate = GateLinear(
-            HIDDEN,
-            E,
-            bias=False,
-            out_dtype=torch.float32,
-            params_dtype=torch.float32,
-        )
-        norm = MuseSpark1xRMSNorm(
-            K,
-            eps=1e-6,
-            has_weight=True,
-            is_post_norm=False,
-            zero_centered_gamma=True,
-            post_norm_gain_center_type="one",
-            residual_id=2,
-            output_norm_gain_center_type="zero",
-        )
-    g = torch.Generator(device="cuda").manual_seed(5)
-    for module, std in ((pooler, HIDDEN**-0.5), (unpooler, K**-0.5), (gate, 0.03)):
-        for p in module.parameters():
-            p.data.copy_(torch.randn(p.shape, generator=g, device="cuda") * std)
-    norm.weight.data.copy_(torch.randn(K, generator=g, device="cuda") * 0.05)
-    # The members of MuseSpark1xMoE that forward_sequence_parallel uses.
-    layer = SimpleNamespace(
-        sm120_sequence_parallel=True,
-        pooler=pooler,
-        unpooler=unpooler,
-        pre_expert_norm=norm,
-        moe_router=router,
-        router=gate,
-        experts=runner,
-    )
 
     results = {}
-    for num_tokens in (1024, 700):
-        x = torch.randn(num_tokens, HIDDEN, generator=g, device="cuda")
-        x = x.to(torch.bfloat16)
-        with (
-            set_current_vllm_config(vllm_config),
-            set_forward_context(None, vllm_config),
-            torch.inference_mode(),
-        ):
-            # The replicated branch, as every rank runs it for any batch.
-            reference = unpooler(
-                runner.forward(
-                    hidden_states=norm(pooler(x)[0]), router_logits=gate(x)[0]
-                )
-            )[0]
-            # The sharded one: this rank's rows only, padded to a multiple of world.
-            rows = -(-num_tokens // world)
-            padded = F.pad(x, (0, 0, 0, rows * world - num_tokens))
-            local = padded[rank * rows : (rank + 1) * rows].contiguous()
-            first = muse_model.MuseSpark1xMoE.forward_sequence_parallel(
-                layer, local, num_tokens
+    for kind in BRANCH_KINDS:
+        router, runner, vllm_config = _branch_experts(kind, expert_bias, parallel)
+        with set_current_vllm_config(vllm_config), torch.device("cuda"):
+            pooler = ReplicatedLinear(
+                HIDDEN, K, bias=False, params_dtype=torch.bfloat16, quant_config=None
             )
-            second = muse_model.MuseSpark1xMoE.forward_sequence_parallel(
-                layer, local, num_tokens
+            unpooler = ReplicatedLinear(
+                K, HIDDEN, bias=False, params_dtype=torch.bfloat16, quant_config=None
             )
-            output = tensor_model_parallel_all_gather(first, 0)[:num_tokens]
-        reference = reference.float()
-        diff = output.float() - reference
-        results[num_tokens] = dict(
-            rel_l2=float(diff.norm() / reference.norm()),
-            max_row_rel_l2=float(
-                (diff.norm(dim=1) / reference.norm(dim=1).clamp_min(1e-12)).max()
-            ),
-            nonzero=float((reference != 0).float().mean()),
-            finite=bool(torch.isfinite(output).all()),
-            deterministic=bool(torch.equal(first, second)),
+            gate = GateLinear(
+                HIDDEN,
+                E,
+                bias=False,
+                out_dtype=torch.float32,
+                params_dtype=torch.float32,
+            )
+            norm = MuseSpark1xRMSNorm(
+                K,
+                eps=1e-6,
+                has_weight=True,
+                is_post_norm=False,
+                zero_centered_gamma=True,
+                post_norm_gain_center_type="one",
+                residual_id=2,
+                output_norm_gain_center_type="zero",
+            )
+        g = torch.Generator(device="cuda").manual_seed(5)
+        for module, std in ((pooler, HIDDEN**-0.5), (unpooler, K**-0.5), (gate, 0.03)):
+            for p in module.parameters():
+                p.data.copy_(torch.randn(p.shape, generator=g, device="cuda") * std)
+        norm.weight.data.copy_(torch.randn(K, generator=g, device="cuda") * 0.05)
+        # The members of MuseSpark1xMoE that forward_sequence_parallel uses.
+        layer = SimpleNamespace(
+            sm120_sequence_parallel=True,
+            pooler=pooler,
+            unpooler=unpooler,
+            pre_expert_norm=norm,
+            moe_router=router,
+            router=gate,
+            experts=runner,
         )
+
+        def sharded(local, num_tokens, layer=layer):
+            return muse_model.MuseSpark1xMoE.forward_sequence_parallel(
+                layer, local, num_tokens
+            )
+
+        for num_tokens in BRANCH_TOKENS:
+            x = torch.randn(num_tokens, HIDDEN, generator=g, device="cuda")
+            x = x.to(torch.bfloat16)
+            with (
+                set_current_vllm_config(vllm_config),
+                set_forward_context(None, vllm_config),
+                torch.inference_mode(),
+            ):
+                # The replicated branch, as every rank runs it for any batch.
+                reference = unpooler(
+                    runner.forward(
+                        hidden_states=norm(pooler(x)[0]), router_logits=gate(x)[0]
+                    )
+                )[0]
+                # The sharded one: this rank's rows only, padded to a multiple of
+                # the world size.
+                rows = -(-num_tokens // world)
+                padded = F.pad(x, (0, 0, 0, rows * world - num_tokens))
+                local = padded[rank * rows : (rank + 1) * rows].contiguous()
+                first = sharded(local, num_tokens)
+                second = sharded(local, num_tokens)
+                output = tensor_model_parallel_all_gather(first, 0)[:num_tokens]
+                # The same branch captured in a CUDA graph, as a decode-sized batch
+                # of a launch with large capture sizes would run it.
+                torch.cuda.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with graph_capture(device=torch.device("cuda", rank)) as capture:
+                    with torch.cuda.graph(graph, stream=capture.stream):
+                        captured = sharded(local, num_tokens)
+                graph.replay()
+                torch.cuda.synchronize()
+            reference = reference.float()
+            diff = output.float() - reference
+            results[f"{kind}:{num_tokens}"] = dict(
+                rel_l2=float(diff.norm() / reference.norm()),
+                max_row_rel_l2=float(
+                    (diff.norm(dim=1) / reference.norm(dim=1).clamp_min(1e-12)).max()
+                ),
+                nonzero=float((reference != 0).float().mean()),
+                finite=bool(torch.isfinite(output).all()),
+                deterministic=bool(torch.equal(first, second)),
+                graph_equal=bool(torch.equal(captured, first)),
+                graph_rel_l2=float(
+                    (captured.float() - first.float()).norm()
+                    / first.float().norm().clamp_min(1e-12)
+                ),
+            )
+            torch.distributed.barrier()
     if rank == 0:
         with open(out_path, "w") as f:
             json.dump(results, f)
@@ -502,10 +582,11 @@ def _sharded_branch_worker(rank: int, world: int, port: int, out_path: str) -> N
 @pytest.mark.parametrize("world", [2, 8])
 def test_sharded_branch_matches_the_replicated_one(tmp_path, world: int) -> None:
     """Every rank's rows of the sharded branch, gathered, are the replicated branch up
-    to rounding: random NVFP4 experts under expert parallelism (E / world local experts
-    per rank), the real router, pooler, unpooler and runner, a batch that is and one
-    that is not a multiple of the world size. A misrouted, misordered or unreduced row
-    would show as an O(1) error."""
+    to rounding: random experts (NVFP4 CUTLASS, BF16 Triton, Marlin W4A16) under
+    expert parallelism (E / world local experts per rank), the real router, pooler,
+    unpooler and runner, and batches that are and are not a multiple of the world
+    size. A misrouted, misordered or unreduced row would show as an O(1) error. The
+    branch also has to replay from a CUDA graph unchanged."""
     if torch.cuda.device_count() < world:
         pytest.skip(f"Requires {world} GPUs")
     out_path = str(tmp_path / "results.json")
@@ -513,10 +594,19 @@ def test_sharded_branch_matches_the_replicated_one(tmp_path, world: int) -> None
     mp.spawn(_sharded_branch_worker, args=(world, port, out_path), nprocs=world)
     with open(out_path) as f:
         results = json.load(f)
-    for num_tokens, result in results.items():
-        assert result["finite"] and result["deterministic"], (num_tokens, result)
-        # Measured on 8 SM120 GPUs: 3.8e-3 and 5.4e-3, the rounding of the collectives
-        # and of the pooled rows (which also moves some FP4 codes of the experts' input).
-        assert result["nonzero"] > 0.99, (num_tokens, result)
-        assert result["rel_l2"] < 2e-2, (num_tokens, result)
-        assert result["max_row_rel_l2"] < 5e-2, (num_tokens, result)
+    assert len(results) == len(BRANCH_KINDS) * len(BRANCH_TOKENS)
+    for key, result in results.items():
+        assert result["finite"], (key, result)
+        # The Marlin experts are not run-to-run reproducible on their own (the
+        # replicated stream included), so only the other two have to repeat bitwise.
+        if not key.startswith("nvfp4_marlin"):
+            assert result["deterministic"], (key, result)
+            assert result["graph_equal"], (key, result)
+        else:
+            assert result["graph_rel_l2"] < 1e-2, (key, result)
+        # Measured on 8 SM120 GPUs: 3.9e-3 to 4.0e-3 and 5.3e-3 to 6.1e-3, the
+        # rounding of the collectives and of the pooled rows (which also moves
+        # some FP4 codes of the experts' input).
+        assert result["nonzero"] > 0.99, (key, result)
+        assert result["rel_l2"] < 1e-2, (key, result)
+        assert result["max_row_rel_l2"] < 2e-2, (key, result)
