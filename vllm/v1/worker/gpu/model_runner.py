@@ -387,7 +387,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.topk_logits_stats: RouteStats | None = None
         self._topk_logits_logged = False
         # Verification of the draft tokens from those candidates (0 off, 1 greedy steps,
-        # 2 also sampled rows), see VLLM_MUSE_SPARK_SM120_VERIFY_TOPK_LOGITS.
+        # 2 also sampled rows, 3 per request, 4 also top_p rows), see
+        # VLLM_MUSE_SPARK_SM120_VERIFY_TOPK_LOGITS.
         self.topk_verify_level = 0
         self.topk_verify_sampled = False
         self.topk_verify_stats: RouteStats | None = None
@@ -1280,7 +1281,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     def _resolve_topk_verify_level(self) -> int:
         """Verification of draft tokens from the top-k logits: 0 off, 1 steps of greedy
-        requests, 2 also sampled rows (VLLM_MUSE_SPARK_SM120_VERIFY_TOPK_LOGITS).
+        requests, 2 also sampled rows, 3 per request (a request that needs the logits
+        is verified from them, the others from the candidates), 4 also top_p rows
+        (VLLM_MUSE_SPARK_SM120_VERIFY_TOPK_LOGITS).
 
         It builds on the top-k logits path (candidates per rank) and the plain
         rejection sampler of a speculative launch that verifies with fixed step

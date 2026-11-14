@@ -170,11 +170,12 @@ def test_the_split_levels_need_a_model_that_splits_the_gather(monkeypatch, level
 
 
 def test_the_flag_is_on_by_default(monkeypatch):
-    """The default is level 2: greedy and sampled steps are verified from the
-    candidates (the accuracy policy: identical for greedy, distribution-exact for
-    sampled rows)."""
+    """The default is level 3: greedy and sampled steps are verified from the
+    candidates, per request (the accuracy policy: identical for greedy,
+    distribution-exact for sampled rows; top_p rows stay on the full route, level 4
+    is opt-in)."""
     got, runner = resolve(monkeypatch, None)
-    assert got == 2 and runner.topk_verify_sampled
+    assert got == 3 and runner.topk_verify_sampled
     assert runner.topk_verify_stats is not None
 
 

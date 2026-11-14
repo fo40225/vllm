@@ -170,7 +170,7 @@ if TYPE_CHECKING:
     VLLM_MUSE_SPARK_SM120_TOPK_LOGITS: bool = True
     VLLM_MUSE_SPARK_SM120_TOPK_LOGITS_K: int = 64
     VLLM_MUSE_SPARK_SM120_TOPK_LOGITS_MIN_TOKENS: int = 2
-    VLLM_MUSE_SPARK_SM120_VERIFY_TOPK_LOGITS: int = 2
+    VLLM_MUSE_SPARK_SM120_VERIFY_TOPK_LOGITS: int = 3
     VLLM_MUSE_SPARK_SM120_DRAFT_FC_SHARD: int = 2
     VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT: bool = True
     VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT_TABLE: str | None = None
@@ -1760,7 +1760,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # [rows, vocab] logits, their fp32 copy and the full-vocabulary passes of the
     # rejection sampler. 0: the full verification; 1: steps in which every request is
     # greedy (the argmax of each row: for finite logits the tokens of the full path,
-    # bit for bit); 2 (default): also steps with requests of temperature > 0 and
+    # bit for bit); 2: also steps with requests of temperature > 0 and
     # top_k <= K (the default top_k of the Muse Spark checkpoint is 64), with the block
     # method and a draft distribution as wide as the vocabulary (the production
     # drafter): the accepted length and the resampled token are drawn with the uniforms
@@ -1771,13 +1771,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # request asks for logprobs, penalties, logit bias / allowed token ids / bad words,
     # a thinking budget, a grammar bitmask, or, at temperature > 0, min_p, top_p, or a
     # top_k above K: ONE such request sends all the rows of its step to the full path.
-    # 3: the same decision per request: the rows of a request that needs the logits
-    # (penalties, logit bias, bad words, a thinking budget, a top_k above K, top_p) are
-    # gathered whole and verified by the full path, the other requests of the step
-    # verify from the candidates (one lm_head projection serves both, the outputs are
-    # merged in the batch order; logprobs, a grammar and the sampler features that work
-    # on all rows still send the whole step to the full path, and so does a step with
-    # fewer than 5 candidate requests: the split costs about 0.5 ms and repays from
+    # 3 (default): the same decision per request: the rows of a request that needs the
+    # logits (penalties, logit bias, bad words, a thinking budget, a top_k above K,
+    # top_p) are gathered whole and verified by the full path, the other requests of the
+    # step verify from the candidates (one lm_head projection serves both, the outputs
+    # are merged in the batch order; logprobs, a grammar and the sampler features that
+    # work on all rows still send the whole step to the full path, and so does a step
+    # with fewer than 5 candidate requests: the split costs about 0.5 ms and repays from
     # about 5 of them). Every request keeps the tokens of level 2, with one exception
     # that the full path has too: a request without a top_k below the vocabulary and
     # with top_p below 1 is verified on its own subset of rows, and the top-k + top-p
@@ -1788,27 +1788,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # full path's, bit for bit (vLLM rejects logit_bias and a min_p above 1e-5 under
     # speculative decoding, SamplingParams._validate_spec_decode: no such request
     # reaches the verification in practice, and min_p adds nothing to the measured
-    # gain). 4: also requests with top_p below 1 (and no min_p): the nucleus of the
-    # full path's top-k + top-p kernel over the candidates. NOT distribution-exact: that
+    # gain). 4: also requests with top_p below 1 (and no min_p): the nucleus of the full
+    # path's top-k + top-p kernel over the candidates. NOT distribution-exact: that
     # kernel finds its nucleus by an fp32 pivot search whose result for tokens that tie
-    # at the boundary depends on how an exp / log round trip rounds and on the bits of
-    # a sum over the whole row, and the candidates cannot see those. On a small share
-    # of the rows (tie-rich logits of small magnitude, a temperature above 1, top_p
-    # 0.99, a nucleus that reaches the k-th place) the kept set differs from the full
-    # path's in members of a tie group, tokens that carry the boundary probability
-    # (at least (1 - top_p) / N, about 1e-3 at top_p 0.95): such a row's distribution
-    # moves by up to about 1 % in total variation. 0 of 3014 measured decode rows
-    # differ at top_p up to 0.95 (temperature 0.7 and 1), so the measured cost is
-    # nil, but the equality is not guaranteed: opt-in, never the default. The whole
-    # path is off for adaptive verification, a watermark, synthetic acceptance rates, a
-    # rejection sampler of another class, and a draft distribution narrower than the
-    # vocabulary; with a draft distribution of another width than the vocabulary, or
-    # without one, only the greedy steps take it. Needs
-    # VLLM_MUSE_SPARK_SM120_TOPK_LOGITS=1. The share of verified steps on the path and
-    # the reasons of the others are logged every 30 s ("steps with drafts"; those steps
-    # do not count in the lines of the top-k logits sampling). Read once, in load_model.
+    # at the boundary depends on how an exp / log round trip rounds and on the bits of a
+    # sum over the whole row, and the candidates cannot see those. On a small share of
+    # the rows (tie-rich logits of small magnitude, a temperature above 1, top_p 0.99, a
+    # nucleus that reaches the k-th place) the kept set differs from the full path's in
+    # members of a tie group, tokens that carry the boundary probability (at least (1 -
+    # top_p) / N, about 1e-3 at top_p 0.95): such a row's distribution moves by up to
+    # about 1 % in total variation. 0 of 3014 measured decode rows differ at top_p up to
+    # 0.95 (temperature 0.7 and 1), so the measured cost is nil, but the equality is not
+    # guaranteed: opt-in, never the default. The whole path is off for adaptive
+    # verification, a watermark, synthetic acceptance rates, a rejection sampler of
+    # another class, and a draft distribution narrower than the vocabulary; with a draft
+    # distribution of another width than the vocabulary, or without one, only the greedy
+    # steps take it. Needs VLLM_MUSE_SPARK_SM120_TOPK_LOGITS=1. The share of verified
+    # steps on the path and the reasons of the others are logged every 30 s ("steps with
+    # drafts"; those steps do not count in the lines of the top-k logits sampling). Read
+    # once, in load_model.
     "VLLM_MUSE_SPARK_SM120_VERIFY_TOPK_LOGITS": lambda: int(
-        os.getenv("VLLM_MUSE_SPARK_SM120_VERIFY_TOPK_LOGITS", "2")
+        os.getenv("VLLM_MUSE_SPARK_SM120_VERIFY_TOPK_LOGITS", "3")
     ),
     # Muse Spark on SM120: how the aux projection (fc, [5 * 8192 -> 8192], 671 MB) of
     # the DFlash2 draft is computed. It runs eagerly in the propose step on all the rows
