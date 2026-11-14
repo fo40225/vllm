@@ -587,8 +587,9 @@ def test_sm120_sequence_parallel_takes_the_speculative_verify_band(
     ``VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_MIN_TOKENS=384``. A verify batch has 8
     tokens per request: 32 requests (256 tokens) are the largest graph batch, 33..47
     requests (264..376) run eagerly on the replicated stream, from 48 requests (384)
-    on the stream is sharded. Every such batch is a multiple of the world size, so
-    no rank carries a padded row."""
+    on the stream is sharded. A pure verify batch is a multiple of the world size, so
+    no rank carries a padded row; mixed batches in the band (a prefill chunk next to
+    the decoders, e.g. 387 tokens) do, and BRANCH_TOKENS covers that case."""
     monkeypatch.setenv(MIN_TOKENS, "384")
     floor = muse_model.sm120_sequence_parallel_min_tokens(
         _vllm_config(max_graph_tokens=256)
@@ -858,8 +859,10 @@ BRANCH_KINDS = ("nvfp4_cutlass", "bf16_triton", "nvfp4_marlin")
 PLACEMENT_BRANCH_KINDS = ("nvfp4_cutlass", "bf16_triton")
 # 257 is the smallest batch the stream takes by default (33 rows per rank, the last
 # padded); 384 and 512 are the verify batches of 48 and 64 requests of the speculative
-# launch that lowers the minimum to 384 (48 and 64 rows per rank).
-BRANCH_TOKENS = (1024, 700, 512, 384, 257)
+# launch that lowers the minimum to 384 (48 and 64 rows per rank, no padded row). 387 is
+# a mixed batch of that launch in the same band (a prefill chunk next to the decoders:
+# 49 rows per rank, the last rank carries five zero rows that are sliced off again).
+BRANCH_TOKENS = (1024, 700, 512, 387, 384, 257)
 
 
 def _marlin_checkpoint() -> dict[str, torch.Tensor]:
