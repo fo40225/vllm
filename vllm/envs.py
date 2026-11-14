@@ -1677,15 +1677,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # bad words, a thinking budget, a grammar bitmask, or, at temperature > 0, min_p,
     # top_p, or a top_k above K (no top_k included): one such request sends the whole
     # step down the full path.
-    # Speculative decoding, LoRA, batch-sharded sampling, a watermark, trace replay, a
-    # sampling mask or the NaN counter switch the path off for the launch, and a step
-    # with fewer rows than VLLM_MUSE_SPARK_SM120_TOPK_LOGITS_MIN_TOKENS takes the full
-    # path. The share of steps on the path and the reasons of the others are logged
-    # every 30 s. End to end (real weights, host plugin, alternating cold sessions) the
-    # decode step of 64 / 128 / 256 concurrent random requests is 1.0 / 2.0 / 2.3%
-    # shorter (output tokens/s +1.0 / +1.8 / +2.0%), real greedy prompts at 64 +1.3%
-    # tokens/s, batch 1 unchanged. Greedy and seeded requests get the tokens of the
-    # full path, unseeded ones its distribution. Set to 0 for the full gather. Read
+    # LoRA, batch-sharded sampling, a watermark, trace replay, a sampling mask or the
+    # NaN counter switch the path off for the launch, and a step with fewer rows than
+    # VLLM_MUSE_SPARK_SM120_TOPK_LOGITS_MIN_TOKENS takes the full path. Under
+    # speculative decoding the path is decided per step: a step with a draft token
+    # verifies it against the full probabilities of the target and takes the full path,
+    # a step without any (dynamic speculative decoding at K == 0, the first token of a
+    # request) may take the path. The share of steps on the path and the reasons of the
+    # others are logged every 30 s. End to end (real weights, host plugin, alternating
+    # cold sessions) the decode step of 64 / 128 / 256 concurrent random requests is 1.0
+    # / 2.0 / 2.3% shorter (output tokens/s +1.0 / +1.8 / +2.0%), real greedy prompts at
+    # 64 +1.3% tokens/s, batch 1 unchanged. Greedy and seeded requests get the tokens of
+    # the full path, unseeded ones its distribution. Set to 0 for the full gather. Read
     # once, when the model is constructed.
     "VLLM_MUSE_SPARK_SM120_TOPK_LOGITS": lambda: bool(
         int(os.getenv("VLLM_MUSE_SPARK_SM120_TOPK_LOGITS", "1"))

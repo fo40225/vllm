@@ -1134,18 +1134,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         """Candidates per TP rank of the top-k logits sampling, 0 when it is off.
 
         The model offers it (``compute_topk_logits``, ``topk_logits_k``); this is
-        the part of the launch it cannot see: a rejection sampler needs the full
-        probabilities of the target, LoRA may add vocabulary, and a sampler that is
-        not the plain ``Sampler`` (watermark, custom) or batch-sharded sampling work
-        on the gathered logits.
+        the part of the launch it cannot see: LoRA may add vocabulary, and a sampler
+        that is not the plain ``Sampler`` (watermark, custom) or batch-sharded sampling
+        work on the gathered logits. Speculative decoding does not turn it off: the
+        rejection sampler needs the full probabilities of the target, so a step with
+        draft tokens takes the full path (``_topk_logits_fallback_reason``), and a step
+        without any (dynamic speculative decoding at K == 0, the first token of a
+        request) samples as it does without speculation.
         """
         k = getattr(self.model, "topk_logits_k", 0)
         if not k:
             return 0
         reason = None
-        if self.speculative_config is not None:
-            reason = "speculative decoding is on"
-        elif self.lora_config:
+        if self.lora_config:
             reason = "LoRA is on"
         elif self.batch_sharder is not None:
             reason = "batch-sharded sampling is on"

@@ -473,6 +473,39 @@ def test_the_step_predicate_falls_back(case: str):
     assert not step_uses_topk(runner, batch, grammar)
 
 
+def test_a_step_without_drafts_takes_the_path_under_speculation():
+    # Dynamic speculative decoding at K == 0: the batch has no draft token, one
+    # logits row per request.
+    runner = fake_runner(speculative_config=object())
+    assert step_uses_topk(runner, fake_batch(4, draft_tokens=0))
+    assert runner.topk_logits_stats.taken == 1
+
+
+@pytest.mark.parametrize(
+    ("rows", "reqs", "drafts"),
+    [(4 + 4 * 7, 4, 4 * 7), (4 + 1, 4, 1), (3 + 2, 3, 2)],
+    ids=["full-block", "one-request-drafts", "mixed-widths"],
+)
+def test_a_step_with_any_draft_token_takes_the_full_path(rows, reqs, drafts):
+    runner = fake_runner(speculative_config=object())
+    assert not step_uses_topk(runner, fake_batch(rows, draft_tokens=drafts, reqs=reqs))
+    assert runner.topk_logits_stats.fallbacks == {"draft-tokens": 1}
+    # The sampler is not even asked: the batch shape decides alone.
+    assert runner.sampler.calls == []
+
+
+def test_the_step_predicate_reads_no_device_data():
+    # Decided from the batch shape and host state: no device read, no sync, and the
+    # same answer on every TP rank (a rank-specific tensor value cannot enter).
+    runner = fake_runner(speculative_config=object())
+    batch = fake_batch(4)
+    batch.logits_indices = torch.empty(4, dtype=torch.int64, device="meta")
+    assert step_uses_topk(runner, batch)
+    batch.logits_indices = torch.empty(9, dtype=torch.int64, device="meta")
+    batch.num_draft_tokens = 5
+    assert not step_uses_topk(runner, batch)
+
+
 def test_the_step_predicate_depends_on_the_row_count_alone():
     runner = fake_runner(min_tokens=16)
     # Every TP rank has the same rows: the same side of the threshold.
@@ -557,15 +590,25 @@ def test_the_launch_switch_follows_the_model():
 @pytest.mark.parametrize(
     "override",
     [
-        {"speculative_config": object()},
         {"lora_config": object()},
         {"batch_sharder": object()},
         {"sampler": object()},
     ],
-    ids=["speculative", "lora", "batch-sharded", "custom-sampler"],
+    ids=["lora", "batch-sharded", "custom-sampler"],
 )
 def test_the_launch_switch_turns_off_for_what_needs_the_logits(override):
     assert resolve(**override)[0] == 0
+
+
+def test_speculative_decoding_leaves_the_launch_switch_on():
+    # A step with draft tokens takes the full path by itself (the step predicate);
+    # a step without any, such as dynamic speculative decoding at K == 0, may not.
+    k, runner = resolve(speculative_config=object())
+    assert k == K and runner.topk_logits_stats is not None
+    # What else turns the path off still does under speculation.
+    assert resolve(speculative_config=object(), lora_config=object())[0] == 0
+    assert resolve(speculative_config=object(), batch_sharder=object())[0] == 0
+    assert resolve(speculative_config=object(), sampler=object())[0] == 0
 
 
 def test_a_model_without_the_path_is_left_alone():
@@ -586,3 +629,83 @@ def test_the_min_tokens_knob(monkeypatch):
     monkeypatch.setenv("VLLM_MUSE_SPARK_SM120_TOPK_LOGITS_MIN_TOKENS", "0")
     k, runner = resolve()
     assert runner.topk_logits_min_tokens == 1
+
+
+class _Recorder:
+    def __init__(self, events: list, name: str, result=None):
+        self.events, self.name, self.result = events, name, result
+
+    def __call__(self, *args, **kwargs):
+        self.events.append(self.name)
+        return self.result
+
+
+def sample_runner(events: list, speculative: bool, refuse: str | None = None):
+    """The members of the runner that `GPUModelRunner.sample` reads."""
+    out = SimpleNamespace(num_sampled="num_sampled", num_rejected="num_rejected")
+    sampler = _Recorder(events, "sampler", out)
+    sampler.topk_logits_fallback_reason = lambda idx, k: refuse
+    sampler.topk_logits_threshold_route = lambda idx: False
+    sampler.topk_logits_tie_draw = lambda batch: None
+    sampler.sample_topk_logits = _Recorder(events, "sample_topk_logits", out)
+    model = SimpleNamespace(
+        compute_logits=lambda h: events.append("compute_logits") or h,
+        compute_topk_logits=lambda h, ties: events.append("compute_topk_logits") or h,
+    )
+    runner = SimpleNamespace(
+        batch_sharder=None,
+        model=model,
+        sampler=sampler,
+        rejection_sampler=_Recorder(events, "rejection_sampler", out)
+        if speculative
+        else None,
+        speculator=SimpleNamespace(draft_logits=None) if speculative else None,
+        topk_logits_k=K,
+        topk_logits_min_tokens=1,
+        topk_logits_stats=RouteStats(K),
+        pcp_manager=None,
+        _topk_logits_logged=True,
+    )
+    runner._topk_logits_fallback_reason = functools.partial(
+        GPUModelRunner._topk_logits_fallback_reason, runner
+    )
+    runner._sample_from_topk_logits = functools.partial(
+        GPUModelRunner._sample_from_topk_logits, runner
+    )
+    return runner
+
+
+def run_sample(runner, rows: int, reqs: int, drafts: int):
+    batch = fake_batch(rows, draft_tokens=drafts, reqs=reqs)
+    return GPUModelRunner.sample(runner, torch.zeros(rows, 4), batch, None)
+
+
+@pytest.mark.parametrize(
+    ("speculative", "refuse", "rows", "reqs", "drafts", "expected"),
+    [
+        # K == 0 under speculation: the plain top-k path, no rejection sampler.
+        (True, None, 4, 4, 0, ["compute_topk_logits", "sample_topk_logits"]),
+        # The same step needing the logits: the plain sampler, never the rejection one.
+        (True, "logprobs", 4, 4, 0, ["compute_logits", "sampler"]),
+        # Any draft token: the full logits and the rejection sampler.
+        (True, None, 4 + 28, 4, 28, ["compute_logits", "rejection_sampler"]),
+        (True, None, 4 + 1, 4, 1, ["compute_logits", "rejection_sampler"]),
+        # Without speculation nothing changes.
+        (False, None, 4, 4, 0, ["compute_topk_logits", "sample_topk_logits"]),
+        (False, "logprobs", 4, 4, 0, ["compute_logits", "sampler"]),
+    ],
+    ids=[
+        "k0-top-k",
+        "k0-needs-logits",
+        "full-block",
+        "one-draft",
+        "no-spec-top-k",
+        "no-spec-logits",
+    ],
+)
+def test_sample_routes_the_step(speculative, refuse, rows, reqs, drafts, expected):
+    events: list = []
+    runner = sample_runner(events, speculative, refuse)
+    output, num_sampled, num_rejected = run_sample(runner, rows, reqs, drafts)
+    assert events == expected
+    assert (num_sampled, num_rejected) == ("num_sampled", "num_rejected")
