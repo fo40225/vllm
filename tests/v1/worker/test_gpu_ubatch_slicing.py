@@ -669,6 +669,79 @@ def test_ubatch_runner_overlaps_and_matches_single_batch():
     )
 
 
+class _AuxTapModel(torch.nn.Module):
+    """Toy target of a drafter: hidden states plus one auxiliary tap per layer."""
+
+    num_taps = 3
+
+    def forward(self, input_ids, positions, intermediate_tensors=None, **kwargs):
+        hidden = input_ids.float().unsqueeze(-1) * 2 + positions.float().unsqueeze(-1)
+        dbo_yield()
+        return hidden, [hidden + 1000.0 * (i + 1) for i in range(self.num_taps)]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="DBO needs a GPU")
+def test_ubatch_runner_merges_auxiliary_hidden_states_in_row_order():
+    """A drafter's taps (one tensor per tapped layer) come back as the model returns
+    them for the whole batch: same structure, rows in batch order, per tap."""
+    vllm_config = _make_dbo_config()
+    device = torch.device("cuda:0")
+    runner = _make_execution_runner(vllm_config)
+
+    model_inputs = _make_model_inputs(16, device)
+    ubatch_state = _make_ubatch_state(
+        vllm_config,
+        [
+            UBatchSlice(slice(0, 4), slice(0, 6)),
+            UBatchSlice(slice(4, 8), slice(6, 16)),
+        ],
+    )
+    model = _AuxTapModel()
+    hidden, taps = runner.run(model, model_inputs, ubatch_state)
+
+    expected_hidden, expected_taps = model(**model_inputs)
+    torch.testing.assert_close(hidden, expected_hidden)
+    assert isinstance(taps, list) and len(taps) == model.num_taps
+    for tap, expected in zip(taps, expected_taps):
+        torch.testing.assert_close(tap, expected)
+
+
+def test_merge_ubatch_outputs_keeps_the_structure_of_the_model_output():
+    from vllm.sequence import IntermediateTensors
+    from vllm.v1.worker.gpu.ubatch_utils import merge_ubatch_outputs
+
+    def rows(start, stop):
+        return torch.arange(start, stop, dtype=torch.float32).unsqueeze(-1)
+
+    expected = rows(0, 7)
+    # Hidden states only.
+    merged = merge_ubatch_outputs([rows(0, 3), rows(3, 7)])
+    assert torch.equal(merged, expected)
+    # Hidden states and a list of taps (DFlash: five of them, EAGLE3: three).
+    for num_taps in (1, 3, 5):
+        outputs = [
+            (rows(a, b), [rows(a, b) + 100 * i for i in range(num_taps)])
+            for a, b in ((0, 2), (2, 7))
+        ]
+        hidden, taps = merge_ubatch_outputs(outputs)
+        assert torch.equal(hidden, expected)
+        assert isinstance(taps, list) and len(taps) == num_taps
+        for i, tap in enumerate(taps):
+            assert torch.equal(tap, expected + 100 * i)
+    # A tuple of taps stays a tuple; three microbatches merge alike.
+    hidden, taps = merge_ubatch_outputs(
+        [(rows(a, b), (rows(a, b) + 1,)) for a, b in ((0, 1), (1, 4), (4, 7))]
+    )
+    assert isinstance(taps, tuple) and torch.equal(taps[0], expected + 1)
+    # Pipeline stages hand over IntermediateTensors.
+    merged = merge_ubatch_outputs(
+        [IntermediateTensors({"hidden_states": rows(0, 3)}), IntermediateTensors(
+            {"hidden_states": rows(3, 7)}
+        )]
+    )
+    assert torch.equal(merged["hidden_states"], expected)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="DBO needs a GPU")
 @pytest.mark.parametrize("failed_ubatch", [0, 1])
 def test_ubatch_runner_names_the_microbatch_that_failed(failed_ubatch):
@@ -1065,6 +1138,41 @@ def test_tp_only_decode_batches_never_split():
         ).num_ubatches
         == 1
     )
+
+
+def test_tp_only_speculative_verify_batches_never_split():
+    """Under speculation a decode step verifies 1 + K tokens per request. It is a
+    uniform decode of that width and as such out of the split, at any size."""
+    verify_len = 8
+    for num_reqs in (4, 128, 1024):
+        desc, sync = dp_utils.dispatch_cg_and_sync_dp(
+            None,
+            num_reqs=num_reqs,
+            num_tokens=verify_len * num_reqs,
+            uniform_token_count=verify_len,
+            dp_size=1,
+            dp_rank=0,
+            need_eager=True,
+            parallel_config=_tp_only_parallel_config(),
+            allow_ubatching=True,
+            uniform_decode=True,
+        )
+        assert sync is None and desc.num_ubatches == 1
+    # A mixed batch of verify rows and a prefill chunk is not uniform: it splits
+    # above the prefill threshold like any other eager batch.
+    desc, _ = dp_utils.dispatch_cg_and_sync_dp(
+        None,
+        num_reqs=5,
+        num_tokens=PREFILL_THRESHOLD,
+        uniform_token_count=None,
+        dp_size=1,
+        dp_rank=0,
+        need_eager=True,
+        parallel_config=_tp_only_parallel_config(),
+        allow_ubatching=True,
+        uniform_decode=False,
+    )
+    assert desc.num_ubatches == 2
 
 
 def test_tp_only_cudagraph_batches_never_split():

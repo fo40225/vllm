@@ -265,11 +265,25 @@ def slice_model_inputs(
     return sliced
 
 
+def _cat_rows(parts: tuple[Any, ...]) -> Any:
+    """Concatenate one output slot of the microbatches along the token dim.
+
+    A slot is a tensor, or a list/tuple of tensors (the auxiliary hidden states of a
+    drafter, one tensor per tapped layer), merged element by element.
+    """
+    first = parts[0]
+    if isinstance(first, (list, tuple)):
+        return type(first)(_cat_rows(column) for column in zip(*parts))
+    return torch.cat(parts, dim=0)
+
+
 def merge_ubatch_outputs(outputs: list[Any]) -> Any:
     """Reassemble the full-batch model output from the per-microbatch ones.
 
     Models return hidden states, a tuple of those plus auxiliary hidden states
-    (EAGLE3), or IntermediateTensors on non-final pipeline ranks.
+    (EAGLE3, DFlash: a list with one tensor per tapped layer), or IntermediateTensors
+    on non-final pipeline ranks. Rows come back in batch order: the microbatches are
+    consecutive token slices.
     """
     first = outputs[0]
     if isinstance(first, IntermediateTensors):
@@ -280,7 +294,7 @@ def merge_ubatch_outputs(outputs: list[Any]) -> Any:
             }
         )
     if isinstance(first, tuple):
-        return tuple(torch.cat(parts, dim=0) for parts in zip(*outputs))
+        return tuple(_cat_rows(slot) for slot in zip(*outputs))
     return torch.cat(outputs, dim=0)
 
 
