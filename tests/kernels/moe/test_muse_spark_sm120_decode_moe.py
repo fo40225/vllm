@@ -13,6 +13,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from tests.kernels.muse_spark_pdl_utils import slow_copy, synchronize_or_exit
 from vllm import _custom_ops as ops
 from vllm.model_executor.layers.fused_moe.utils import remap_topk_to_local
 from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
@@ -24,7 +25,6 @@ from vllm.models.muse_spark.nvidia.sm120_nvfp4_moe import (
     fold_sm120_nvfp4_scales,
 )
 from vllm.platforms import current_platform
-from vllm.triton_utils import tl, triton
 
 if not current_platform.is_device_capability_family(120):
     pytest.skip("Requires an SM120 GPU", allow_module_level=True)
@@ -804,36 +804,17 @@ def test_launch_variants_are_bitwise_equal(layer: _Layer, t: int) -> None:
             assert bool((rows[perm < 0].view(torch.int16) == 0).all())
 
 
-@triton.jit
-def _slow_copy_kernel(dst_ptr, src_ptr, n, SPIN: tl.constexpr, BLOCK: tl.constexpr):
-    # Let the dependents of this kernel launch right now, and write the data
-    # only after a spin of about 60 us. acc stays below 1e3, so the second mask
-    # term is always true; it keeps the spin from being removed.
-    tl.extra.cuda.gdc_launch_dependents()
-    acc = tl.zeros([BLOCK], dtype=tl.float32)
-    for _ in range(SPIN):
-        acc = acc * 0.999 + 1.0
-    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    mask = (offs < n) & (acc < 1e30)
-    tl.store(dst_ptr + offs, tl.load(src_ptr + offs, mask=mask), mask=mask)
-
-
-def _slow_copy(dst: torch.Tensor, src: torch.Tensor) -> None:
-    block = 1024
-    _slow_copy_kernel[(triton.cdiv(src.numel(), block),)](
-        dst.view(-1), src.view(-1), src.numel(), SPIN=20_000, BLOCK=block
-    )
-
-
-@pytest.mark.parametrize("t", [1, 4, 8])
+@pytest.mark.parametrize("t", [1, 2, 4, 8])
 @pytest.mark.parametrize("use_graph", [False, True])
 @torch.inference_mode()
 def test_persistent_kernel_waits_for_the_routing_and_the_norm(
-    layer: _Layer, t: int, use_graph: bool
+    layer: _Layer, t: int, use_graph: bool, capfd
 ) -> None:
     """The kernel is a programmatic dependent of the routing kernel: it may start
     while the top-k ids and the activations are still being written, and must wait
-    before it reads either (``ids`` and ``u`` start as other valid inputs)."""
+    before it reads either (``ids`` and ``u`` start as other valid inputs and are
+    both written late, by one producer). Without the wait the CTAs build different
+    plans and the kernel hangs: ``synchronize_or_exit`` ends the process then."""
     engine = _Engine(layer)
     u, _, _ = _routing(t, 170)
     ids = _ids_cases(t, 171)["three_local"]
@@ -844,8 +825,7 @@ def test_persistent_kernel_waits_for_the_routing_and_the_norm(
     u_in, ids_in = stale_u.clone(), stale_ids.clone()
 
     def step():
-        _slow_copy(u_in, u)
-        _slow_copy(ids_in, ids)
+        slow_copy((u_in, u), (ids_in, ids))
         return engine.run(u_in, ids_in)
 
     def restore():
@@ -854,7 +834,7 @@ def test_persistent_kernel_waits_for_the_routing_and_the_norm(
 
     restore()
     step()  # compiles the Triton producer
-    torch.cuda.synchronize()
+    synchronize_or_exit("the first launch", capfd)
     if use_graph:
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
@@ -862,11 +842,14 @@ def test_persistent_kernel_waits_for_the_routing_and_the_norm(
         for _ in range(4):
             restore()
             graph.replay()
+            synchronize_or_exit("a graph replay", capfd)
             got = _valid(rows, perm)
             assert torch.equal(got[0], ref[0]) and torch.equal(got[1], ref[1])
     else:
         for _ in range(4):
             restore()
-            got = _valid(*step())
+            rows, perm = step()
+            synchronize_or_exit("a launch", capfd)
+            got = _valid(rows, perm)
             assert torch.equal(got[0], ref[0]) and torch.equal(got[1], ref[1])
     assert engine.counters_are_zero()

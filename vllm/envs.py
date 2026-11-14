@@ -1295,12 +1295,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MUSE_SPARK_FUSED_KERNELS": lambda: bool(
         int(os.getenv("VLLM_MUSE_SPARK_FUSED_KERNELS", "1"))
     ),
-    # Muse Spark: launch the decode-path kernels that follow another kernel (the
-    # residual boundary, the post-expert finalize and the SM120 decode MoE) as
-    # programmatic dependents, so that their launch and prologue overlap the end
-    # of the predecessor. Bitwise identical to plain launches; set to 0 to launch
-    # them as plain kernels, e.g. for A/B tests. Read at every launch, so it must
-    # not change between a CUDA graph capture and its replay.
+    # Muse Spark on SM120: launch the decode-path kernels that follow another
+    # kernel (the residual boundary, the post-expert finalize and the decode MoE)
+    # as programmatic dependents, and let the routing and the QK-norm/RoPE/KV
+    # insert kernels trigger their successors early, so that the launch and the
+    # prologue of a kernel overlap the end of its predecessor. Bitwise identical
+    # to plain launches; set to 0 to get the previous launches back, e.g. for A/B
+    # tests. Other GPUs always keep the previous launches. Read at every launch
+    # (also by the JIT-built QK-norm/RoPE/KV insert op), so it must not change
+    # between a CUDA graph capture and its replay.
     "VLLM_MUSE_SPARK_SM120_PDL": lambda: bool(
         int(os.getenv("VLLM_MUSE_SPARK_SM120_PDL", "1"))
     ),

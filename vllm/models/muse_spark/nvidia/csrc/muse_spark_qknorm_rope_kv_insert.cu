@@ -49,6 +49,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdlib>
 #include <optional>
 #include <string>
 #include <type_traits>
@@ -161,6 +162,15 @@ inline int device_sm_count() {
 inline int device_max_threads_per_sm() {
   static std::atomic<int> threads[kMaxCachedDevices];
   return device_attribute(cudaDevAttrMaxThreadsPerMultiProcessor, threads);
+}
+
+// VLLM_MUSE_SPARK_SM120_PDL (default on, parsed like vllm/envs.py): whether the
+// kernel lets its programmatic successor launch at its start. Off keeps the
+// trigger at the end of the kernel, for A/B runs and bisecting. Read at every
+// launch, like the Python side, so a CUDA graph capture sees the current value.
+inline bool early_trigger_enabled() {
+  char const* value = std::getenv("VLLM_MUSE_SPARK_SM120_PDL");
+  return value == nullptr || std::atoi(value) != 0;
 }
 }  // namespace
 
@@ -346,7 +356,7 @@ fusedMuseSparkQKNormRopeKVInsertKernel(
     float const eps, int const rotary_dim, int const num_tokens, int const nq,
     int const nkv, FastDiv const chunks_div, int64_t const qkv_stride,
     FastDiv const block_div, int64_t const kv_s_block, int64_t const kv_s_head,
-    int64_t const kv_s_token) {
+    int64_t const kv_s_token, bool const early_trigger) {
   constexpr int kElems = kBytesPerLane / sizeof(scalar_t);
   constexpr int kLanes = HEAD_DIM / kElems;
   constexpr int kPairs = kElems / 2;
@@ -381,7 +391,7 @@ fusedMuseSparkQKNormRopeKVInsertKernel(
   // Let the successor (the attention kernel, which waits for this kernel to
   // finish before it reads q and the KV cache) launch now rather than when the
   // last block is done: its launch and setup overlap this kernel.
-  cudaTriggerProgrammaticLaunchCompletion();
+  if (early_trigger) cudaTriggerProgrammaticLaunchCompletion();
 #endif
 
   // Q, K and V are contiguous head slots at the head of the row, so the slot
@@ -496,6 +506,11 @@ fusedMuseSparkQKNormRopeKVInsertKernel(
       }
     }
   }
+
+  // PDL: without the early trigger, let a dependent successor launch here.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  if (!early_trigger) cudaTriggerProgrammaticLaunchCompletion();
+#endif
 }
 
 template <typename scalar_t, typename cache_t, KVCacheDtype kv_dt,
@@ -534,6 +549,7 @@ void launchFusedMuseSparkTyped(
   attrs[0].val.programmaticStreamSerializationAllowed = 1;
   config.attrs = attrs;
   config.numAttrs = (sm_version >= 90) ? 1 : 0;
+  bool const early_trigger = early_trigger_enabled();
 
 #define LAUNCH_MUSE(DO_ROPE, INSERT)                                         \
   C10_CUDA_CHECK(cudaLaunchKernelEx(                                         \
@@ -544,7 +560,8 @@ void launchFusedMuseSparkTyped(
                                              INSERT>,                        \
       qkv, cos_sin_cache, positions, slot_mapping, kv_cache, k_scale,        \
       v_scale, q_fp8_out, q_scale, eps, rotary_dim, num_tokens, nq, nkv,     \
-      chunks_div, qkv_stride, block_div, kv_s_block, kv_s_head, kv_s_token))
+      chunks_div, qkv_stride, block_div, kv_s_block, kv_s_head, kv_s_token,  \
+      early_trigger))
 
   if (do_rope) {
     if (insert_kv) {

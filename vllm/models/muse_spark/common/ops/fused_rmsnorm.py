@@ -90,15 +90,15 @@ def _rmsnorm_fwd_kernel(
     bT: tl.constexpr,
     bD: tl.constexpr,
     USE_PDL: tl.constexpr,
-    EARLY_TRIGGER: tl.constexpr,
 ):
     """RMSNorm over the last dim of ``[T, D]``; fp32 math, the store rounds once.
 
     ``KAHAN`` uses compensated fp32 instead of fp64 for the cross-tile sum
-    (Blackwell runs fp64 at 1/64 rate). ``EARLY_TRIGGER`` lets a programmatic
-    successor launch as soon as every program is past its wait: the successor
-    waits for this kernel to finish before it reads anything.
+    (Blackwell runs fp64 at 1/64 rate).
     """
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+
     t_idx = tl.program_id(0)
     t = t_idx * bT + tl.arange(0, bT)
     tm = t < T
@@ -109,15 +109,9 @@ def _rmsnorm_fwd_kernel(
         idx = t[:, None] * D + d[None, :]
         mask = tm[:, None] & dm[None, :]
 
-        # The weight is a parameter: load it before the wait, so that the load
-        # overlaps the end of the predecessor.
+        x = tl.load(x_ptr + idx, mask=mask, other=0.0).to(tl.float32)
         if HAS_WEIGHT:
             w = _effective_weight(w_ptr, d, dm, gain_center)
-        if USE_PDL:
-            tl.extra.cuda.gdc_wait()
-            if EARLY_TRIGGER:
-                tl.extra.cuda.gdc_launch_dependents()
-        x = tl.load(x_ptr + idx, mask=mask, other=0.0).to(tl.float32)
 
         if INPUT_SCALE and HAS_WEIGHT:
             x = x * w[None, :]
@@ -147,10 +141,6 @@ def _rmsnorm_fwd_kernel(
                 y = y * w[None, :]
             tl.store(y_ptr + idx, y.to(y_ptr.dtype.element_ty), mask=mask)
     else:
-        if USE_PDL:
-            tl.extra.cuda.gdc_wait()
-            if EARLY_TRIGGER:
-                tl.extra.cuda.gdc_launch_dependents()
         if KAHAN:
             sum_sq = tl.zeros([bT], dtype=tl.float32)
             compensation = tl.zeros([bT], dtype=tl.float32)
@@ -353,7 +343,6 @@ def fused_rmsnorm_fwd(
         bD=bD,
         num_warps=num_warps,
         USE_PDL=enable_pdl,
-        EARLY_TRIGGER=enable_pdl and muse_pdl_enabled(),
         **({"launch_pdl": True} if enable_pdl else {}),
     )
     return y.view(input_shape)

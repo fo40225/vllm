@@ -16,17 +16,19 @@ logger = init_logger(__name__)
 def muse_pdl_enabled() -> bool:
     """Whether the Muse Spark kernels launch as programmatic dependents.
 
-    Needs a GPU that supports PDL (SM90+) and ``VLLM_MUSE_SPARK_SM120_PDL``. A
-    kernel launched this way may start before its predecessor has finished, so
-    it must call ``gdc_wait`` before it reads anything a kernel of the step
-    writes (or writes anything such a kernel reads).
+    Needs an SM120 GPU and ``VLLM_MUSE_SPARK_SM120_PDL``. The new dependents and
+    the early triggers were only validated against the SM120 decode kernels, so
+    other GPUs keep the launches they had. A kernel launched this way may start
+    before its predecessor has finished, so it must call ``gdc_wait`` before it
+    reads anything a kernel of the step writes (or writes anything such a kernel
+    reads).
     """
     from vllm.platforms import current_platform
 
     return (
         envs.VLLM_MUSE_SPARK_SM120_PDL
         and current_platform.is_cuda()
-        and current_platform.is_arch_support_pdl()
+        and current_platform.is_device_capability_family(120)
     )
 
 
