@@ -208,8 +208,12 @@ class DFlashSpeculator(DraftModelSpeculator):
         states, publish the context anchor and store the context K/V."""
         num_context = self._num_graph_context_tokens(num_reqs)
         if self._aux_staging is not None:
+            staged = self._aux_staging[:num_context]
+            # A projection the target already ran must not be applied twice.
             self.hidden_states[:num_context].copy_(
-                self.model.combine_hidden_states(self._aux_staging[:num_context])
+                staged
+                if self.aux_combined_by_target
+                else self.model.combine_hidden_states(staged)
             )
         self.prepare_context_anchor(
             num_reqs, self.target_input_buffers.query_start_loc, self._num_rejected
@@ -290,6 +294,15 @@ class DFlashSpeculator(DraftModelSpeculator):
             return
         set_combiner(combiner)
         self.aux_combined_by_target = True
+        if self._aux_staging is not None:
+            # The target returns one projected tap of the draft's hidden width, so
+            # the FULL graph's staging buffer holds that, not the raw taps.
+            self._aux_staging = torch.zeros(
+                self._aux_staging.shape[0],
+                self.hidden_states.shape[-1],
+                dtype=self.dtype,
+                device=self.device,
+            )
         logger.info(
             "%s: the aux projection runs in the target's forward "
             "(VLLM_MUSE_SPARK_SM120_DRAFT_FC_SHARD=2).",

@@ -841,6 +841,7 @@ def _speculator(monkeypatch, draft_combiner, holder, pp_world_size=1):
     )
     speculator = object.__new__(DFlash2Speculator)
     speculator.dtype = torch.bfloat16
+    speculator._aux_staging = None
     draft = SimpleNamespace(make_aux_combiner=lambda dtype: draft_combiner)
     target = SimpleNamespace(get_language_model=lambda: SimpleNamespace(model=holder))
     return speculator, target, draft
@@ -895,3 +896,42 @@ def test_a_target_that_cannot_run_it_keeps_the_projection(
     speculator._hand_aux_projection_to_target(target, draft)
 
     assert registered == [] and not speculator.aux_combined_by_target
+
+
+def test_the_full_graph_staging_holds_the_projected_tap_and_is_not_projected_twice(
+    monkeypatch,
+):
+    registered = []
+    holder = SimpleNamespace(set_aux_combiner=registered.append)
+    speculator, target, draft = _speculator(monkeypatch, object(), holder)
+    num_aux, max_ctx, num_context = 3, 8, 5
+    speculator.device = torch.device("cpu")
+    speculator.hidden_states = torch.zeros(16, HIDDEN, dtype=torch.bfloat16)
+    speculator._aux_staging = torch.zeros(
+        max_ctx, num_aux * HIDDEN, dtype=torch.bfloat16
+    )
+    speculator._num_rejected = None
+    speculator._num_graph_context_tokens = lambda num_reqs: num_context
+    speculator.target_input_buffers = SimpleNamespace(query_start_loc=None)
+    speculator.prepare_context_anchor = lambda *args: None
+    speculator._precompute_context_kv = lambda *args: None
+    speculator.supports_decode_metadata_update = False
+    combined = []
+
+    def combine(x):
+        combined.append(x)
+        return x
+
+    speculator.model = SimpleNamespace(combine_hidden_states=combine)
+
+    speculator._hand_aux_projection_to_target(target, draft)
+
+    assert speculator._aux_staging.shape == (max_ctx, HIDDEN)
+    projected = torch.randn(num_context, HIDDEN).to(torch.bfloat16)
+    speculator._store_hidden_states(num_context, projected, [projected], num_context)
+    torch.testing.assert_close(speculator._aux_staging[:num_context], projected)
+
+    speculator._prepare_graph_forward(1, None)
+
+    assert combined == []
+    torch.testing.assert_close(speculator.hidden_states[:num_context], projected)
