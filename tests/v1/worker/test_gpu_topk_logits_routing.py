@@ -213,7 +213,7 @@ def test_the_threshold_route_is_the_choice_of_the_full_sampler(
     seen = []
 
     def spy(self, processed_logits, expanded_idx_mapping, idx_mapping_np, pos, top_k,
-            top_p, use_fused_sampler):
+            top_p, has_topp_only_rows, use_fused_sampler):
         seen.append(use_fused_sampler)
         return processed_logits.argmax(-1), processed_logits
 
