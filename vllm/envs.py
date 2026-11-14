@@ -1350,17 +1350,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # output are reduce-scattered instead of all-reduced, and the norms, the
     # router, the pooler and the unpooler run on this rank's rows only. The
     # reduce-scatter + all-gather rounds the bf16 sums differently from the
-    # all-reduce, so outputs are deterministic but not bitwise equal to the
-    # replicated stream. Decode and short prefill batches are unchanged.
+    # all-reduce, so outputs are not bitwise equal to the replicated stream; they
+    # are run-to-run deterministic and identical on all ranks as long as the experts
+    # are (the NVFP4 W4A4 and BF16 paths; the Marlin W4A16 experts are not bitwise
+    # reproducible from run to run on their own, with or without this flag). Decode,
+    # CUDA-graph and short prefill batches are unchanged. Needs SM120, expert
+    # parallel, TP > 1, PP = DP = 1, and modular (not monolithic) experts; with
+    # another layout the flag is ignored with a warning.
     "VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL": lambda: bool(
         int(os.getenv("VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL", "0"))
     ),
     # Muse Spark on SM120: smallest batch (in tokens) that takes the sharded
-    # stream when VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL is on. Values below
-    # 257 are raised to 257: batches of up to 256 tokens use CUDA graphs and the
-    # fused decode-sized all-reduce. The stream pays three more collectives per
-    # layer than the replicated one; on 8 PCIe GPUs that is repaid from about
-    # 400 tokens on (TTFT at 300 tokens +19%, at 512 tokens -9%).
+    # stream when VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL is on. Raised to one
+    # above the largest CUDA-graph capture size (and to at least 257): graph
+    # batches and the batches of up to 256 tokens that use the fused decode-sized
+    # all-reduce always stay replicated. The capture size is 256 with
+    # --max-num-seqs 128 and 512 with the default --max-num-seqs 1024 on a 96 GB
+    # GPU. The stream pays three more collectives per layer than the replicated
+    # one; on 8 PCIe GPUs that is repaid from about 400 tokens on (TTFT at 300
+    # tokens +19%, at 512 tokens -9%).
     "VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_MIN_TOKENS": lambda: int(
         os.getenv("VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_MIN_TOKENS", "512")
     ),

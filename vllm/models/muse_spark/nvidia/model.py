@@ -375,9 +375,32 @@ def is_sequence_parallel_enabled(vllm_config: VllmConfig) -> bool:
     )
 
 
-# SM120 sequence-parallel prefill never takes the batches that run in CUDA graphs or
-# use the fused decode-sized all-reduce, which end at 256 tokens.
-_SM120_SEQUENCE_PARALLEL_FLOOR_TOKENS = 257
+def _sm120_sequence_parallel_blocker(vllm_config: VllmConfig) -> str | None:
+    """Why the sharded stream cannot run on this launch, None if it can."""
+    pc = vllm_config.parallel_config
+    mlp_layer_types = getattr(
+        vllm_config.model_config.hf_text_config, "mlp_layer_types", None
+    )
+    if not (
+        current_platform.is_cuda() and current_platform.is_device_capability_family(120)
+    ):
+        return "the device is not SM120"
+    if vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe":
+        return "--moe-backend deep_gemm_mega_moe has its own sequence-parallel stream"
+    if not pc.enable_expert_parallel:
+        return "it needs --enable-expert-parallel"
+    if pc.tensor_parallel_size <= 1:
+        return "it needs tensor parallelism"
+    if pc.pipeline_parallel_size != 1 or pc.data_parallel_size != 1:
+        return "it needs pipeline and data parallel sizes of 1"
+    if pc.use_sequence_parallel_moe:
+        return "the MoE already shards the tokens"
+    if envs.VLLM_BATCH_INVARIANT:
+        return "batch-invariant mode is on"
+    # The sharded FFN branch is the MoE one.
+    if mlp_layer_types is None or not all(t == "sparse" for t in mlp_layer_types):
+        return "it needs every layer to be a sparse (MoE) layer"
+    return None
 
 
 def is_sm120_sequence_parallel_enabled(vllm_config: VllmConfig) -> bool:
@@ -387,31 +410,30 @@ def is_sm120_sequence_parallel_enabled(vllm_config: VllmConfig) -> bool:
     ``sm120_sequence_parallel_min_tokens``; the experts still see every token,
     through the same runner as the replicated stream.
     """
-    pc = vllm_config.parallel_config
-    mlp_layer_types = getattr(
-        vllm_config.model_config.hf_text_config, "mlp_layer_types", None
-    )
-    return (
-        envs.VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL
-        and current_platform.is_cuda()
-        and current_platform.is_device_capability_family(120)
-        and vllm_config.kernel_config.moe_backend != "deep_gemm_mega_moe"
-        and pc.pipeline_parallel_size == 1
-        and pc.data_parallel_size == 1
-        and pc.enable_expert_parallel
-        and pc.tensor_parallel_size > 1
-        and not pc.use_sequence_parallel_moe
-        and not envs.VLLM_BATCH_INVARIANT
-        # The sharded FFN branch is the MoE one.
-        and mlp_layer_types is not None
-        and all(layer_type == "sparse" for layer_type in mlp_layer_types)
-    )
+    if not envs.VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL:
+        return False
+    blocker = _sm120_sequence_parallel_blocker(vllm_config)
+    if blocker is not None:
+        logger.warning_once(
+            "VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL is set but ignored: %s.", blocker
+        )
+    return blocker is None
 
 
-def sm120_sequence_parallel_min_tokens() -> int:
+def sm120_sequence_parallel_min_tokens(vllm_config: VllmConfig) -> int:
+    """Smallest batch (in tokens) that shards the stream.
+
+    Never a batch that may run in a CUDA graph (every size up to the largest
+    captured one: the dispatcher pads into a graph only up to that size and runs
+    larger batches eagerly) or with the fused decode-sized all-reduce and the
+    sharded projections (up to ``_SHARDED_PROJECTION_MAX_TOKENS``).
+    """
+    # 0 without CUDA graphs (enforce-eager or cudagraph mode NONE).
+    max_graph_tokens = vllm_config.compilation_config.max_cudagraph_capture_size or 0
     return max(
         envs.VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_MIN_TOKENS,
-        _SM120_SEQUENCE_PARALLEL_FLOOR_TOKENS,
+        _SHARDED_PROJECTION_MAX_TOKENS + 1,
+        max_graph_tokens + 1,
     )
 
 
@@ -1107,11 +1129,6 @@ class MuseSpark1xMoE(nn.Module):
         assert self.sm120_sequence_parallel
         assert self.pooler is not None and self.unpooler is not None
         assert self.pre_expert_norm is not None
-        logger.info_once(
-            "MuseSpark SM120: sequence-parallel residual stream for batches of at "
-            "least %d tokens.",
-            sm120_sequence_parallel_min_tokens(),
-        )
         router = self.moe_router
         top_k = router.top_k
         router_logits, _ = self.router(
@@ -1615,7 +1632,7 @@ class MuseSpark1xDecoderLayer(nn.Module):
         )
         # Smallest batch that shards the stream; None: one token per rank.
         self.sp_min_tokens = (
-            sm120_sequence_parallel_min_tokens()
+            sm120_sequence_parallel_min_tokens(vllm_config)
             if self.sm120_sequence_parallel
             else None
         )
@@ -1771,7 +1788,18 @@ class MuseSpark1xModel(LlamaModel):
             is_sequence_parallel_enabled(vllm_config) or sm120_sp
         )
         # Smallest batch that shards the stream; None: one token per rank.
-        self.sp_min_tokens = sm120_sequence_parallel_min_tokens() if sm120_sp else None
+        self.sp_min_tokens = (
+            sm120_sequence_parallel_min_tokens(vllm_config) if sm120_sp else None
+        )
+        if self.sp_min_tokens is not None:
+            logger.info_once(
+                "MuseSpark SM120: sequence-parallel residual stream for batches of "
+                "at least %d tokens (VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_MIN_TOKENS"
+                "=%d, CUDA graphs up to %d tokens).",
+                self.sp_min_tokens,
+                envs.VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_MIN_TOKENS,
+                vllm_config.compilation_config.max_cudagraph_capture_size or 0,
+            )
         self.make_empty_intermediate_tensors = self._make_empty_intermediate_tensors
         self.is_sequence_parallel_input = self.is_sequence_parallel
         self._configure_replicated_prefix()

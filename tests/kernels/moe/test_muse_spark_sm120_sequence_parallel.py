@@ -51,6 +51,10 @@ def _vllm_config(**overrides) -> SimpleNamespace:
         parallel_config=SimpleNamespace(**parallel),
         kernel_config=SimpleNamespace(moe_backend=overrides.pop("moe_backend", "auto")),
         model_config=SimpleNamespace(hf_text_config=text),
+        # The largest CUDA-graph batch of the reference --max-num-seqs 128 launch.
+        compilation_config=SimpleNamespace(
+            max_cudagraph_capture_size=overrides.pop("max_graph_tokens", 256)
+        ),
     )
 
 
@@ -90,7 +94,29 @@ def test_sm120_sequence_parallel_needs_the_replicated_ep_layout(
     monkeypatch, sm120_platform, overrides
 ) -> None:
     monkeypatch.setenv(FLAG, "1")
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        muse_model.logger,
+        "warning_once",
+        lambda msg, *args: warnings.append(msg % args),
+    )
     assert not muse_model.is_sm120_sequence_parallel_enabled(_vllm_config(**overrides))
+    # A flag that is set but cannot apply says why, instead of being ignored silently.
+    assert len(warnings) == 1 and FLAG in warnings[0], warnings
+
+
+def test_sm120_sequence_parallel_flag_off_is_silent(
+    monkeypatch, sm120_platform
+) -> None:
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        muse_model.logger, "warning_once", lambda *args: warnings.append(args)
+    )
+    monkeypatch.delenv(FLAG, raising=False)
+    assert not muse_model.is_sm120_sequence_parallel_enabled(
+        _vllm_config(parallel=dict(enable_expert_parallel=False))
+    )
+    assert not warnings
 
 
 def test_sm120_sequence_parallel_is_for_sm120_only(monkeypatch) -> None:
@@ -108,14 +134,52 @@ def test_sm120_sequence_parallel_is_for_sm120_only(monkeypatch) -> None:
 
 
 def test_sm120_sequence_parallel_threshold(monkeypatch) -> None:
+    config = _vllm_config()
     monkeypatch.delenv(MIN_TOKENS, raising=False)
     assert envs.VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_MIN_TOKENS == 512
-    assert muse_model.sm120_sequence_parallel_min_tokens() == 512
+    assert muse_model.sm120_sequence_parallel_min_tokens(config) == 512
     monkeypatch.setenv(MIN_TOKENS, "4096")
-    assert muse_model.sm120_sequence_parallel_min_tokens() == 4096
-    # Batches of up to 256 tokens run in CUDA graphs and use the fused all-reduce.
+    assert muse_model.sm120_sequence_parallel_min_tokens(config) == 4096
+    # Batches of up to 256 tokens use the fused all-reduce and the sharded
+    # projections, and run in CUDA graphs on the --max-num-seqs 128 launch.
     monkeypatch.setenv(MIN_TOKENS, "1")
-    assert muse_model.sm120_sequence_parallel_min_tokens() == 257
+    assert muse_model.sm120_sequence_parallel_min_tokens(config) == 257
+
+
+@pytest.mark.parametrize(
+    "max_graph_tokens, env_min, expected",
+    [
+        # Default launch (--max-num-seqs 1024 on a 96 GB GPU): graphs up to 512
+        # tokens, so the default minimum of 512 must move up to 513.
+        (512, None, 513),
+        (512, 300, 513),
+        (512, 1, 513),
+        (512, 513, 513),
+        (512, 4096, 4096),
+        # The reference launch and the floor of the fused all-reduce paths.
+        (256, None, 512),
+        (256, 1, 257),
+        (128, 1, 257),
+        # Eager (no graphs) and an explicit wide capture range.
+        (0, 1, 257),
+        (None, 1, 257),
+        (1024, None, 1025),
+    ],
+)
+def test_sm120_sequence_parallel_never_takes_cuda_graph_batches(
+    monkeypatch, max_graph_tokens, env_min, expected
+) -> None:
+    """The stream must stay out of every batch the CUDA-graph dispatcher can serve
+    (num_tokens <= the largest capture size), whatever the launch and the env."""
+    if env_min is None:
+        monkeypatch.delenv(MIN_TOKENS, raising=False)
+    else:
+        monkeypatch.setenv(MIN_TOKENS, str(env_min))
+    config = _vllm_config(max_graph_tokens=max_graph_tokens)
+    min_tokens = muse_model.sm120_sequence_parallel_min_tokens(config)
+    assert min_tokens == expected
+    assert min_tokens > (max_graph_tokens or 0)
+    assert min_tokens > muse_model._SHARDED_PROJECTION_MAX_TOKENS
 
 
 def test_sequence_parallel_activation_threshold(dist_init) -> None:
