@@ -12,11 +12,12 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+import vllm.envs as envs
 import vllm.models.muse_spark.nvidia.model as model_ops
 from vllm.models.muse_spark.nvidia.ops import muse_c
 from vllm.models.muse_spark.nvidia.ops.l2_prefetch import (
-    AFTER_EXPERTS_CTAS,
     L2_BUDGET_FRACTION,
+    L2_PREFETCH_MAX_CTAS,
     L2Prefetcher,
     l2_budget_bytes,
 )
@@ -111,7 +112,7 @@ def test_graph_side_stream(evict_last):
     assert torch.equal(out, ref)
 
 
-@pytest.mark.parametrize("num_ctas", [None, 1, AFTER_EXPERTS_CTAS])
+@pytest.mark.parametrize("num_ctas", [None, 1, 4, 8])
 def test_graph_launch_with_its_own_cta_count(num_ctas):
     """The launch behind the experts takes its own CTA count; the default stays."""
     w_qkv, w_o = _weights()
@@ -245,3 +246,67 @@ def test_the_prefetch_is_hooked_into_all_but_the_last_layer(monkeypatch):
         1,
         0,
     ]
+
+
+CTAS_KNOB = "VLLM_MUSE_SPARK_SM120_L2_PREFETCH_AFTER_EXPERTS_CTAS"
+
+
+def _model_with_launchable_hooks() -> model_ops.MuseSpark1xModel:
+    """``_model_with_layers`` plus the weights that the hooks hand to the launch."""
+    model = _model_with_layers(hookable=True)
+    for layer in model.layers:
+        layer.feed_forward.sharded_weights = lambda num_tokens, op: []
+        layer.feed_forward.pooler = layer.feed_forward.unpooler = None
+        layer.feed_forward.router = SimpleNamespace(
+            weight=SimpleNamespace(data=torch.empty(1))
+        )
+        layer.self_attn = SimpleNamespace(
+            qkv_proj=SimpleNamespace(weight=SimpleNamespace(data=torch.empty(1))),
+            o_proj=SimpleNamespace(weight=SimpleNamespace(data=torch.empty(1))),
+        )
+    return model
+
+
+def _launches_of_the_hooks(monkeypatch) -> list[tuple[int, int | None]]:
+    """What the two hooks of layer 0 launch: (tensors, CTA count or None)."""
+    launches = []
+
+    def launch(self, tensors, num_ctas=None):
+        launches.append((len(tensors), num_ctas))
+
+    monkeypatch.setattr(muse_c, "preflight", lambda: None)
+    monkeypatch.setattr(L2Prefetcher, "launch", launch)
+    model = _model_with_launchable_hooks()
+    model._configure_l2_prefetch()
+    model.layers[0].feed_forward.experts.hooks[0](1)
+    model.layers[0].self_attn.after_qkv_hook(1)
+    return launches
+
+
+def test_the_cta_count_behind_the_experts_defaults_to_the_stock_collectives(
+    monkeypatch,
+):
+    """The 8-CTA launch was tuned for the host collectives (layer of 160 us); with
+    the stock NCCL ones (296 us) it costs +1.2% TPOT, so it must be asked for."""
+    monkeypatch.delenv(CTAS_KNOB, raising=False)
+    assert envs.VLLM_MUSE_SPARK_SM120_L2_PREFETCH_AFTER_EXPERTS_CTAS == 4
+    # unpooler (none here) + QKV + O behind the experts; the pooler launch keeps the
+    # prefetcher's own count.
+    assert _launches_of_the_hooks(monkeypatch) == [(2, 4), (1, None)]
+
+
+def test_the_cta_count_behind_the_experts_follows_the_knob(monkeypatch):
+    monkeypatch.setenv(CTAS_KNOB, "8")
+    assert envs.VLLM_MUSE_SPARK_SM120_L2_PREFETCH_AFTER_EXPERTS_CTAS == 8
+    assert _launches_of_the_hooks(monkeypatch) == [(2, 8), (1, None)]
+
+
+@pytest.mark.parametrize("value", ["0", "-1", str(L2_PREFETCH_MAX_CTAS + 1)])
+def test_a_cta_count_the_launch_cannot_take_is_refused_at_construction(
+    monkeypatch, value
+):
+    monkeypatch.setenv(CTAS_KNOB, value)
+    monkeypatch.setattr(muse_c, "preflight", lambda: None)
+    model = _model_with_launchable_hooks()
+    with pytest.raises(ValueError, match=CTAS_KNOB):
+        model._configure_l2_prefetch()

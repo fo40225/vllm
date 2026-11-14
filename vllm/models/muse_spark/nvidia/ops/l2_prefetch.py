@@ -14,13 +14,15 @@ written and no kernel output changes.
 The branch exists only inside a CUDA graph capture. Its join sits at the end of
 the model forward: the GEMMs need no ordering after the prefetch (it is a hint),
 and a join in front of them would stall the rank that finishes its MoE last. The
-prefetch is throttled to a few CTAs (``AFTER_EXPERTS_CTAS`` for the 62 MB of the
-next attention weights): issued as a burst (12 to 16 CTAs) it competes with the
-latency bound collectives for HBM and loses the gain, but it must also be done
-before its readers. The launches share one stream, so a prefetch still running when
-the next one is due delays that one, and the pooler and router weights, queued
-behind the attention weights, arrived after their GEMVs in half of the layers when
-the launch took 113 us (4 CTAs).
+prefetch is throttled to a few CTAs (4 by default, 8 for the 62 MB of the next
+attention weights where the collectives are fast, see
+``VLLM_MUSE_SPARK_SM120_L2_PREFETCH_AFTER_EXPERTS_CTAS``): issued as a burst (12 to
+16 CTAs) it competes with the latency bound collectives for HBM and loses the gain,
+but it must also be done before its readers. The launches share one stream, so a
+prefetch still running when the next one is due delays that one: with the host
+collectives (a layer of 160 us instead of 296 us) the pooler and router weights,
+queued behind the attention weights, arrived after their GEMVs in half of the layers
+when the launch took 113 us (4 CTAs).
 """
 
 from collections.abc import Sequence
@@ -37,14 +39,7 @@ logger = init_logger(__name__)
 L2_PREFETCH_MAX_TOKENS = 256
 # What one ``_muse_C::l2_prefetch`` launch takes.
 _MAX_TENSORS = 4
-# CTAs of the launch behind the experts of a layer (the unpooler, QKV and O weights of
-# the next layer, 62 MB at TP8). Host-tied tuning constant (8 RTX PRO 6000 on PCIe, muse
-# collectives, real weights, TPOT at batch 1 over 60 layers): 4 CTAs 10.69 ms, 8 CTAs
-# 9.85; with the expert prefetch on, 7 CTAs 9.94, 8 9.73, 9 9.65, 10 10.07 (12 CTAs
-# 10.65 without it). Too few finish behind the attention all-reduce and late for the
-# GEMMs; too many load HBM while the MoE all-reduce, which is latency bound, runs.
-# 8 keeps a margin to the slow 7 and 10.
-AFTER_EXPERTS_CTAS = 8
+L2_PREFETCH_MAX_CTAS = 1024
 # The most that one launch pulls into L2, as a share of the cache. The weights share
 # it with the activations, the KV blocks of the attention in flight, the NCCL buffers
 # and the weights of the op that is running, and a prefetch of more than the cache

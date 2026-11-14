@@ -125,7 +125,7 @@ from vllm.models.muse_spark.nvidia.ops.cute_dsl.qk_norm import (
 )
 from vllm.models.muse_spark.nvidia.ops.expert_prefetch import ExpertPrefetch
 from vllm.models.muse_spark.nvidia.ops.l2_prefetch import (
-    AFTER_EXPERTS_CTAS,
+    L2_PREFETCH_MAX_CTAS,
     L2_PREFETCH_MAX_TOKENS,
     L2Prefetcher,
 )
@@ -2200,6 +2200,12 @@ class MuseSpark1xModel(LlamaModel):
         if (reason := muse_c.preflight()) is not None:
             logger.info_once("The L2 weight prefetch is off: %s", reason)
             return
+        after_experts_ctas = envs.VLLM_MUSE_SPARK_SM120_L2_PREFETCH_AFTER_EXPERTS_CTAS
+        if not 1 <= after_experts_ctas <= L2_PREFETCH_MAX_CTAS:
+            raise ValueError(
+                "VLLM_MUSE_SPARK_SM120_L2_PREFETCH_AFTER_EXPERTS_CTAS must be in "
+                f"[1, {L2_PREFETCH_MAX_CTAS}], got {after_experts_ctas}."
+            )
         try:
             prefetcher = L2Prefetcher()
         except Exception as e:
@@ -2223,7 +2229,7 @@ class MuseSpark1xModel(LlamaModel):
                             next_attn.qkv_proj.weight.data,
                             next_attn.o_proj.weight.data,
                         ],
-                        num_ctas=AFTER_EXPERTS_CTAS,
+                        num_ctas=after_experts_ctas,
                     )
 
             return hook
@@ -2255,8 +2261,9 @@ class MuseSpark1xModel(LlamaModel):
             self._l2_prefetcher = prefetcher
             logger.info_once(
                 "MuseSpark: L2 prefetch of the weights of the next decode ops in %d "
-                "layers.",
+                "layers (%d CTAs behind the experts).",
                 hooked,
+                after_experts_ctas,
             )
 
     def _make_empty_intermediate_tensors(

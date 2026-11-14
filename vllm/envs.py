@@ -149,6 +149,7 @@ if TYPE_CHECKING:
     VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL: bool | None = None
     VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_MIN_TOKENS: int = 512
     VLLM_MUSE_SPARK_SM120_L2_PREFETCH: bool = True
+    VLLM_MUSE_SPARK_SM120_L2_PREFETCH_AFTER_EXPERTS_CTAS: int = 4
     VLLM_MUSE_SPARK_SM120_EXPERT_PREFETCH: bool = True
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
     VLLM_ROCM_USE_AITER_LINEAR_HIPBMM: bool = False
@@ -1405,6 +1406,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # nothing. Read once, when the model is constructed.
     "VLLM_MUSE_SPARK_SM120_L2_PREFETCH": lambda: bool(
         int(os.getenv("VLLM_MUSE_SPARK_SM120_L2_PREFETCH", "1"))
+    ),
+    # Muse Spark on SM120: CTAs of the weight prefetch that is launched behind the
+    # experts of each layer (the unpooler, QKV and O weights of the next layer, 62 MB at
+    # TP8). More CTAs finish it earlier, but they also load HBM while the MoE
+    # all-reduce, which is latency bound, runs. With the stock NCCL collectives (layer
+    # of about 296 us) 4 is better: TPOT 16.90 ms against 17.09 ms for 8 (batch 1, real
+    # weights). With fast collectives (host plugin, layer of about 160 us) the 4-CTA
+    # launch (113 us) is still running when the pooler and router weights are due, and
+    # 8 wins: 9.80 ms against 10.69 ms. A cache-hint tuning, no output changes; the
+    # host launch environment sets it. Read once, when the model is constructed.
+    "VLLM_MUSE_SPARK_SM120_L2_PREFETCH_AFTER_EXPERTS_CTAS": lambda: int(
+        os.getenv("VLLM_MUSE_SPARK_SM120_L2_PREFETCH_AFTER_EXPERTS_CTAS", "4")
     ),
     # Muse Spark on SM120: in the decode CUDA graphs of up to 8 tokens, prefetch the head
     # of the experts that the routing picked for this rank into L2 on the aux stream, behind
