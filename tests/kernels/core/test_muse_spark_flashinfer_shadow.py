@@ -10,6 +10,7 @@ module when the shadow does not build.
 
 import dataclasses
 import hashlib
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -33,14 +34,33 @@ class FakeSpec:
     sources: list
     extra_include_dirs: list | None
     build_dir: Path
-    fail: bool = False
+    fail: BaseException | None = None
     built: int = 0
 
     def build_and_load(self):
         self.built += 1
-        if self.fail:
-            raise RuntimeError("nvcc failed")
+        if self.fail is not None:
+            raise self.fail
         return object()
+
+
+def _ninja_failure(output: str | None, returncode: int = 1) -> RuntimeError:
+    """What FlashInfer's ``run_ninja`` raises when ninja exits with an error."""
+    try:
+        raise subprocess.CalledProcessError(returncode, "ninja", output=output)
+    except subprocess.CalledProcessError as cause:
+        try:
+            raise RuntimeError("Ninja build failed.") from cause
+        except RuntimeError as exc:
+            return exc
+
+
+NVCC_ERROR = _ninja_failure("mha.cu(10): error: identifier 'foo' is undefined")
+
+
+@pytest.fixture(autouse=True)
+def _toolchain(monkeypatch):
+    monkeypatch.setattr(shadow, "toolchain", lambda: "CUDA 13.3 at /usr/local/cuda ")
 
 
 def _workspace(monkeypatch, tmp_path):
@@ -120,19 +140,67 @@ def test_materialize_is_content_addressed_and_idempotent(monkeypatch, tmp_path):
     assert second.read_text() == "two" and first.read_text() == "one"
 
 
-def test_failed_build_falls_back_to_stock_and_is_remembered(tmp_path):
+def test_compiler_failure_falls_back_to_stock_and_is_remembered(tmp_path):
     stock = FakeSpec("stock", [], None, tmp_path / "stock")
-    bad = FakeSpec("bad", [], None, tmp_path / "bad", fail=True)
+    bad = FakeSpec("bad", [], None, tmp_path / "bad", fail=NVCC_ERROR)
     assert shadow.build_or_stock(bad, stock) is stock
-    assert bad.built == 1 and (bad.build_dir / shadow.FAILED_MARKER).is_file()
-    # The next process does not compile again.
+    marker = bad.build_dir / shadow.FAILED_MARKER
+    assert bad.built == 1 and marker.is_file()
+    assert marker.read_text().startswith("toolchain: CUDA 13.3 at /usr/local/cuda \n")
+    # The next process with this toolchain does not compile again.
     assert shadow.build_or_stock(bad, stock) is stock and bad.built == 1
     with pytest.raises(RuntimeError, match="earlier build"):
         shadow.build_or_stock(bad, stock, strict=True)
-    fresh = FakeSpec("fresh", [], None, tmp_path / "fresh", fail=True)
-    with pytest.raises(RuntimeError, match="nvcc failed"):
+    fresh = FakeSpec("fresh", [], None, tmp_path / "fresh", fail=NVCC_ERROR)
+    with pytest.raises(RuntimeError, match="Ninja build failed"):
         shadow.build_or_stock(fresh, stock, strict=True)
     assert not (fresh.build_dir / shadow.FAILED_MARKER).exists()
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        pytest.param(OSError(28, "No space left on device"), id="oserror"),
+        pytest.param(RuntimeError("Could not find nvcc"), id="no-nvcc"),
+        pytest.param(TimeoutError("lock"), id="lock-timeout"),
+        pytest.param(_ninja_failure(None), id="verbose-ninja-has-no-output"),
+        pytest.param(_ninja_failure("error: x", returncode=-9), id="ninja-killed"),
+        pytest.param(
+            _ninja_failure("nvcc error : 'cicc' died due to signal 9"), id="oom-killed"
+        ),
+        pytest.param(
+            _ninja_failure("fatal error: cannot write: No space left on device"),
+            id="disk-full",
+        ),
+        pytest.param(_ninja_failure("ninja: build stopped"), id="no-diagnostic"),
+    ],
+)
+def test_a_failure_of_the_machine_is_not_remembered(tmp_path, failure):
+    """A helper process without nvcc or a full disk must not switch production off."""
+    stock = FakeSpec("stock", [], None, tmp_path / "stock")
+    flaky = FakeSpec("flaky", [], None, tmp_path / "flaky", fail=failure)
+    assert shadow.build_or_stock(flaky, stock) is stock
+    assert not (flaky.build_dir / shadow.FAILED_MARKER).exists()
+    # The next process tries again and gets the shadow.
+    flaky.fail = None
+    assert shadow.build_or_stock(flaky, stock) is flaky and flaky.built == 2
+
+
+def test_marker_of_another_toolchain_is_ignored_and_removed(monkeypatch, tmp_path):
+    stock = FakeSpec("stock", [], None, tmp_path / "stock")
+    spec = FakeSpec("spec", [], None, tmp_path / "spec", fail=NVCC_ERROR)
+    assert shadow.build_or_stock(spec, stock) is stock
+    marker = spec.build_dir / shadow.FAILED_MARKER
+    monkeypatch.setattr(shadow, "toolchain", lambda: "CUDA 13.4 at /opt/cuda ")
+    spec.fail = None  # the other toolchain compiles it
+    assert shadow.build_or_stock(spec, stock) is spec and spec.built == 2
+    assert not marker.exists()
+    # Without a known toolchain nothing is remembered or honored.
+    monkeypatch.setattr(shadow, "toolchain", lambda: None)
+    spec.fail = NVCC_ERROR
+    assert shadow.build_or_stock(spec, stock) is stock and not marker.exists()
+    marker.write_text("toolchain: None\n")
+    assert shadow.build_or_stock(spec, stock) is stock and spec.built == 4
 
 
 def test_good_build_keeps_the_shadow(tmp_path):

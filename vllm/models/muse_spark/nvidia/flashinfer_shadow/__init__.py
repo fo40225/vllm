@@ -26,9 +26,13 @@ How a shadow is built:
   ``flashinfer/data``) and is skipped, with a warning, when the installed FlashInfer
   is another version or one of the files differs.
 * The module is compiled at the first use, like the stock one, and cached in the
-  FlashInfer workspace. When that build fails the stock spec is returned instead, and
-  the failure is remembered in the build directory (delete ``FAILED_MARKER`` there to
-  try again), so that the next process does not compile again.
+  FlashInfer workspace. When that build fails the stock spec is returned instead. A
+  failure of the COMPILER (nvcc rejects the source) is also remembered in the build
+  directory, together with the CUDA toolchain that rejected it, so that the next
+  process with that toolchain does not compile again (delete ``FAILED_MARKER`` there
+  to try again). Any other failure (no nvcc, a full disk, a killed compiler, a lock
+  timeout) is not remembered: it says nothing about the source, and a helper process
+  without a toolchain must not switch the production processes to the stock kernel.
 
 To add a shadow of another module (for example the FA2 ``prefill.cuh``): copy the
 file from the installed package, record the md5 of every stock file it needs, patch,
@@ -40,6 +44,8 @@ import dataclasses
 import functools
 import hashlib
 import os
+import re
+import subprocess
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -50,8 +56,18 @@ logger = init_logger(__name__)
 
 # The FlashInfer version every manifest in this package was taken from.
 STOCK_FLASHINFER_VERSION = "0.7.0.post1"
-# Left in the build directory of a shadow whose compilation failed.
+# Left in the build directory of a shadow that the compiler rejected.
 FAILED_MARKER = ".muse_shadow_failed"
+# Compiler output that blames the machine, not the source.
+_MACHINE_FAILURES = (
+    "No space left on device",
+    "Cannot allocate memory",
+    "Killed",
+    "died due to signal",
+    "Permission denied",
+    "Input/output error",
+    "Disk quota exceeded",
+)
 
 
 def flashinfer_data_dir() -> Path:
@@ -149,6 +165,45 @@ def derive_spec(
     )
 
 
+@functools.cache
+def toolchain() -> str | None:
+    """The CUDA toolkit that a build uses (None when it cannot be told)."""
+    from flashinfer.jit import cpp_ext
+
+    try:
+        version, path = cpp_ext.get_cuda_version(), cpp_ext.get_cuda_path()
+        return f"CUDA {version} at {path} {os.environ.get('FLASHINFER_NVCC', '')}"
+    except Exception:
+        return None
+
+
+def is_compile_failure(exc: BaseException) -> bool:
+    """Whether ``exc`` is the compiler rejecting the source, as opposed to the machine.
+
+    FlashInfer raises ``RuntimeError("Ninja build failed...")`` from the
+    ``CalledProcessError`` of ninja, with the compiler output in it. A compiler that
+    printed an error and exited, and nothing in the output that points at the
+    machine, is a failure that the same toolchain repeats.
+    """
+    cause = exc.__cause__
+    if not isinstance(cause, subprocess.CalledProcessError) or cause.returncode <= 0:
+        return False
+    output = str(cause.output or "")
+    return bool(re.search(r"\b(error|fatal)\b", output)) and not any(
+        text in output for text in _MACHINE_FAILURES
+    )
+
+
+def _remembered_failure(marker: Path) -> bool:
+    """Whether the marker is there and was left by the toolchain that runs now."""
+    try:
+        lines = marker.read_text().splitlines()
+    except OSError:
+        return False
+    current = toolchain()
+    return current is not None and bool(lines) and lines[0] == f"toolchain: {current}"
+
+
 def build_or_stock(shadow_spec: Any, stock_spec: Any, *, strict: bool = False) -> Any:
     """Compile and load ``shadow_spec`` now, so that a failure can fall back.
 
@@ -158,7 +213,7 @@ def build_or_stock(shadow_spec: Any, stock_spec: Any, *, strict: bool = False) -
     module with itself).
     """
     marker = shadow_spec.build_dir / FAILED_MARKER
-    if marker.exists():
+    if _remembered_failure(marker):
         if strict:
             raise RuntimeError(f"an earlier build of {shadow_spec.name} failed")
         logger.warning_once(
@@ -180,10 +235,19 @@ def build_or_stock(shadow_spec: Any, stock_spec: Any, *, strict: bool = False) -
             type(exc).__name__,
             exc,
         )
-        try:
-            marker.parent.mkdir(parents=True, exist_ok=True)
-            marker.write_text(f"{type(exc).__name__}: {exc}\n")
-        except OSError:
-            pass
+        current = toolchain()
+        if current is not None and is_compile_failure(exc):
+            try:
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                marker.write_text(
+                    f"toolchain: {current}\n{type(exc).__name__}: {exc}\n"
+                )
+            except OSError:
+                pass
         return stock_spec
+    # A marker that another toolchain left is out of date now.
+    try:
+        marker.unlink(missing_ok=True)
+    except OSError:
+        pass
     return shadow_spec
