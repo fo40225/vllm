@@ -62,6 +62,11 @@ class BaseSpeculator(ABC):
     num_query_per_req: int = 1
     # Extra query slots reserved per request outside the regular queries.
     num_extra_query_per_req: int = 0
+    # Whether the draft step builds all its attention metadata itself, from its own
+    # attention groups, and never reads the target runner's metadata of a draft layer.
+    # The target runner then builds no metadata for the attention groups of draft
+    # layers alone.
+    builds_own_attn_metadata: bool = False
 
     @abstractmethod
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:

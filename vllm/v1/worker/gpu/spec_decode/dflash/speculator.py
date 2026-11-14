@@ -37,6 +37,10 @@ logger = init_logger(__name__)
 
 class DFlashSpeculator(DraftModelSpeculator):
     _speculator_name = "DFlash"  # For logging, so we can share methods with subclasses
+    # propose() builds the draft attention metadata from this speculator's own groups
+    # (`_build_uniform_attn_metadata`, the graph capture) and ignores the metadata the
+    # target step built.
+    builds_own_attn_metadata = True
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         parallel_config = vllm_config.parallel_config

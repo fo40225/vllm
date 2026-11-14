@@ -692,8 +692,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 for layer_name in group.layer_names
             } - self.speculator.draft_attn_layer_names
         draft_attn_layer_names = None
+        unbuilt_attn_layer_names = None
         if isinstance(self.speculator, DraftModelSpeculator):
             draft_attn_layer_names = self.speculator.draft_attn_layer_names
+            if self.speculator.builds_own_attn_metadata:
+                unbuilt_attn_layer_names = draft_attn_layer_names
         # Metadata builders select attention kernels that need JIT warmup.
         with self.jit_warmup_registry.activate():
             (
@@ -705,6 +708,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.vllm_config,
                 self.device,
                 draft_layer_names=draft_attn_layer_names,
+                unbuilt_layer_names=unbuilt_attn_layer_names,
             )
         additional_attn_cg_support = self.model_state.get_additional_cg_support()
         attn_cg_support = attn_cg_support.narrow(*additional_attn_cg_support)
@@ -840,7 +844,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         """Build KV-block zeroing metadata; invoked from gpu_worker."""
         self.kv_block_zeroer = KVBlockZeroer(
             self.device,
-            attn_groups_iter=(g for groups in self.attn_groups for g in groups),
+            attn_groups_iter=(
+                g
+                for groups in self.attn_groups
+                + (
+                    self.speculator.attn_groups
+                    if getattr(self.speculator, "builds_own_attn_metadata", False)
+                    else []
+                )
+                for g in groups
+            ),
             kernel_block_sizes=self.kernel_block_sizes,
             static_forward_context=self.compilation_config.static_forward_context,
             num_blocks=self.kv_cache_config.num_blocks,

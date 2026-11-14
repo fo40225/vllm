@@ -218,12 +218,28 @@ def get_attn_group_key(
     )
 
 
+def drop_unbuilt_attn_groups(
+    attn_groups: list[list[AttentionGroup]], unbuilt_layer_names: set[str]
+) -> list[list[AttentionGroup]]:
+    """The groups with a layer outside ``unbuilt_layer_names``; the others are dropped.
+
+    A group of ``unbuilt_layer_names`` only gets no metadata builder and no metadata
+    per step. A kv cache group left without a group is skipped like a group without
+    layer views.
+    """
+    return [
+        [g for g in groups if not unbuilt_layer_names.issuperset(g.layer_names)]
+        for groups in attn_groups
+    ]
+
+
 def init_attn_backend(
     kv_cache_config: KVCacheConfig,
     vllm_config: VllmConfig,
     device: torch.device,
     active_layer_names: set[str] | None = None,
     draft_layer_names: set[str] | None = None,
+    unbuilt_layer_names: set[str] | None = None,
 ) -> tuple[list[list[AttentionGroup]], AttentionCGSupportInfo, list[int]]:
     # Phase 1: discover attention groups for each kv cache group.
     attn_groups: list[list[AttentionGroup]] = []
@@ -289,6 +305,13 @@ def init_attn_backend(
     # Phase 2: pick a kernel block size per kv cache group that is supported
     # by all backends within that group.
     kernel_block_sizes = prepare_kernel_block_sizes(kv_cache_config, attn_groups)
+
+    # The kernel block sizes above still count every layer: they fix the layout of the
+    # shared KV cache. Groups of layers whose metadata the caller builds elsewhere
+    # (the draft layers of a speculator with its own attention groups) are dropped
+    # only now, before their builders are made.
+    if unbuilt_layer_names:
+        attn_groups = drop_unbuilt_attn_groups(attn_groups, unbuilt_layer_names)
 
     if current_platform.is_xpu():
         for kv_cache_group_id, selected_kernel_block_size in enumerate(
