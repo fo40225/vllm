@@ -20,6 +20,7 @@ FLAG = "VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP"
 MIN_TOKENS = "VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_MIN_TOKENS"
 UBATCHES = "VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_UBATCHES"
 SP_MIN_TOKENS = "VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_MIN_TOKENS"
+SPEC_FLAG = "VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_SPECULATIVE"
 
 
 def _config(dbo_unsupported=(), dbo_fn=None, **parallel) -> SimpleNamespace:
@@ -149,7 +150,9 @@ def test_prefill_overlap_is_off_with_lora(monkeypatch, sm120_platform) -> None:
     assert MuseSparkConfig._prefill_overlap_blocker(config) is not None
 
 
-def _dbo_stub(method: str | None, tp_collective_overlap: bool = True):
+def _dbo_stub(
+    method: str | None, tp_collective_overlap: bool = True, adaptive: bool = False
+):
     """A config stub the real ``VllmConfig._get_dbo_unsupported_features`` can read."""
     from vllm.config import CUDAGraphMode
 
@@ -162,7 +165,11 @@ def _dbo_stub(method: str | None, tp_collective_overlap: bool = True):
         ),
         model_config=None,
         lora_config=None,
-        speculative_config=None if method is None else SimpleNamespace(method=method),
+        speculative_config=(
+            None
+            if method is None
+            else SimpleNamespace(method=method, enable_adaptive_verification=adaptive)
+        ),
         compilation_config=SimpleNamespace(
             cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE
         ),
@@ -170,13 +177,70 @@ def _dbo_stub(method: str | None, tp_collective_overlap: bool = True):
     )
 
 
-@pytest.mark.parametrize("method", ["dflash", "dspark"])
+def _spec_config(stub) -> SimpleNamespace:
+    return _config(
+        dbo_fn=lambda tp_collective_overlap=None: (
+            VllmConfig._get_dbo_unsupported_features(
+                stub, tp_collective_overlap=tp_collective_overlap
+            )
+        )
+    )
+
+
+def test_prefill_overlap_beside_a_drafter_is_an_explicit_opt_in(
+    monkeypatch, sm120_platform
+) -> None:
+    """The exact KV bytes of a speculative launch are derived with the overlap on or
+    off: without VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_SPECULATIVE a launch with a
+    drafter keeps its footprint (and its bytes), whatever the flag says."""
+    monkeypatch.setenv(FLAG, "1")
+    monkeypatch.delenv(SPEC_FLAG, raising=False)
+    stub = _dbo_stub("dflash")
+    config = _spec_config(stub)
+    config.speculative_config = stub.speculative_config
+    blocker = MuseSparkConfig._prefill_overlap_blocker(config)
+    assert blocker is not None and SPEC_FLAG in blocker
+    MuseSparkConfig.verify_and_update_config(config)
+    assert config.parallel_config.ubatch_size == 0
+    assert not config.parallel_config.ubatch_overlap_tp_collectives
+    # A launch without a drafter is not asked for it.
+    config = _config()
+    assert MuseSparkConfig._prefill_overlap_blocker(config) is None
+    monkeypatch.setenv(SPEC_FLAG, "1")
+    stub = _dbo_stub("dflash")
+    config = _spec_config(stub)
+    config.speculative_config = stub.speculative_config
+    assert MuseSparkConfig._prefill_overlap_blocker(config) is None
+
+
+@pytest.mark.parametrize(
+    ("method", "adaptive"), [("dspark", False), ("dflash", True), ("dspark", True)]
+)
+def test_prefill_overlap_stays_off_beside_unmeasured_dflash_family_launches(
+    monkeypatch, sm120_platform, method, adaptive
+) -> None:
+    """DSpark (no memory or speed run yet) and adaptive verification (trims the
+    dispatched token count of a step) are kept off even with the opt-in."""
+    monkeypatch.setenv(FLAG, "1")
+    monkeypatch.setenv(SPEC_FLAG, "1")
+    stub = _dbo_stub(method, adaptive=adaptive)
+    config = _spec_config(stub)
+    config.speculative_config = stub.speculative_config
+    blocker = MuseSparkConfig._prefill_overlap_blocker(config)
+    assert blocker is not None and f"'{method}'" in blocker
+    assert ("adaptive verification" in blocker) == adaptive
+    MuseSparkConfig.verify_and_update_config(config)
+    assert config.parallel_config.ubatch_size == 0
+
+
+@pytest.mark.parametrize("method", ["dflash"])
 def test_prefill_overlap_runs_beside_the_dflash_family_drafters(
     monkeypatch, sm120_platform, method
 ) -> None:
     """The drafters that build their own attention metadata and take the merged aux
     hidden states are no reason to keep the microbatched prefill off."""
     monkeypatch.setenv(FLAG, "1")
+    monkeypatch.setenv(SPEC_FLAG, "1")
     stub = _dbo_stub(method)
     config = _config(
         dbo_fn=lambda tp_collective_overlap=None: (
@@ -202,6 +266,7 @@ def test_prefill_overlap_stays_off_beside_a_drafter_that_reads_the_target_metada
 ) -> None:
     """A microbatched step builds no target attention metadata for the runner."""
     monkeypatch.setenv(FLAG, "1")
+    monkeypatch.setenv(SPEC_FLAG, "1")
     stub = _dbo_stub(method)
     config = _config(
         dbo_fn=lambda tp_collective_overlap=None: (
@@ -229,7 +294,7 @@ def test_generic_dbo_still_rejects_speculative_decoding(monkeypatch) -> None:
         assert any("speculative decoding" in item for item in unsupported)
         assert VllmConfig._get_dbo_unsupported_features(
             stub, tp_collective_overlap=True
-        ) == ([] if method != "eagle3" else unsupported)
+        ) == ([] if method == "dflash" else unsupported)
     assert VllmConfig._get_dbo_unsupported_features(_dbo_stub(None)) == []
 
 
@@ -672,8 +737,21 @@ def test_the_memory_profile_stays_whole_where_no_batch_is_split():
                     "num_speculative_tokens": 7,
                 },
             ),
-            {},
+            {SPEC_FLAG: "1"},
             True,
+        ),
+        (
+            "dflash2-default",
+            dict(
+                limit_mm_per_prompt="ZERO",
+                speculative_config={
+                    "method": "dflash",
+                    "model": "RadixArk/Muse-Spark-Open-DFlash2",
+                    "num_speculative_tokens": 7,
+                },
+            ),
+            {},
+            False,
         ),
         (
             "piecewise",

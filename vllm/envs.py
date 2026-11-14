@@ -162,6 +162,7 @@ if TYPE_CHECKING:
     VLLM_MUSE_SPARK_SM120_FUSED_GEMV: bool = True
     VLLM_MUSE_SPARK_SM120_ROUTER_GEMV: bool = True
     VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP: bool = True
+    VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_SPECULATIVE: bool = False
     VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_MIN_TOKENS: int = 2048
     VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_UBATCHES: int = 2
     VLLM_MUSE_SPARK_SM120_XQA_ACTIVE_MERGE: bool = True
@@ -1614,9 +1615,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # run-to-run deterministic and identical on all ranks, but not bitwise equal to
     # the unsplit batch (rounding-level differences, as with the sequence-parallel
     # stream). Needs the V2 model runner, SM120, expert parallel, TP > 1, PP = DP = 1
-    # and no speculative decoding other than the DFlash family (DFlash2, DSpark: the
-    # drafter builds its own attention metadata and takes the merged auxiliary hidden
-    # states, a verify batch is never split), LoRA, multimodal inputs (all
+    # and no speculative decoding (except the DFlash family, see
+    # VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_SPECULATIVE), LoRA, multimodal inputs (all
     # modalities capped at zero by --limit-mm-per-prompt), PIECEWISE CUDA graphs,
     # context parallelism or VLLM_BATCH_INVARIANT: on such a launch the flag has no
     # effect (a warning if it was set explicitly), it never changes the model runner
@@ -1624,12 +1624,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the experts; what stays is a second set of FlashInfer metadata builders (about
     # 0.17 GiB per rank) and the activations of two halves in flight. The memory
     # profile runs the split batch too, so a launch without --kv-cache-memory-bytes
-    # sizes its KV cache for them (RadixArk DFlash2 K=7: 4.6 % fewer tokens before the
-    # scratch is shared); with exact bytes the speculative profile needs 145 MiB less
-    # KV per rank (10,373,877,760 instead of 10,526,351,360 bytes) to keep the S1-7
-    # slack.
+    # sizes its KV cache for them.
     "VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP": lambda: bool(
         int(os.getenv("VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP", "1"))
+    ),
+    # Muse Spark on SM120: let VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP run beside
+    # speculative decoding of the DFlash family (method dflash: DFlash2). Off by
+    # default: the exact --kv-cache-memory-bytes of a speculative launch (S1-7) are
+    # derived with the overlap off, and with it on the persistent footprint is
+    # larger (RadixArk DFlash2 K=7, mns 128: 145 MiB per rank, 10,373,877,760 instead
+    # of 10,526,351,360 bytes at the S1-7 slack), so each launch line that turns it on
+    # needs its bytes derived again. The drafter builds its own attention metadata
+    # and takes the merged auxiliary hidden states; verify rows (1 + K tokens each)
+    # are never split off their step. 8185-token chunk: -13 % forward time.
+    "VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_SPECULATIVE": lambda: bool(
+        int(os.getenv("VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_SPECULATIVE", "0"))
     ),
     # Muse Spark on SM120: smallest eager batch (in tokens) that is split when
     # VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP is on. Raised to at least the number of

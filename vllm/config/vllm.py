@@ -153,7 +153,9 @@ PerformanceMode = Literal["balanced", "interactivity", "throughput"]
 # does not read it: DFlashSpeculator builds the draft metadata from its own groups
 # (builds_own_attn_metadata) and takes the target's aux hidden states, which the
 # runner merges back in row order. Every other drafter reads the target metadata.
-DBO_TP_OVERLAP_SPEC_METHODS = ("dflash", "dspark")
+# DSpark (same drafter family, e2e-checked) is left out until its memory and speed
+# are measured beside microbatches.
+DBO_TP_OVERLAP_SPEC_METHODS = ("dflash",)
 
 IS_QUANTIZED = False
 # The optimizations that depend on these properties currently set to False
@@ -3312,14 +3314,21 @@ class VllmConfig:
 
         if self.lora_config is not None:
             unsupported.append("dual batch overlap with LoRA")
-        if self.speculative_config is not None and not (
-            tp_collective_overlap
-            and self.speculative_config.method in DBO_TP_OVERLAP_SPEC_METHODS
-        ):
-            unsupported.append(
-                "dual batch overlap with speculative decoding "
-                f"(method '{self.speculative_config.method}')"
-            )
+        spec_config = self.speculative_config
+        if spec_config is not None:
+            adaptive = bool(spec_config.enable_adaptive_verification)
+            # Adaptive verification trims the draft budget (and the dispatched
+            # token count) of a step: not run beside microbatches.
+            if not (
+                tp_collective_overlap
+                and spec_config.method in DBO_TP_OVERLAP_SPEC_METHODS
+                and not adaptive
+            ):
+                unsupported.append(
+                    "dual batch overlap with speculative decoding "
+                    f"(method '{spec_config.method}'"
+                    + (", adaptive verification)" if adaptive else ")")
+                )
         if parallel_config.pipeline_parallel_size > 1:
             unsupported.append("dual batch overlap with pipeline parallelism")
         if (

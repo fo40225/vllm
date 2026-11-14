@@ -97,6 +97,16 @@ class MuseSparkConfig(VerifyAndUpdateConfig):
             return "it needs pipeline and data parallel sizes of 1"
         if pc.use_ubatching:
             return "microbatching is already configured"
+        if (
+            vllm_config.speculative_config is not None
+            and not envs.VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_SPECULATIVE
+        ):
+            # Its footprint moves the exact KV bytes of the launch line: opt in.
+            return (
+                "speculative decoding needs "
+                "VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_SPECULATIVE=1 (the KV cache "
+                "bytes of such a launch are derived with it on or off)"
+            )
         if vllm_config.lora_config is not None:
             return "it does not support LoRA"
         # The microbatches share the kernel scratch of the experts (one workspace
