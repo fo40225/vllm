@@ -680,12 +680,12 @@ class _SequenceParallelRowGate:
     the 1992 sizes from 512 to 16384 tokens in steps of 8, 100 pass on 8 RTX PRO
     6000 (4104-4224, 5312-5472, 6920-7168 and 8008-8224: among them the full
     8192-token prefill chunk and the chunks that decode tokens fill up), and at the
-    others up to 95% of the router logits differ in the last bit. The kernel choice depends on the shapes and not on the values, so the
-    check runs the three projections of one layer on random inputs of the real
-    shapes, once per batch size, and compares the rows. Every other op of the
-    sharded stream is a row-wise kernel of fixed configuration (identical at any
-    size) or a collective with the guarantee ``tp_reduce_scatter_matches_all_reduce``
-    asks for.
+    others up to 95% of the router logits differ in the last bit. The kernel choice
+    depends on the shapes and not on the values, so the check runs the three
+    projections of one layer on random inputs of the real shapes, once per batch
+    size, and compares the rows. Every other op of the sharded stream is a row-wise
+    kernel of fixed configuration (identical at any size) or a collective with the
+    guarantee ``tp_reduce_scatter_matches_all_reduce`` asks for.
     """
 
     # Admitted sizes that are logged at info level; the rest at debug level.

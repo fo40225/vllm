@@ -808,13 +808,9 @@ class MuseSparkSm120NvFp4Experts(mk.FusedMoEExpertsModular):
         for the launch that ``apply`` makes, and does nothing where ``apply`` would
         not run the muse kernel. Returns whether a prefetch was queued.
         """
-        if not (
-            self.use_muse_decode
-            and self.muse is not None
-            and _capturing()
-            and topk_ids.shape[0]
-            <= min(self.muse.max_tokens, EXPERT_PREFETCH_MAX_TOKENS)
-        ):
+        if not (self.use_muse_decode and self.muse is not None and _capturing()):
+            return False
+        if topk_ids.shape[0] > min(self.muse.max_tokens, EXPERT_PREFETCH_MAX_TOKENS):
             return False
         self.muse.prefetch(
             topk_ids,
