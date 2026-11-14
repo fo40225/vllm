@@ -350,6 +350,31 @@ def test_engine_serves_every_padded_token_count(layer: _Layer) -> None:
 
 
 @torch.inference_mode()
+def test_engine_bulk_loader_flag_follows_the_environment(
+    layer: _Layer, monkeypatch
+) -> None:
+    """VLLM_MUSE_SPARK_SM120_LARGE_BULK_LOADER (default off) makes the engine launch
+    the large-batch kernel with the bulk loader; the rows are the same bit for bit
+    at every token count (the small-batch kernel does not read the flag)."""
+    monkeypatch.delenv("VLLM_MUSE_SPARK_SM120_LARGE_BULK_LOADER", raising=False)
+    plain = _Engine(layer)
+    assert plain.engine._large_flags == 0
+    monkeypatch.setenv("VLLM_MUSE_SPARK_SM120_LARGE_BULK_LOADER", "1")
+    bulk = _Engine(layer)
+    assert bulk.engine._large_flags != 0
+    ids_all = _ids_cases(MUSE_MAX_TOKENS, 8)["all_local"]
+    u_all = _routing(MUSE_MAX_TOKENS, 8)[0]
+    for t in (1, 8, 9, 33, MUSE_MAX_TOKENS):
+        want_rows, want_perm = plain.run(u_all[:t], ids_all[:t])
+        want_rows, want_perm = want_rows.clone(), want_perm.clone()
+        rows, perm = bulk.run(u_all[:t], ids_all[:t])
+        assert torch.equal(perm, want_perm), t
+        assert torch.equal(
+            rows[perm >= 0].view(torch.int16), want_rows[perm >= 0].view(torch.int16)
+        ), t
+
+
+@torch.inference_mode()
 def test_engine_limit_follows_the_environment(layer: _Layer, monkeypatch) -> None:
     """VLLM_MUSE_SPARK_SM120_DECODE_MAX_TOKENS lowers the largest served batch
     (8: the small-batch kernel only, which then never launches the large one)."""

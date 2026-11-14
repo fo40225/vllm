@@ -148,8 +148,10 @@ void nvfp4_decode_moe(at::Tensor const& hidden, at::Tensor const& topk_ids,
 //   [>= T, 256] u8 the quantized activations (scratch, written by the first
 //   launch), plan (int32, >= 6084 entries) and ctl (int32, >= 322 entries, zero it
 //   once, every launch leaves it zero) as above. flags: 4 = zero the rows
-//   of non-local routes, 8 = no programmatic dependent launches; bits 16..
-//   override the grid size of the persistent kernel.
+//   of non-local routes, 8 = no programmatic dependent launches, 16 = the loader
+//   warp fetches the B operand with bulk copies (the scratch above must be 16-byte
+//   aligned, as it is for every launch); bits 16.. override the grid size of the
+//   persistent kernel.
 void nvfp4_decode_moe_large(
     at::Tensor const& hidden, at::Tensor const& topk_ids,
     std::optional<at::Tensor> const& expert_map, at::Tensor const& w13,

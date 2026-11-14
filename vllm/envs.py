@@ -145,6 +145,7 @@ if TYPE_CHECKING:
         "auto"
     )
     VLLM_MUSE_SPARK_SM120_DECODE_MAX_TOKENS: int = 128
+    VLLM_MUSE_SPARK_SM120_LARGE_BULK_LOADER: bool = False
     VLLM_MUSE_SPARK_SM120_EXACT_GEMM1: bool = True
     VLLM_MUSE_SPARK_SM120_PREFILL_LOCAL_ROWS: bool = True
     VLLM_MUSE_SPARK_SM120_PREFILL_LATENT_FP4: bool = True
@@ -1353,6 +1354,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # not change between a CUDA graph capture and its replay.
     "VLLM_MUSE_SPARK_SM120_DECODE_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_MUSE_SPARK_SM120_DECODE_MAX_TOKENS", "128")
+    ),
+    # Muse Spark on SM120: let the loader warp of the large-batch decode kernel (9..128
+    # tokens) fetch the B operand of every pipeline stage (the quantized activations
+    # of GEMM1, the intermediate of GEMM2) with one bulk copy per route column instead
+    # of a cp.async per 16 bytes. For an expert with 9 or more routes in the batch the
+    # loop of cp.asyncs keeps the warp busy and the weight ring waits for it: such an
+    # expert is 17-34% faster with the bulk copies (kernel, cold L2), a layer of the
+    # real routing at 64 / 96 / 128 tokens 0.7 / 1.9 / 1.8%, a layer without one is
+    # unchanged. The bytes in shared memory, and so the rows, are the same bit for
+    # bit. Read once, when a layer's decode engine is prepared, so it must not change
+    # between a CUDA graph capture and its replay.
+    "VLLM_MUSE_SPARK_SM120_LARGE_BULK_LOADER": lambda: bool(
+        int(os.getenv("VLLM_MUSE_SPARK_SM120_LARGE_BULK_LOADER", "0"))
     ),
     # Muse Spark on SM120: run GEMM1 of the CUTLASS grouped-GEMM NVFP4 MoE with
     # the gate and up global weight scales apart (one group per half, and the

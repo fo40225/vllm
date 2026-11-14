@@ -22,6 +22,7 @@ import torch.nn.functional as F
 
 from tests.kernels.muse_spark_pdl_utils import slow_copy, synchronize_or_exit
 from vllm import _custom_ops as ops
+from vllm import envs
 from vllm.model_executor.layers.fused_moe.utils import remap_topk_to_local
 from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
     swizzle_blockscale,
@@ -66,6 +67,15 @@ FLAG_TWO_LAUNCH = 1
 FLAG_CTL_MEMSET = 2
 FLAG_ZERO_NON_LOCAL = 4
 FLAG_NO_PDL = 8
+FLAG_LARGE_BULK = 16  # the loader warp of the large-batch kernel uses bulk copies
+# What the large-batch launches of the tests use unless they say otherwise (the
+# whole file runs with the bulk loader under VLLM_MUSE_SPARK_SM120_LARGE_BULK_LOADER=1).
+LARGE_DEFAULT_FLAGS = (
+    FLAG_LARGE_BULK if envs.VLLM_MUSE_SPARK_SM120_LARGE_BULK_LOADER else 0
+)
+LOADERS = pytest.mark.parametrize(
+    "loader", [0, FLAG_LARGE_BULK], ids=["cp_async", "bulk"]
+)
 FP8_MAX = 448.0
 FP4_MAX = 6.0
 NIB_RMS = 2.9269  # RMS of a uniformly random e2m1 code
@@ -261,14 +271,17 @@ class _Engine:
 
     def run(
         self, u, ids, dbg=None, t_pad=None, flags=0, xq=None, expert_map="map",
-        large=None, gs=None,
+        large=None, gs=None, loader=None,
     ):  # fmt: skip
         """The small-batch op up to 8 tokens, the large-batch one beyond (or when
-        ``large``)."""
+        ``large``). The large-batch op also gets the loader flag ``loader``
+        (0 or ``FLAG_LARGE_BULK``; default ``LARGE_DEFAULT_FLAGS``)."""
         t = u.shape[0]
         if large is None:
             large = t > 8
         self.last_large = large
+        if large:
+            flags |= LARGE_DEFAULT_FLAGS if loader is None else loader
         lay = self.layer
         emap = lay.expert_map if expert_map == "map" else expert_map
         gs = lay.gs if gs is None else gs
@@ -627,8 +640,11 @@ def _valid(rows: torch.Tensor, perm: torch.Tensor):
 
 
 @pytest.mark.parametrize("t", [1, 2, 4, 8, 16, MAX_LARGE_T])
+@LOADERS
 @torch.inference_mode()
-def test_bitwise_deterministic_eager_and_graph(layer: _Layer, t: int) -> None:
+def test_bitwise_deterministic_eager_and_graph(
+    layer: _Layer, t: int, loader: int
+) -> None:
     engine = _Engine(layer)
     inputs = []
     for i in range(6):
@@ -638,21 +654,21 @@ def test_bitwise_deterministic_eager_and_graph(layer: _Layer, t: int) -> None:
                 t, [1 + (i + k) % 5 for k in range(t)], 60 + i, layer.e_local
             )
         inputs.append((u, ids))
-    ref = [_valid(*engine.run(u, ids)) for u, ids in inputs]
+    ref = [_valid(*engine.run(u, ids, loader=loader)) for u, ids in inputs]
     for i in range(50):
-        got = _valid(*engine.run(*inputs[i % 2]))
+        got = _valid(*engine.run(*inputs[i % 2], loader=loader))
         assert torch.equal(got[0], ref[i % 2][0]) and torch.equal(got[1], ref[i % 2][1])
 
     u_s, ids_s = inputs[0][0].clone(), inputs[0][1].clone()
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side):
-        engine.run(u_s, ids_s)
+        engine.run(u_s, ids_s, loader=loader)
     torch.cuda.current_stream().wait_stream(side)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        rows, perm = engine.run(u_s, ids_s)
+        rows, perm = engine.run(u_s, ids_s, loader=loader)
     for i in range(60):
         k = i % len(inputs)
         u_s.copy_(inputs[k][0])
@@ -847,13 +863,21 @@ def test_launch_variants_are_bitwise_equal(layer: _Layer, t: int) -> None:
     xq_data, xq_sf = ops.scaled_fp4_quant(u, gs0, is_sf_swizzled_layout=False)
     xq = (xq_data.view(torch.uint8).contiguous(), xq_sf.view(torch.uint8).contiguous())
     for name, ids in _ids_cases(t, 161, layer.e_local).items():
-        ref = _valid(*engine.run(u, ids))
+        ref = _valid(*engine.run(u, ids, loader=0))
         variants = {
             "no_pdl": dict(flags=FLAG_NO_PDL),
             "grid_1": dict(flags=1 << 16),
             "grid_7": dict(flags=7 << 16),
             "grid_400": dict(flags=400 << 16),
         }
+        if t > 8:
+            variants |= {
+                "bulk": dict(loader=FLAG_LARGE_BULK),
+                "bulk_no_pdl": dict(flags=FLAG_NO_PDL, loader=FLAG_LARGE_BULK),
+                "bulk_grid_1": dict(flags=1 << 16, loader=FLAG_LARGE_BULK),
+                "bulk_grid_7": dict(flags=7 << 16, loader=FLAG_LARGE_BULK),
+                "bulk_grid_400": dict(flags=400 << 16, loader=FLAG_LARGE_BULK),
+            }
         if t <= 8:
             variants |= {
                 "two_launch": dict(flags=FLAG_TWO_LAUNCH),
@@ -869,22 +893,26 @@ def test_launch_variants_are_bitwise_equal(layer: _Layer, t: int) -> None:
             assert torch.equal(got[1], ref[1]), (name, vname)
             assert engine.counters_are_zero(), (name, vname)
         rows, perm = engine.out_buffers(t)
-        rows.fill_(float("nan"))
-        engine.run(u, ids, flags=FLAG_ZERO_NON_LOCAL)
-        assert torch.equal(rows[perm >= 0].view(torch.int16), ref[0])
-        assert bool((rows[perm < 0].view(torch.int16) == 0).all())
-        for grid in (1, 5):  # fewer CTAs than routes
+        for loader in (0, FLAG_LARGE_BULK):
             rows.fill_(float("nan"))
-            engine.run(u, ids, flags=FLAG_ZERO_NON_LOCAL | (grid << 16))
+            engine.run(u, ids, flags=FLAG_ZERO_NON_LOCAL, loader=loader)
             assert torch.equal(rows[perm >= 0].view(torch.int16), ref[0])
             assert bool((rows[perm < 0].view(torch.int16) == 0).all())
+            for grid in (1, 5):  # fewer CTAs than routes
+                rows.fill_(float("nan"))
+                engine.run(
+                    u, ids, flags=FLAG_ZERO_NON_LOCAL | (grid << 16), loader=loader
+                )
+                assert torch.equal(rows[perm >= 0].view(torch.int16), ref[0])
+                assert bool((rows[perm < 0].view(torch.int16) == 0).all())
 
 
 @pytest.mark.parametrize("t", [1, 2, 4, 8, 16, 64])
 @pytest.mark.parametrize("use_graph", [False, True])
+@LOADERS
 @torch.inference_mode()
 def test_persistent_kernel_waits_for_the_routing_and_the_norm(
-    layer: _Layer, t: int, use_graph: bool, capfd
+    layer: _Layer, t: int, use_graph: bool, loader: int, capfd
 ) -> None:
     """The kernel is a programmatic dependent of the kernel before it in the stream
     (the routing, or the pre-expert norm when the routing runs on the aux stream and
@@ -896,7 +924,7 @@ def test_persistent_kernel_waits_for_the_routing_and_the_norm(
     engine = _Engine(layer)
     u, _, _ = _routing(t, 170)
     ids = _ids_cases(t, 171, layer.e_local)["three_local"]
-    ref = _valid(*engine.run(u, ids, flags=FLAG_NO_PDL))
+    ref = _valid(*engine.run(u, ids, flags=FLAG_NO_PDL, loader=loader))
     stale_u, _, _ = _routing(t, 172)
     stale_ids = _ids_cases(t, 173, layer.e_local)["all_local"]
 
@@ -904,7 +932,7 @@ def test_persistent_kernel_waits_for_the_routing_and_the_norm(
 
     def step():
         slow_copy((u_in, u), (ids_in, ids))
-        return engine.run(u_in, ids_in)
+        return engine.run(u_in, ids_in, loader=loader)
 
     def restore():
         u_in.copy_(stale_u)
@@ -987,9 +1015,10 @@ def test_large_batch_rows_equal_the_small_batch_kernel(
 
 
 @pytest.mark.parametrize("routes", [1, 7, 8, 9, 15, 16, 17, 24, 31, 33, 48])
+@LOADERS
 @torch.inference_mode()
 def test_large_batch_experts_at_the_entry_boundaries(
-    layer: _Layer, routes: int
+    layer: _Layer, routes: int, loader: int
 ) -> None:
     """An expert with 1..48 routes: one entry, or two (a second column group, then a
     second entry) from 9, 17 and 33 routes on; the rows are the small-batch kernel's
@@ -1001,7 +1030,7 @@ def test_large_batch_experts_at_the_entry_boundaries(
     ids[:routes, 0] = 3
     ids[-6:, 1] = 5  # a second expert with a few routes
     want = _small_batch_rows(engine, u, ids)
-    got = engine.run(u, ids)
+    got = engine.run(u, ids, loader=loader)
     _assert_rows_equal(got, want, routes)
     plan = engine.plan_tables()
     by_expert = {e: 0 for e in (3, 5)}
@@ -1009,6 +1038,113 @@ def test_large_batch_experts_at_the_entry_boundaries(
         by_expert[plan["expert"][g]] += 1
     assert by_expert[3] == -(-routes // LARGE_ENTRY_COLS)
     assert by_expert[5] == 1
+    assert engine.counters_are_zero()
+
+
+def _zipf_ids(
+    t: int, seed: int, e_local: int, exponent: float, n_local: int = 8
+) -> torch.Tensor:
+    """Every token routes to ``n_local`` distinct local experts drawn with a power-law
+    popularity (the first experts are hot: 9 or more routes, several entries) and to
+    8 - ``n_local`` non-local ones."""
+    g = torch.Generator().manual_seed(7000 + seed)
+    popularity = 1.0 / torch.arange(1, e_local + 1).float() ** exponent
+    out = torch.empty(t, TOP_K, dtype=torch.int32)
+    for i in range(t):
+        loc = torch.multinomial(popularity, n_local, generator=g)
+        non = torch.randperm(E_GLOBAL - e_local, generator=g)[: TOP_K - n_local]
+        row = torch.cat([loc, e_local + non])[torch.randperm(TOP_K, generator=g)]
+        out[i] = row.to(torch.int32)
+    return out.cuda()
+
+
+def _poison_scratch(engine: _Engine, t: int) -> None:
+    """Everything the large-batch launch writes before it reads it: a loader that
+    reads the intermediate or the activations too early, or never, sees this."""
+    engine.out_buffers(t)[0].fill_(float("nan"))
+    for scratch in (engine.hq_data, engine.hq_sf, engine.xq_data, engine.xq_sf):
+        scratch.fill_(0xFF)
+    engine.plan.fill_(0x7FFFFFFF)
+
+
+def _run_poisoned(engine: _Engine, u, ids, **kwargs):
+    _poison_scratch(engine, u.shape[0])
+    rows, perm = engine.run(u, ids, **kwargs)
+    return rows.clone(), perm.clone()
+
+
+@pytest.mark.parametrize("pdl", [True, False], ids=["pdl", "no_pdl"])
+@pytest.mark.parametrize("up_first", [False, True])
+@pytest.mark.parametrize("t", [9, 10, 12, 16, 17, 24, 33, 48, 64, 96, MAX_LARGE_T])
+@torch.inference_mode()
+def test_large_batch_bulk_loader_rows_equal_the_cp_async_loader(
+    layer: _Layer, t: int, up_first: bool, pdl: bool
+) -> None:
+    """The loader warp's bulk copies put the same bytes in shared memory as its
+    cp.async loop, so every route's row is the same bit for bit: uniform and skewed
+    routings, experts with 1..16 routes (a bulk copy per column of the entry) and
+    with more (several entries), launched with and without PDL. The scratch is
+    poisoned before every launch, so a read of the intermediate before the GEMM1
+    units that write it have finished would show."""
+    engine = _Engine(layer, up_first)
+    u, _, _ = _routing(t, 250)
+    flags = 0 if pdl else FLAG_NO_PDL
+    cases = _ids_cases(t, 251, layer.e_local)
+    cases["busy"] = _local_ids(
+        t, [min(8, 2 + k % 7) for k in range(t)], 252, layer.e_local
+    )
+    cases["zipf"] = _zipf_ids(t, 253, layer.e_local, 1.0)
+    cases["zipf_steep"] = _zipf_ids(t, 254, layer.e_local, 2.0, n_local=4)
+    for name, ids in cases.items():
+        want = _run_poisoned(engine, u, ids, flags=flags, loader=0)
+        for rep in range(3):
+            got = _run_poisoned(engine, u, ids, flags=flags, loader=FLAG_LARGE_BULK)
+            _assert_rows_equal(got, want, (name, t, rep))
+            assert engine.counters_are_zero(), (name, t, rep)
+
+
+@torch.inference_mode()
+def test_large_batch_bulk_loader_is_race_free_over_many_launches(
+    layer: _Layer,
+) -> None:
+    """Hot experts at 64 and 128 tokens, 150 launches each with the scratch poisoned
+    in front: the rows never differ from those of the cp.async loader."""
+    engine = _Engine(layer)
+    for t, exponent in ((64, 1.0), (MAX_LARGE_T, 1.4)):
+        u, _, _ = _routing(t, 255)
+        ids = _zipf_ids(t, 256, layer.e_local, exponent)
+        want = _run_poisoned(engine, u, ids, loader=0)
+        bad = 0
+        for _ in range(150):
+            got = _run_poisoned(engine, u, ids, loader=FLAG_LARGE_BULK)
+            bad += not (
+                torch.equal(got[1], want[1])
+                and torch.equal(
+                    got[0][want[1] >= 0].view(torch.int16),
+                    want[0][want[1] >= 0].view(torch.int16),
+                )
+            )
+        assert bad == 0, (t, bad)
+
+
+@LOADERS
+@pytest.mark.parametrize("name", ["hq_data", "hq_sf", "xq_data", "xq_sf"])
+@torch.inference_mode()
+def test_large_batch_rejects_misaligned_scratch(
+    layer: _Layer, name: str, loader: int
+) -> None:
+    """Both loaders copy 16 bytes at least: a scratch tensor that is not 16-byte
+    aligned (a view at an odd offset) is an error, not a fault in the kernel."""
+    engine = _Engine(layer)
+    good = getattr(engine, name)
+    flat = torch.zeros(good.numel() + 16, dtype=torch.uint8, device="cuda")
+    setattr(engine, name, flat[8 : 8 + good.numel()].view(good.shape))
+    u, ids, _ = _routing(24, 260)
+    with pytest.raises(RuntimeError, match="16-byte aligned"):
+        engine.run(u, ids, loader=loader)
+    setattr(engine, name, good)
+    want = _small_batch_rows(engine, u, ids)
+    _assert_rows_equal(engine.run(u, ids, loader=loader), want, name)
     assert engine.counters_are_zero()
 
 
@@ -1058,19 +1194,22 @@ def test_large_batch_plan_is_a_deterministic_partition_of_the_local_routes(
             assert again["route"][g][:cnt] == plan["route"][g][:cnt], name
 
 
+@LOADERS
 @torch.inference_mode()
-def test_large_batch_poisoned_scratch_does_not_matter(layer: _Layer) -> None:
+def test_large_batch_poisoned_scratch_does_not_matter(
+    layer: _Layer, loader: int
+) -> None:
     engine = _Engine(layer)
     t = 40
     u, _, _ = _routing(t, 220)
     ids = _ids_cases(t, 221, layer.e_local)["random"]
-    base = _valid(*engine.run(u, ids))
+    base = _valid(*engine.run(u, ids, loader=loader))
     rows, perm = engine.out_buffers(t)
     rows.fill_(float("nan"))
     for scratch in (engine.hq_data, engine.hq_sf, engine.xq_data, engine.xq_sf):
         scratch.fill_(0xFF)
     engine.plan.fill_(0x7FFFFFFF)
-    engine.run(u, ids)
+    engine.run(u, ids, loader=loader)
     assert torch.isnan(rows[perm < 0].float()).all()  # untouched
     got = _valid(rows, perm)
     assert torch.equal(got[0], base[0]) and torch.equal(got[1], base[1])
@@ -1091,7 +1230,7 @@ def test_large_batch_poisoned_scratch_does_not_matter(layer: _Layer) -> None:
             engine.sf13[e].view(torch.uint8).fill_(0xFF)
             layer.sf2[e].view(torch.uint8).fill_(0xFF)
     try:
-        got = _valid(*engine.run(u, ids))
+        got = _valid(*engine.run(u, ids, loader=loader))
     finally:
         for e, (a, b, c, d) in saved.items():
             layer.w13[e].copy_(a)

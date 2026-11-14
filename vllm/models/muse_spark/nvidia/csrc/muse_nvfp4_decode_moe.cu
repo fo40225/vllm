@@ -68,6 +68,7 @@ constexpr int kHalfBytes = kRowBytes / 2;  // one K half of a row
 constexpr int kW13Rows = 2 * kInter;
 constexpr int kSfCols = kHidden / 16;  // scale columns of a weight row
 constexpr int kKTiles = kHidden / 64;  // K64 tiles of a row (64 scale words)
+constexpr int kHalfSfBytes = kSfCols / 2;  // the scales of one K half of a row
 constexpr int kMaxEntries = 64;
 constexpr int kMaxCols = 64;
 // Large-batch engine (k_prep + k_persistent<..., true>): tokens and entries it
@@ -95,6 +96,9 @@ constexpr int kFlagTwoLaunch = 1;       // plan B: K1 + K2 instead of k_persiste
 constexpr int kFlagCtlMemset = 2;       // zero the counters with a memset node
 constexpr int kFlagZeroNonLocal = 4;    // zero the rows of non-local routes
 constexpr int kFlagNoPdl = 8;           // no PDL: K2 / k_persistent are plain launches
+// Large-batch kernel: the loader warp fetches the B operand with one bulk copy per
+// column and K half instead of a cp.async per 16 bytes (same bytes in shared memory).
+constexpr int kFlagLargeBulkLoader = 16;
 
 // ---- shared memory layout ---------------------------------------------------
 #ifndef MUSE_DECODE_STAGES
@@ -938,19 +942,28 @@ void launch_persistent(const DecodeParams& p, int grid, cudaStream_t stream) {
 }
 
 // Large batches: k_prep, then the persistent kernel as its programmatic dependent.
-void launch_large(const DecodeParams& p, int grid, cudaStream_t stream) {
+template <bool BULK>
+void launch_large_kernels(const DecodeParams& p, int grid, cudaStream_t stream) {
   static std::atomic<int> attr{0};
   constexpr int kSmem = smem_bytes_persist<kLargeMaxTokens, true>();
-  ensure_smem_checked(k_persistent<kLargeMaxTokens, true>, kSmem, attr);
+  ensure_smem_checked(k_persistent<kLargeMaxTokens, true, BULK>, kSmem, attr);
   const int prep_grid = 1 + (p.T + kPrepRowsPerCta - 1) / kPrepRowsPerCta;
   if (!(p.flags & kFlagNoPdl)) {
     launch_dependent(k_prep, p, prep_grid, 0, stream, kPrepThreads);
-    launch_dependent(k_persistent<kLargeMaxTokens, true>, p, grid, kSmem, stream);
+    launch_dependent(k_persistent<kLargeMaxTokens, true, BULK>, p, grid, kSmem, stream);
   } else {
     k_prep<<<prep_grid, kPrepThreads, 0, stream>>>(p);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    k_persistent<kLargeMaxTokens, true><<<grid, kBlockThreads, kSmem, stream>>>(p);
+    k_persistent<kLargeMaxTokens, true, BULK><<<grid, kBlockThreads, kSmem, stream>>>(p);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+}
+
+void launch_large(const DecodeParams& p, int grid, cudaStream_t stream) {
+  if (p.flags & kFlagLargeBulkLoader) {
+    launch_large_kernels<true>(p, grid, stream);
+  } else {
+    launch_large_kernels<false>(p, grid, stream);
   }
 }
 
@@ -1125,6 +1138,12 @@ void nvfp4_decode_moe_large(
   check_tensor(xq_sf, at::kByte, "xq_sf", {-1, kSfCols});
   TORCH_CHECK(xq_data.size(0) >= T && xq_sf.size(0) >= T,
               "activation scratch must hold one row per token");
+  // The loader warp copies whole rows of these in 16-byte pieces or bulk copies; the
+  // pitch of a row is a multiple of 16 bytes, so the base must be aligned.
+  for (const at::Tensor* t : {&hq_data, &hq_sf, &xq_data, &xq_sf}) {
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(t->data_ptr()) % 16 == 0,
+                "the intermediate and activation scratch must be 16-byte aligned");
+  }
   check_tensor(plan, at::kInt, "plan", {-1});
   TORCH_CHECK(plan.numel() * 4 >= static_cast<int64_t>(sizeof(PlanLarge)),
               "plan scratch is too small");

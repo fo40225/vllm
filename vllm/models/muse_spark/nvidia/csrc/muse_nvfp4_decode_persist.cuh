@@ -42,6 +42,16 @@
 // kernel's bit for bit. (An entry has kEntryCols columns, MMA column groups of 8
 // that share the A fragments of a K64 slice; the ring has fewer stages because
 // the B operand slots take the shared memory the activations took.)
+//
+// Loader of the B operand. By default warp 5 issues a cp.async of 16 bytes per
+// piece of the stage (up to 72 per column: 64 of codes, 8 of scales), every lane
+// with a division and a shuffle in its way: for an entry of 9..16 routes that is
+// 1152 copies per stage and the warp, not the DRAM, bounds the kernel. With BULK
+// (kFlagLargeBulkLoader) a stage is one bulk copy per column and K half, 1 KB of
+// codes (lanes 0..cnt-1) and 128 B of scales (lanes cnt..2 cnt-1), landing in
+// the same shared memory layout; the warp's arrival on the full barrier is one
+// arrive.expect_tx of all the bytes. The bytes in shared memory are the same, so
+// the consumers and the results are unchanged.
 
 constexpr int kCtlTicket = 0;
 constexpr int kCtlExit = 1;
@@ -104,9 +114,29 @@ __device__ __forceinline__ const PlanLarge& plan_of(PlanStorage<true>&,
   return *reinterpret_cast<const PlanLarge*>(p.plan);
 }
 
-template <int T_PAD, bool LARGE>
+// Bulk copies of the B operand of one stage, by the loader warp (BULK): one per
+// column and K half, 1 KB of codes by lane n < cnt into column slot n and 128 B of
+// scales by lane cnt + n into the scale slot of column n. `src` is the lane's own
+// source (read by the copying lanes only). Lane 0 arrives on the stage's full
+// barrier (the barrier counts one arrival for this warp) with the bytes of every
+// copy, before any copy is issued.
+template <int CMAX>
+__device__ __forceinline__ void load_columns_bulk(int lane, int cnt, uint32_t fb,
+                                                  uint8_t* hs, const uint8_t* src) {
+  if (lane == 0) mbar_arrive_expect_tx(fb, cnt * (kHalfBytes + kHalfSfBytes));
+  __syncwarp();
+  if (lane < cnt) {
+    bulk_copy_g2s(smem_u32(hs + lane * kHPitch), src, kHalfBytes, fb);
+  } else if (lane < 2 * cnt) {
+    bulk_copy_g2s(smem_u32(hs + CMAX * kHPitch + (lane - cnt) * kHsfPitch), src,
+                  kHalfSfBytes, fb);
+  }
+}
+
+template <int T_PAD, bool LARGE, bool BULK = false>
 __global__ void __launch_bounds__(kBlockThreads, 1)
     k_persistent(const DecodeParams p) {
+  static_assert(LARGE || !BULK, "the bulk loader is the large-batch kernel's");
   constexpr int CMAX = cols_of<T_PAD, LARGE>();
   constexpr int NG = groups_of<T_PAD, LARGE>();  // MMA column groups of an entry
   constexpr int NST = stages_of<LARGE>();        // ring stages
@@ -146,7 +176,9 @@ __global__ void __launch_bounds__(kBlockThreads, 1)
 
   if (tid == 0) {
     for (int i = 0; i < NST; ++i) {
-      mbar_init(smem_u32(&full[i]), 1 + 32 + 32);
+      // Arrivals: the producer's expect_tx, the 32 cp.async arrivals of its lanes and
+      // those of the loader's (32, or one expect_tx arrival of lane 0 with BULK).
+      mbar_init(smem_u32(&full[i]), 1 + 32 + (BULK ? 1 : 32));
       mbar_init(smem_u32(&empty[i]), 4);
       mbar_init(smem_u32(&hdr_ready[i]), 1);
     }
@@ -273,6 +305,12 @@ __global__ void __launch_bounds__(kBlockThreads, 1)
     // ---- loader of the GEMM2 B operand (the intermediate hq); with LARGE also of
     // the GEMM1 B operand (the quantized activations) ----
     bool xq_released = LARGE;
+    // A stage's B operand slot is rewritten only after the consumers released it (their
+    // empty arrival, then the producer's hdr_ready), as with the cp.async loads. The
+    // bulk copies read global memory in the async proxy: the activations were written
+    // by k_prep, which has completed (griddepcontrol.wait above), the intermediate by
+    // other CTAs of this grid (fenced at the first stage of every GEMM2 unit below).
+    if constexpr (BULK) fence_proxy_async_global();
     for (int st = 0;; ++st) {
       const int slot = st % NST;
       mbar_wait(smem_u32(&hdr_ready[slot]), (st / NST) & 1);
@@ -296,21 +334,36 @@ __global__ void __launch_bounds__(kBlockThreads, 1)
           }
           __syncwarp();
           fence_acq_rel_gpu();
+          // The stores of the other CTAs are generic-proxy writes, the copies below
+          // are async-proxy reads: each copying lane orders them.
+          if constexpr (BULK) fence_proxy_async_global();
         }
         const int cnt = plan.cnt[g];
         const int col0 = plan.col0[g];
         uint8_t* hs = uni + slot * (CMAX * kHcolBytes);
-        for (int idx = lane; idx < cnt * 72; idx += 32) {
-          const int n = idx / 72;
-          const int ch = idx - n * 72;
-          if (ch < 64) {
-            cp_async_16(smem_u32(hs + n * kHPitch + ch * 16),
-                        p.hq_data + static_cast<size_t>(col0 + n) * kRowBytes +
-                            s * kHalfBytes + ch * 16);
-          } else {
-            cp_async_16(smem_u32(hs + CMAX * kHPitch + n * kHsfPitch + (ch - 64) * 16),
-                        p.hq_sf + static_cast<size_t>(col0 + n) * kSfCols + s * 128 +
-                            (ch - 64) * 16);
+        if constexpr (BULK) {
+          // Lane n < cnt: codes of hq row col0 + n; lane cnt + n: its scales.
+          const int n = lane < cnt ? lane : lane - cnt;
+          const uint8_t* src =
+              lane < cnt ? p.hq_data + static_cast<size_t>(col0 + n) * kRowBytes +
+                               s * kHalfBytes
+                         : p.hq_sf + static_cast<size_t>(col0 + n) * kSfCols +
+                               s * kHalfSfBytes;
+          load_columns_bulk<CMAX>(lane, cnt, fb, hs, src);
+        } else {
+          for (int idx = lane; idx < cnt * 72; idx += 32) {
+            const int n = idx / 72;
+            const int ch = idx - n * 72;
+            if (ch < 64) {
+              cp_async_16(smem_u32(hs + n * kHPitch + ch * 16),
+                          p.hq_data + static_cast<size_t>(col0 + n) * kRowBytes +
+                              s * kHalfBytes + ch * 16);
+            } else {
+              cp_async_16(
+                  smem_u32(hs + CMAX * kHPitch + n * kHsfPitch + (ch - 64) * 16),
+                  p.hq_sf + static_cast<size_t>(col0 + n) * kSfCols + s * 128 +
+                      (ch - 64) * 16);
+            }
           }
         }
       } else if (LARGE && !stop) {
@@ -319,30 +372,48 @@ __global__ void __launch_bounds__(kBlockThreads, 1)
         const int g = static_cast<int>(ticket >> 8);
         const int kh = s & 1;
         const int cnt = plan.cnt[g];
-        // The token of every column of the entry: lane n loads that of column n,
-        // the copy loop below takes it from there.
-        const int col_tok = lane < cnt ? plan.route[g][lane] >> 3 : 0;
         uint8_t* hs = uni + slot * (CMAX * kHcolBytes);
-        for (int base = 0; base < cnt * 72; base += 32) {
-          const int idx = base + lane;
-          const int n = idx / 72;
-          const int ch = idx - n * 72;
-          const int tok = __shfl_sync(0xffffffffu, col_tok, n);
-          if (idx < cnt * 72) {
-            if (ch < 64) {
-              cp_async_16(smem_u32(hs + n * kHPitch + ch * 16),
-                          p.xq_buf + static_cast<size_t>(tok) * kRowBytes +
-                              kh * kHalfBytes + ch * 16);
-            } else {
-              cp_async_16(
-                  smem_u32(hs + CMAX * kHPitch + n * kHsfPitch + (ch - 64) * 16),
-                  p.xq_sf_buf + static_cast<size_t>(tok) * kSfCols + kh * 128 +
-                      (ch - 64) * 16);
+        if constexpr (BULK) {
+          // Lane n < cnt: codes of the token of column n; lane cnt + n: its scales.
+          const int n = lane < cnt ? lane : lane - cnt;
+          const int tok = lane < 2 * cnt ? plan.route[g][n] >> 3 : 0;
+          const uint8_t* src =
+              lane < cnt ? p.xq_buf + static_cast<size_t>(tok) * kRowBytes +
+                               kh * kHalfBytes
+                         : p.xq_sf_buf + static_cast<size_t>(tok) * kSfCols +
+                               kh * kHalfSfBytes;
+          load_columns_bulk<CMAX>(lane, cnt, fb, hs, src);
+        } else {
+          // The token of every column of the entry: lane n loads that of column n,
+          // the copy loop below takes it from there.
+          const int col_tok = lane < cnt ? plan.route[g][lane] >> 3 : 0;
+          for (int base = 0; base < cnt * 72; base += 32) {
+            const int idx = base + lane;
+            const int n = idx / 72;
+            const int ch = idx - n * 72;
+            const int tok = __shfl_sync(0xffffffffu, col_tok, n);
+            if (idx < cnt * 72) {
+              if (ch < 64) {
+                cp_async_16(smem_u32(hs + n * kHPitch + ch * 16),
+                            p.xq_buf + static_cast<size_t>(tok) * kRowBytes +
+                                kh * kHalfBytes + ch * 16);
+              } else {
+                cp_async_16(
+                    smem_u32(hs + CMAX * kHPitch + n * kHsfPitch + (ch - 64) * 16),
+                    p.xq_sf_buf + static_cast<size_t>(tok) * kSfCols + kh * 128 +
+                        (ch - 64) * 16);
+              }
             }
           }
         }
       }
-      cp_async_arrive_noinc(fb);
+      if constexpr (BULK) {
+        // A stage that loaded bulk copies has arrived with its expect_tx; the stop
+        // stage carries no bytes: one plain arrival.
+        if (stop && lane == 0) mbar_arrive(fb);
+      } else {
+        cp_async_arrive_noinc(fb);
+      }
       if (stop) break;
     }
   } else {

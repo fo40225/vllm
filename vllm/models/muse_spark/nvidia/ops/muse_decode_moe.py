@@ -65,6 +65,7 @@ MUSE_TOP_K = 8
 # Flags of the ops, see muse_c_ops.h.
 _FLAG_ZERO_NON_LOCAL = 4
 _FLAG_NO_PDL = 8
+_FLAG_LARGE_BULK_LOADER = 16  # only the large-batch op reads it
 # Scratch of the large-batch kernel: one row per route of the largest batch.
 _MAX_ROUTES = MUSE_MAX_TOKENS * MUSE_TOP_K
 
@@ -253,6 +254,8 @@ class MuseDecodeMoE:
         self._gs = gs.float().contiguous()
         self._up_first = up_first
         self._flags = _FLAG_ZERO_NON_LOCAL if zero_non_local else 0
+        bulk_loader = envs.VLLM_MUSE_SPARK_SM120_LARGE_BULK_LOADER
+        self._large_flags = _FLAG_LARGE_BULK_LOADER if bulk_loader else 0
         self._sources = self._pointers(w1, w1_scale, w2, w2_scale)
         # The first launch of each shape sets up its kernel (the shared memory
         # attribute), which must not happen during a CUDA graph capture.
@@ -390,7 +393,7 @@ class MuseDecodeMoE:
                 scratch.xq_sf,
                 scratch.plan,
                 scratch.ctl,
-                flags,
+                flags | self._large_flags,
             )
             return rows, perm_idx
         t_pad = _padded_tokens(num_tokens)

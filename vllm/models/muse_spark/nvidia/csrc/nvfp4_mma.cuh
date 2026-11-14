@@ -175,5 +175,12 @@ __device__ __forceinline__ void fence_acq_rel_gpu() {
   asm volatile("fence.acq_rel.gpu;" ::: "memory");
 }
 
+// Orders the global memory accesses of the calling thread that came before (the
+// ones an acquire made visible to it included) ahead of the bulk copies it issues
+// after: those run in the async proxy, the stores of other CTAs in the generic one.
+__device__ __forceinline__ void fence_proxy_async_global() {
+  asm volatile("fence.proxy.async.global;" ::: "memory");
+}
+
 }  // namespace nvfp4
 }  // namespace muse_spark
