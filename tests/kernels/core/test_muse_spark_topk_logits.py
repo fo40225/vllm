@@ -190,12 +190,12 @@ def resolve(monkeypatch, enabled=True, tp=8, k=None, last_pp=True, **kwargs):
     return MuseSpark1xForCausalLM._resolve_topk_logits_k(model)
 
 
-def test_the_flag_is_off_by_default(monkeypatch):
+def test_the_flag_is_on_by_default(monkeypatch):
     monkeypatch.delenv(FLAG, raising=False)
     monkeypatch.delenv(FLAG_K, raising=False)
     from vllm import envs
 
-    assert envs.VLLM_MUSE_SPARK_SM120_TOPK_LOGITS is False
+    assert envs.VLLM_MUSE_SPARK_SM120_TOPK_LOGITS is True
     assert envs.VLLM_MUSE_SPARK_SM120_TOPK_LOGITS_K == 64
     assert envs.VLLM_MUSE_SPARK_SM120_TOPK_LOGITS_MIN_TOKENS == 2
 
