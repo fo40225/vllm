@@ -3,6 +3,7 @@
 import json
 from typing import TYPE_CHECKING
 
+import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.utils.math_utils import round_up
 
@@ -69,6 +70,78 @@ class AliceAIForCausalLMConfig(VerifyAndUpdateConfig):
                 "AliceAI does not support speculative method "
                 f"{speculative_method!r} because it requires auxiliary hidden states"
             )
+
+
+class MuseSparkConfig(VerifyAndUpdateConfig):
+    @staticmethod
+    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        MuseSparkConfig._maybe_enable_prefill_overlap(vllm_config)
+
+    @staticmethod
+    def _prefill_overlap_blocker(vllm_config: "VllmConfig") -> str | None:
+        """Why the microbatched prefill cannot run on this launch, None if it can."""
+        from vllm.platforms import current_platform
+
+        pc = vllm_config.parallel_config
+        if not (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability_family(120)
+        ):
+            return "the device is not SM120"
+        if pc.tensor_parallel_size <= 1:
+            return "it needs tensor parallelism"
+        if not pc.enable_expert_parallel:
+            return "it needs --enable-expert-parallel"
+        if pc.pipeline_parallel_size != 1 or pc.data_parallel_size != 1:
+            return "it needs pipeline and data parallel sizes of 1"
+        if pc.use_ubatching:
+            return "microbatching is already configured"
+        if vllm_config.speculative_config is not None:
+            return "it does not support speculative decoding"
+        if vllm_config.lora_config is not None:
+            return "it does not support LoRA"
+        if envs.VLLM_USE_V2_MODEL_RUNNER is False:
+            return "it needs the V2 model runner"
+        return None
+
+    @staticmethod
+    def _maybe_enable_prefill_overlap(vllm_config: "VllmConfig") -> None:
+        """Microbatch the eager prefill batches (VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP).
+
+        The V2 runner splits a batch into microbatches that alternate at the TP
+        collectives, which then run on a side stream. Only batches of at least
+        ``dbo_prefill_token_threshold`` tokens are split and never a decode batch
+        (an unreachable decode threshold), so CUDA graphs are untouched.
+        """
+        if not envs.VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP:
+            return
+        blocker = MuseSparkConfig._prefill_overlap_blocker(vllm_config)
+        if blocker is not None:
+            logger.warning(
+                "VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP is set but ignored: %s.",
+                blocker,
+            )
+            return
+        pc = vllm_config.parallel_config
+        # The microbatches hand off at every collective, so both halves must take
+        # the same model path: keep them above the token thresholds of the model
+        # (the sequence-parallel minimum, the CUDA-graph range, the decode-sized
+        # fused kernels).
+        num_ubatches = max(envs.VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_UBATCHES, 2)
+        floor = num_ubatches * (
+            max(envs.VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_MIN_TOKENS, 1024) + 1
+        )
+        pc.ubatch_size = num_ubatches
+        pc.dbo_prefill_token_threshold = max(
+            envs.VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_MIN_TOKENS, floor
+        )
+        pc.dbo_decode_token_threshold = 2**31 - 1
+        logger.info(
+            "MuseSpark SM120: prefill batches of at least %d tokens run as %d "
+            "microbatches that overlap their collectives with each other's compute.",
+            pc.dbo_prefill_token_threshold,
+            num_ubatches,
+        )
 
 
 class DeepseekV32ForCausalLM(VerifyAndUpdateConfig):
@@ -1248,6 +1321,8 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "MiniMaxM3SparseForConditionalGeneration": (
         MiniMaxM3SparseForConditionalGenerationConfig
     ),
+    "MuseSpark1xForCausalLM": MuseSparkConfig,
+    "MuseSparkForConditionalGeneration": MuseSparkConfig,
     "NemotronHForCausalLM": NemotronHForCausalLMConfig,
     "NemotronHPuzzleForCausalLM": NemotronHForCausalLMConfig,
     "NemotronH_Nano_VL_V2": NemotronHNanoVLV2Config,

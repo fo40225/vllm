@@ -153,6 +153,9 @@ if TYPE_CHECKING:
     VLLM_MUSE_SPARK_SM120_L2_PREFETCH_AFTER_EXPERTS_CTAS: int = 4
     VLLM_MUSE_SPARK_SM120_EXPERT_PREFETCH: bool = True
     VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY: bool = True
+    VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP: bool = False
+    VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_MIN_TOKENS: int = 4096
+    VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_UBATCHES: int = 2
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
     VLLM_ROCM_USE_AITER_LINEAR_HIPBMM: bool = False
     VLLM_ROCM_USE_AITER_MOE: bool = True
@@ -1461,6 +1464,32 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # constructed.
     "VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY": lambda: bool(
         int(os.getenv("VLLM_MUSE_SPARK_SM120_FUSED_BOUNDARY", "1"))
+    ),
+    # Muse Spark on SM120: split every eager batch of at least
+    # VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_MIN_TOKENS tokens into two microbatches
+    # (the second one starts mid-request where a request straddles the split) and
+    # run their tensor-parallel collectives on a side stream, so the collectives of
+    # one microbatch overlap the compute of the other. The model runs twice on half
+    # the rows: GEMM tilings and the attention split differ, so the outputs are
+    # run-to-run deterministic but not bitwise equal to the unsplit batch. Decode and
+    # CUDA-graph batches are untouched. Needs the V2 model runner, SM120, expert
+    # parallel, TP > 1, PP = DP = 1 and no speculative decoding, LoRA or multimodal
+    # inputs; with another layout the flag is ignored with a warning.
+    "VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP": lambda: bool(
+        int(os.getenv("VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP", "0"))
+    ),
+    # Muse Spark on SM120: smallest eager batch (in tokens) that is split when
+    # VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP is on. Raised to at least four times the
+    # sequence-parallel threshold plus the CUDA-graph range, so that both halves
+    # take the same model path (the microbatches hand off at every collective and
+    # must issue the same number of them).
+    "VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_MIN_TOKENS": lambda: int(
+        os.getenv("VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_MIN_TOKENS", "4096")
+    ),
+    # Muse Spark on SM120: number of microbatches of
+    # VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP.
+    "VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_UBATCHES": lambda: int(
+        os.getenv("VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_UBATCHES", "2")
     ),
     # use aiter linear op if aiter ops are enabled
     # The following list of related ops
