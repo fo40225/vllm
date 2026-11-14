@@ -87,6 +87,7 @@ from vllm.models.muse_spark.nvidia.sm120_nvfp4_moe import (
     fold_sm120_nvfp4_scales,
     make_sm120_nvfp4_quant_config,
     packed_nvfp4_input,
+    rebind_sm120_block_scales,
     select_decode_engine,
     swap_gate_up_halves_,
 )
@@ -839,9 +840,16 @@ class MuseSparkModelOptNvFp4FusedMoE(ModelOptNvFp4FusedMoE):
             layer.w2_weight_scale_2.data,
             layer.w2_input_scale.data,
         )
-        # Swapping the parameters frees the linear block scales.
+        # The swizzled block scales replace the linear ones in the parameters, and
+        # the quant config reads the parameters' own tensors, so there is one copy.
         replace_parameter(layer, "w13_weight_scale", w13_scale)
         replace_parameter(layer, "w2_weight_scale", w2_scale)
+        self.moe_quant_config = rebind_sm120_block_scales(
+            self.moe_quant_config,
+            layer.w13_weight_scale.data,
+            layer.w2_weight_scale.data,
+        )
+        del w13_scale, w2_scale
         self.moe_kernel = make_nvfp4_moe_kernel(
             moe_quant_config=self.moe_quant_config,
             moe_config=self.moe,

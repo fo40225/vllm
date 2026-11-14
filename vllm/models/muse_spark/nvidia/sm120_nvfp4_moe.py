@@ -259,8 +259,8 @@ def make_sm120_nvfp4_quant_config(
     will read, i.e. swapped by ``swap_gate_up_halves_`` if they are. Returns the
     swizzled w13 / w2 block scales and the quant config. Only the (small) block
     scales are copied: the checkpoint's global scales are left untouched. The
-    caller replaces the linear block scales with the returned ones, which frees
-    them.
+    caller replaces the linear block scales with the returned ones and rebinds
+    the config to the replaced parameters (``rebind_sm120_block_scales``).
     """
     hidden = w2_weight_scale.shape[1]
     intermediate = w2_weight_scale.shape[2] * 16
@@ -286,6 +286,27 @@ def make_sm120_nvfp4_quant_config(
         is_scale_swizzled=True,
     )
     return w13_swizzled, w2_swizzled, quant_config
+
+
+def rebind_sm120_block_scales(
+    quant_config: FusedMoEQuantConfig, w13_scale: torch.Tensor, w2_scale: torch.Tensor
+) -> FusedMoEQuantConfig:
+    """The quant config of ``make_sm120_nvfp4_quant_config`` on other block scales.
+
+    ``replace_parameter`` copies the swizzled scales into the layer's existing
+    parameters when the shapes agree (v0.33.0), so the tensors the config was
+    built on are a second copy. The caller rebinds the config to the parameters'
+    own tensors, which lets the swizzled temporaries go.
+    """
+    return nvfp4_moe_quant_config(
+        g1_alphas=quant_config.g1_alphas,
+        g2_alphas=quant_config.g2_alphas,
+        a1_gscale=quant_config.a1_gscale,
+        a2_gscale=quant_config.a2_gscale,
+        w1_scale=w13_scale,
+        w2_scale=w2_scale,
+        is_scale_swizzled=True,
+    )
 
 
 # The decode engines a layer can be built for, in the order ``auto`` tries them.
