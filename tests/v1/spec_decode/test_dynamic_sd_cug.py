@@ -517,3 +517,81 @@ def test_dflash_family_draft_manager_has_a_single_tier(monkeypatch, speculator_p
     descs = manager._capture_descs[CUDAGraphMode.FULL]
     assert descs
     assert {desc.uniform_token_count for desc in descs} == {8}
+
+
+def _draft_manager(monkeypatch, manager_cls, *, num_reqs_cap: int = 16):
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    monkeypatch.setattr(
+        gpu_cudagraph_utils.current_platform,
+        "get_global_graph_pool",
+        lambda: None,
+    )
+    vllm_config = _create_vllm_config_for_dsd(
+        max_num_seqs=num_reqs_cap,
+        max_spec_tokens=7,
+        cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
+        use_dynamic_sd=False,
+    )
+    manager = manager_cls(
+        vllm_config=vllm_config,
+        device=torch.device("cpu"),
+        cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
+        decode_query_len=8,
+        dynamic_decode_query_len=False,
+    )
+    manager._graphs_captured = True
+    warnings = MagicMock()
+    monkeypatch.setattr(gpu_cudagraph_utils, "logger", warnings)
+    return manager, warnings.warning
+
+
+def test_draft_manager_warns_once_on_a_dispatch_miss_inside_its_range(monkeypatch):
+    """A draft block that stops being 1 + K tokens per request misses the only tier."""
+    from vllm.v1.worker.gpu.spec_decode.dflash.cudagraph import DFlashCudaGraphManager
+
+    manager, warning = _draft_manager(monkeypatch, DFlashCudaGraphManager)
+
+    # The full block hits the captured graph.
+    desc = manager.dispatch(
+        num_reqs=4, num_tokens=32, uniform_token_count=8, num_active_loras=0
+    )
+    assert desc.cg_mode == CUDAGraphMode.FULL
+    warning.assert_not_called()
+
+    # A shorter block has no graph: eager, and one warning however often it recurs.
+    for _ in range(3):
+        desc = manager.dispatch(
+            num_reqs=4, num_tokens=16, uniform_token_count=4, num_active_loras=0
+        )
+        assert desc.cg_mode == CUDAGraphMode.NONE
+    warning.assert_called_once()
+    assert "inside its captured range" in warning.call_args.args[0]
+
+
+def test_draft_manager_is_silent_beyond_its_captured_range(monkeypatch):
+    from vllm.v1.worker.gpu.spec_decode.dflash.cudagraph import DFlashCudaGraphManager
+
+    manager, warning = _draft_manager(monkeypatch, DFlashCudaGraphManager)
+
+    beyond = 16 * 8 + 8  # more requests than the manager captures
+    desc = manager.dispatch(
+        num_reqs=17, num_tokens=beyond, uniform_token_count=8, num_active_loras=0
+    )
+    assert desc.cg_mode == CUDAGraphMode.NONE
+    warning.assert_not_called()
+
+
+def test_other_managers_do_not_warn_on_a_dispatch_miss(monkeypatch):
+    """The target manager misses all the time (prefill batches): no warning."""
+    assert gpu_cudagraph_utils.CudaGraphManager.warn_on_dispatch_miss is False
+    manager, warning = _draft_manager(monkeypatch, gpu_cudagraph_utils.CudaGraphManager)
+
+    desc = manager.dispatch(
+        num_reqs=4, num_tokens=16, uniform_token_count=4, num_active_loras=0
+    )
+    assert desc.cg_mode == CUDAGraphMode.NONE
+    warning.assert_not_called()

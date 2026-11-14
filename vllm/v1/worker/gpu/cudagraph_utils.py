@@ -7,7 +7,7 @@ from collections.abc import Callable, Hashable, Iterable, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from itertools import groupby, product
-from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, Protocol
 
 import torch
 import torch.nn as nn
@@ -148,6 +148,11 @@ def has_compiled_submodule(model: nn.Module) -> bool:
 
 
 class CudaGraphManager:
+    # A manager whose caller always asks for a shape it captured sets this: a dispatch
+    # that misses inside the captured token range then means a shape the capture did
+    # not cover (a draft block that varies per batch), and the step runs eagerly.
+    warn_on_dispatch_miss: ClassVar[bool] = False
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -187,6 +192,7 @@ class CudaGraphManager:
         self.pool = current_platform.get_global_graph_pool() if cudagraph_mode else None
 
         self._graphs_captured = False
+        self._dispatch_miss_warned = False
 
         # Profiling hooks, set only by profile_cudagraph_memory() below: cap
         # FULL-mode capture at the N largest descriptors and record each
@@ -551,6 +557,17 @@ class CudaGraphManager:
                     num_ubatches,
                 ):
                     return desc
+            if self.warn_on_dispatch_miss and not self._dispatch_miss_warned:
+                self._dispatch_miss_warned = True
+                logger.warning(
+                    "%s found no captured CUDA graph for %d requests, %d tokens "
+                    "(uniform token count %s) inside its captured range: such a step "
+                    "runs eagerly (logged once).",
+                    type(self).__name__,
+                    num_reqs,
+                    num_tokens,
+                    uniform_token_count,
+                )
         return BatchExecutionDescriptor(
             cg_mode=CUDAGraphMode.NONE,
             num_tokens=num_tokens,

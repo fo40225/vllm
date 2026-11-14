@@ -76,6 +76,9 @@ class DFlashCudaGraphManager(CudaGraphManager):
     """DFlash CudaGraphManager for the parallel-drafting query forward,
     building its own attention metadata from scratch."""
 
+    # Every draft step is a uniform batch of ``decode_query_len`` tokens per request.
+    warn_on_dispatch_miss = True
+
     def capture(
         self,
         forward_fn: Callable,
