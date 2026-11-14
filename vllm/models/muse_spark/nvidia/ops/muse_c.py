@@ -533,10 +533,18 @@ def load() -> None:
 
 
 def _allocate_experts_quant_outputs(
-    m_numtopk: int, k: int, topk: int, device: torch.device
+    m_numtopk: int, k: int, topk: int, num_experts: int, device: torch.device
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Output buffers of the experts quantization of ``m_numtopk`` rows of width
-    ``k``, sized like the stock wrapper does."""
+    ``k`` over ``num_experts`` experts.
+
+    The scale buffer is sized by the batch, as ``gather_scaled_fp4_experts_quant``
+    sizes its own: every expert's scales start at a multiple of 128 rows, so
+    ``m_numtopk + 128 * num_experts`` rows hold them all. The stock wrapper takes
+    ``VLLM_MAX_TOKENS_PER_EXPERT_FP4_MOE * topk`` rows on every call, 320 MiB at
+    the default of 163840 tokens per expert, which is live in every MoE layer and,
+    with two microbatches in flight, twice at once.
+    """
     # Control the maximum number of tokens per expert supported by the
     # NVFP4 MoE Expert Quantization (see the stock wrapper).
     MAX_TOKENS_PER_EXPERT = envs.VLLM_MAX_TOKENS_PER_EXPERT_FP4_MOE
@@ -552,7 +560,10 @@ def _allocate_experts_quant_outputs(
     # output is uint8 and packed fp4 values
     output = torch.empty(m_numtopk, k // 2, device=device, dtype=torch.uint8)
     output_scales = torch.empty(
-        MAX_TOKENS_PER_EXPERT * topk, padded_k, dtype=torch.int32, device=device
+        min(MAX_TOKENS_PER_EXPERT * topk, m_numtopk + 128 * num_experts),
+        padded_k,
+        dtype=torch.int32,
+        device=device,
     )
     return output, output_scales
 
@@ -710,7 +721,11 @@ def mul_and_silu_scaled_fp4_experts_quant(
     m_numtopk, k_times_2 = input_tensor.shape
     assert k_times_2 % 2 == 0, "input width must be even (up || gate layout)"
     output, output_scales = _allocate_experts_quant_outputs(
-        m_numtopk, k_times_2 // 2, topk, input_tensor.device
+        m_numtopk,
+        k_times_2 // 2,
+        topk,
+        expert_offsets.shape[0] - 1,
+        input_tensor.device,
     )
     torch.ops._muse_C.mul_and_silu_scaled_fp4_experts_quant(
         output,
@@ -759,7 +774,7 @@ def silu_and_mul_split_scaled_fp4_experts_quant(
     rows, k = input_tensor.shape
     assert rows % 2 == 0, "input must hold two stacked halves"
     output, output_scales = _allocate_experts_quant_outputs(
-        rows // 2, k, topk, input_tensor.device
+        rows // 2, k, topk, expert_offsets.shape[0] - 1, input_tensor.device
     )
     torch.ops._muse_C.silu_and_mul_split_scaled_fp4_experts_quant(
         output,
