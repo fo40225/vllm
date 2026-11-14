@@ -139,6 +139,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_CUSTOM_AR: bool = True
     VLLM_ROCM_MUSE_MOE_REDUCE_DTYPE: str = "fp32"
     VLLM_ROCM_MUSE_MOE_ONLINE_QUANT: str = ""
+    VLLM_MUSE_SPARK_FUSED_KERNELS: bool = True
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
     VLLM_ROCM_USE_AITER_LINEAR_HIPBMM: bool = False
     VLLM_ROCM_USE_AITER_MOE: bool = True
@@ -1281,6 +1282,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ROCM_MUSE_MOE_ONLINE_QUANT": lambda: os.getenv(
         "VLLM_ROCM_MUSE_MOE_ONLINE_QUANT", ""
     ).lower(),
+    # Muse Spark: use the fused CUDA kernels of vllm-project/vllm#62132 (the
+    # logit soft-cap and the QK-norm + RoPE + KV-insert) from torch.ops._C, or
+    # from the JIT-built _muse_C extension on SM12x when the prebuilt _C lacks
+    # them. Set to 0 to force the unfused PyTorch paths, e.g. for A/B tests.
+    "VLLM_MUSE_SPARK_FUSED_KERNELS": lambda: bool(
+        int(os.getenv("VLLM_MUSE_SPARK_FUSED_KERNELS", "1"))
+    ),
     # use aiter linear op if aiter ops are enabled
     # The following list of related ops
     # - scaled_mm (per-tensor / rowwise)

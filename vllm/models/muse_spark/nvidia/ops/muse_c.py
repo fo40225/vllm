@@ -5,7 +5,9 @@
 The sources live in ``../csrc`` and are compiled on first use with
 ``torch.utils.cpp_extension.load``; importing this module never builds.
 The kernels target SM12x (NVFP4 instructions) and are registered in the
-``_muse_C`` torch library. To add a kernel, put its ``.cu`` file in ``csrc``,
+``_muse_C`` torch library. It also carries the two attention ops of
+vllm-project/vllm#62132 for builds whose ``torch.ops._C`` lacks them; the
+model picks between the two with ``common.ops.resolve_compiled_op``. To add a kernel, put its ``.cu`` file in ``csrc``,
 declare it in ``muse_c_ops.h``, register it in ``muse_c_bindings.cpp`` and
 append the file to ``_SOURCES``.
 
@@ -36,7 +38,12 @@ logger = init_logger(__name__)
 _EXT_NAME = "_muse_C"
 _CSRC_DIR = Path(__file__).resolve().parent.parent / "csrc"
 # Compiled into the extension.
-_SOURCES = ("muse_c_bindings.cpp", "muse_nvfp4_experts_quant.cu")
+_SOURCES = (
+    "muse_c_bindings.cpp",
+    "muse_nvfp4_experts_quant.cu",
+    "muse_spark_mul_tanh_soft_cap.cu",
+    "muse_spark_qknorm_rope_kv_insert.cu",
+)
 _CSRC_SUFFIXES = (".cpp", ".cu", ".cuh", ".h")
 # The NVFP4 e2m1 conversion instructions need an sm_120 capable nvcc.
 _MIN_NVCC_VERSION = (12, 8)
@@ -242,6 +249,68 @@ def _build_and_load(
     Path(build_dir, _BUILT_MARKER).write_text(os.path.basename(library))
 
 
+_fakes_registered: set[str] = set()
+
+
+def _op_defined(name: str) -> bool:
+    try:
+        getattr(torch.ops._muse_C, name)
+    except (AttributeError, RuntimeError):
+        return False
+    return True
+
+
+def _register_fakes() -> None:
+    """Fake (meta) implementations, so torch.compile can trace the ops.
+
+    The attention ops only mutate their arguments and return nothing, like the
+    stock ``torch.ops._C`` versions they mirror. Each fake is registered once
+    per process, and only if the loaded library defines the op.
+    """
+    if "muse_spark_mul_tanh_soft_cap" not in _fakes_registered and _op_defined(
+        "muse_spark_mul_tanh_soft_cap"
+    ):
+
+        @torch.library.register_fake("_muse_C::muse_spark_mul_tanh_soft_cap")
+        def _muse_spark_mul_tanh_soft_cap_fake(
+            out: torch.Tensor,
+            input: torch.Tensor,
+            multiplier: float,
+            soft_cap_temp: float,
+        ) -> None:
+            return None
+
+        _fakes_registered.add("muse_spark_mul_tanh_soft_cap")
+
+    if (
+        "fused_muse_spark_qknorm_rope_kv_insert" not in _fakes_registered
+        and _op_defined("fused_muse_spark_qknorm_rope_kv_insert")
+    ):
+
+        @torch.library.register_fake("_muse_C::fused_muse_spark_qknorm_rope_kv_insert")
+        def _fused_muse_spark_qknorm_rope_kv_insert_fake(
+            qkv: torch.Tensor,
+            positions: torch.Tensor,
+            num_heads: int,
+            num_kv_heads: int,
+            head_dim: int,
+            eps: float,
+            cos_sin_cache: torch.Tensor | None,
+            rotary_dim: int,
+            slot_mapping: torch.Tensor | None,
+            kv_cache: torch.Tensor | None,
+            block_size: int,
+            kv_cache_dtype: str,
+            k_scale: torch.Tensor | None = None,
+            v_scale: torch.Tensor | None = None,
+            q_fp8_out: torch.Tensor | None = None,
+            q_scale: torch.Tensor | None = None,
+        ) -> None:
+            return None
+
+        _fakes_registered.add("fused_muse_spark_qknorm_rope_kv_insert")
+
+
 def load() -> None:
     """Load the `_muse_C` library, building it on the first use of a cache dir.
 
@@ -265,6 +334,11 @@ def load() -> None:
             _load_error = e
             raise
         _loaded = True
+    # Outside the failure-latching path: a missing fake must not poison load().
+    try:
+        _register_fakes()
+    except Exception:
+        logger.warning("Could not register _muse_C fake ops", exc_info=True)
 
 
 def mul_and_silu_scaled_fp4_experts_quant(

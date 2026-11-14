@@ -6,13 +6,13 @@ Not a custom op since ``MuseSpark1xModel`` is ``@ignore_torch_compile``;
 re-enabling compile requires hiding the forward-context lookup from dynamo.
 """
 
-from typing import Any
-
 import torch
 
-from vllm import _custom_ops as ops
 from vllm.config import get_current_vllm_config
 from vllm.model_executor.layers.attention.attention import get_attention_context
+from vllm.models.muse_spark.common.ops import resolve_compiled_op
+
+_FUSED_KV_INSERT_OP = "fused_muse_spark_qknorm_rope_kv_insert"
 
 # nvfp4 pages a different layout and keeps the unfused path.
 SUPPORTED_KV_CACHE_DTYPES = frozenset(
@@ -24,7 +24,9 @@ def supports_fused_kv_insert(attn_layer: torch.nn.Module) -> bool:
     """Whether this attention layer's backend and cache can take the insert.
 
     The backend must keep its KV write out of ``forward``. Off under DCP, whose
-    FlashInfer prefill attends over the raw new-token k/v.
+    FlashInfer prefill attends over the raw new-token k/v. Also off when no
+    fused kernel is available (see ``resolve_compiled_op``). Call it from layer
+    construction: the first call may build the JIT extension.
     """
     parallel_config = get_current_vllm_config().parallel_config
     if parallel_config.decode_context_parallel_size > 1:
@@ -35,7 +37,10 @@ def supports_fused_kv_insert(attn_layer: torch.nn.Module) -> bool:
         return False
     if attn_layer.kv_sharing_target_layer_name is not None:
         return False
-    return attn_layer.kv_cache_dtype in SUPPORTED_KV_CACHE_DTYPES
+    if attn_layer.kv_cache_dtype not in SUPPORTED_KV_CACHE_DTYPES:
+        return False
+    # Last, so that a layer that cannot use the kernel never triggers the build.
+    return resolve_compiled_op(_FUSED_KV_INSERT_OP) is not None
 
 
 def fused_qk_norm_rope_kv_insert(
@@ -81,30 +86,40 @@ def fused_qk_norm_rope_kv_insert(
 
     # No cache bound (profiling) or no slots: skip the insert, still norm+rotate.
     insert = slot_mapping is not None and kv_cache.numel() > 0
-    insert_kwargs: dict[str, Any] = {}
+    slot_mapping_arg = None
+    kv_cache_arg = None
+    block_size = 0
+    kv_cache_dtype = "auto"
+    k_scale = None
+    v_scale = None
     if insert:
+        slot_mapping_arg = slot_mapping
+        kv_cache_arg = kv_cache
+        block_size = kv_cache.shape[2]
         kv_cache_dtype = attn_layer.kv_cache_dtype
-        is_fp8 = kv_cache_dtype not in ("auto", "bfloat16", "float16")
-        insert_kwargs = {
-            "slot_mapping": slot_mapping,
-            "kv_cache": kv_cache,
-            "block_size": kv_cache.shape[2],
-            "kv_cache_dtype": kv_cache_dtype,
-            "k_scale": attn_layer._k_scale if is_fp8 else None,
-            "v_scale": attn_layer._v_scale if is_fp8 else None,
-        }
+        if kv_cache_dtype not in ("auto", "bfloat16", "float16"):
+            k_scale = attn_layer._k_scale
+            v_scale = attn_layer._v_scale
 
-    ops.fused_muse_spark_qknorm_rope_kv_insert(
+    fused_op = resolve_compiled_op(_FUSED_KV_INSERT_OP)
+    assert fused_op is not None
+    # The op schema has no defaults for the cache arguments: pass them all.
+    fused_op(
         qkv,
         positions,
         num_heads,
         num_kv_heads,
         head_dim,
         eps,
-        cos_sin_cache=cos_sin_cache,
-        rotary_dim=rotary_dim,
-        q_fp8_out=q_fp8,
-        q_scale=attn_layer._q_scale if q_fp8 is not None else None,
-        **insert_kwargs,
+        cos_sin_cache,
+        rotary_dim,
+        slot_mapping_arg,
+        kv_cache_arg,
+        block_size,
+        kv_cache_dtype,
+        k_scale,
+        v_scale,
+        q_fp8,
+        attn_layer._q_scale if q_fp8 is not None else None,
     )
     return q_fp8

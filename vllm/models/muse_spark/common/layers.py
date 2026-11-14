@@ -10,9 +10,9 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from vllm import _custom_ops as ops
 from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.models.muse_spark.common.ops import resolve_compiled_op
 from vllm.models.muse_spark.common.ops.fused_rmsnorm import fused_rmsnorm_fwd
 
 
@@ -201,15 +201,18 @@ class MulTanhSoftCap(nn.Module):
         super().__init__()
         self.multiplier = multiplier
         self.soft_cap_temp = soft_cap_temp
+        # None keeps the torch formula (an older build, or the JIT extension
+        # is unavailable). Resolved here, not at import: the JIT extension may
+        # need to build, which must not happen in a forward pass.
+        self._fused_op = resolve_compiled_op("muse_spark_mul_tanh_soft_cap")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         assert x.dtype in (torch.float32, torch.float16, torch.bfloat16)
-        if x.is_cuda and x.is_contiguous():
-            if x.dtype != torch.float32:
-                x = x.float()
-            return ops.muse_spark_mul_tanh_soft_cap(
-                x, self.multiplier, self.soft_cap_temp
-            )
+        if self._fused_op is not None and x.is_cuda and x.is_contiguous():
+            # The kernel widens fp16/bf16 in registers.
+            out = torch.empty_like(x, dtype=torch.float32)
+            self._fused_op(out, x, self.multiplier, self.soft_cap_temp)
+            return out
         x = x.float() * self.multiplier
         return self.soft_cap_temp * torch.tanh(x / self.soft_cap_temp)
 
