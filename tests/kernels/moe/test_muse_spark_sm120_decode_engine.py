@@ -353,13 +353,14 @@ def test_engine_serves_every_padded_token_count(layer: _Layer) -> None:
 def test_engine_bulk_loader_flag_follows_the_environment(
     layer: _Layer, monkeypatch
 ) -> None:
-    """VLLM_MUSE_SPARK_SM120_LARGE_BULK_LOADER (default off) makes the engine launch
-    the large-batch kernel with the bulk loader; the rows are the same bit for bit
-    at every token count (the small-batch kernel does not read the flag)."""
-    monkeypatch.delenv("VLLM_MUSE_SPARK_SM120_LARGE_BULK_LOADER", raising=False)
+    """VLLM_MUSE_SPARK_SM120_LARGE_BULK_LOADER (default on, 0 restores the cp.async
+    loader) makes the engine launch the large-batch kernel with the bulk loader; the
+    rows are the same bit for bit at every token count (the small-batch kernel does
+    not read the flag)."""
+    monkeypatch.setenv("VLLM_MUSE_SPARK_SM120_LARGE_BULK_LOADER", "0")
     plain = _Engine(layer)
     assert plain.engine._large_flags == 0
-    monkeypatch.setenv("VLLM_MUSE_SPARK_SM120_LARGE_BULK_LOADER", "1")
+    monkeypatch.delenv("VLLM_MUSE_SPARK_SM120_LARGE_BULK_LOADER", raising=False)
     bulk = _Engine(layer)
     assert bulk.engine._large_flags != 0
     ids_all = _ids_cases(MUSE_MAX_TOKENS, 8)["all_local"]

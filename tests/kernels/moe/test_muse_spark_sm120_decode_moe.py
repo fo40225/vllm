@@ -69,8 +69,9 @@ FLAG_CTL_MEMSET = 2
 FLAG_ZERO_NON_LOCAL = 4
 FLAG_NO_PDL = 8
 FLAG_LARGE_BULK = 16  # the loader warp of the large-batch kernel uses bulk copies
-# What the large-batch launches of the tests use unless they say otherwise (the
-# whole file runs with the bulk loader under VLLM_MUSE_SPARK_SM120_LARGE_BULK_LOADER=1).
+# What the large-batch launches of the tests use unless they say otherwise: the loader
+# of the engine default (the whole file runs with the cp.async loader under
+# VLLM_MUSE_SPARK_SM120_LARGE_BULK_LOADER=0).
 LARGE_DEFAULT_FLAGS = (
     FLAG_LARGE_BULK if envs.VLLM_MUSE_SPARK_SM120_LARGE_BULK_LOADER else 0
 )

@@ -145,7 +145,7 @@ if TYPE_CHECKING:
         "auto"
     )
     VLLM_MUSE_SPARK_SM120_DECODE_MAX_TOKENS: int = 128
-    VLLM_MUSE_SPARK_SM120_LARGE_BULK_LOADER: bool = False
+    VLLM_MUSE_SPARK_SM120_LARGE_BULK_LOADER: bool = True
     VLLM_MUSE_SPARK_SM120_LARGE_COLS: int | None = None
     VLLM_MUSE_SPARK_SM120_LARGE_STAGES: int | None = None
     VLLM_MUSE_SPARK_SM120_EXACT_GEMM1: bool = True
@@ -1357,18 +1357,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MUSE_SPARK_SM120_DECODE_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_MUSE_SPARK_SM120_DECODE_MAX_TOKENS", "128")
     ),
-    # Muse Spark on SM120: let the loader warp of the large-batch decode kernel (9..128
-    # tokens) fetch the B operand of every pipeline stage (the quantized activations
+    # Muse Spark on SM120: the loader warp of the large-batch decode kernel (9..128
+    # tokens) fetches the B operand of every pipeline stage (the quantized activations
     # of GEMM1, the intermediate of GEMM2) with one bulk copy per route column instead
     # of a cp.async per 16 bytes. For an expert with 9 or more routes in the batch the
     # loop of cp.asyncs keeps the warp busy and the weight ring waits for it: such an
     # expert is 16-34% faster with the bulk copies (kernel, cold L2), a layer of the
     # real routing at 64 / 96 / 128 tokens 0.7 / 1.9 / 1.8%, a layer without one is
-    # unchanged. The bytes in shared memory, and so the rows, are the same bit for
-    # bit. Read once, when a layer's decode engine is prepared, so it must not change
-    # between a CUDA graph capture and its replay.
+    # unchanged; end to end (real weights, host plugin) the decode step of 64 / 128
+    # concurrent requests is 0.7 / 0.9% shorter (c1 and c16 unchanged within noise).
+    # The bytes in shared memory, and so the rows, are the same bit for bit. Set to 0
+    # for the cp.async loader. Read once, when a layer's decode engine is prepared, so
+    # it must not change between a CUDA graph capture and its replay.
     "VLLM_MUSE_SPARK_SM120_LARGE_BULK_LOADER": lambda: bool(
-        int(os.getenv("VLLM_MUSE_SPARK_SM120_LARGE_BULK_LOADER", "0"))
+        int(os.getenv("VLLM_MUSE_SPARK_SM120_LARGE_BULK_LOADER", "1"))
     ),
     # Muse Spark on SM120: the routes of one expert in one entry of the large-batch
     # decode kernel (8 or 16; unset = the kernel's default, 16) and its weight ring
