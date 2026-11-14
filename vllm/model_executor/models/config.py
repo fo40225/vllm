@@ -99,6 +99,11 @@ class MuseSparkConfig(VerifyAndUpdateConfig):
             return "microbatching is already configured"
         if vllm_config.lora_config is not None:
             return "it does not support LoRA"
+        # The microbatches share the kernel scratch of the experts (one workspace
+        # slot, see _num_workspace_ubatches): that is only sound because the MoE has
+        # no TP partial sums to all-reduce out of the scratch (expert parallelism,
+        # required above) and its prepare/finalize does not hand off inside the
+        # expert op. Both are asserted where the slot is shared.
         if envs.VLLM_USE_V2_MODEL_RUNNER is False:
             return "it needs the V2 model runner"
         if envs.VLLM_BATCH_INVARIANT:
@@ -140,12 +145,16 @@ class MuseSparkConfig(VerifyAndUpdateConfig):
             )
             return
         pc = vllm_config.parallel_config
-        # A floor for the speed, not for correctness (the microbatches hand off
-        # at every collective and cope with unequal collective counts): keep both
-        # halves above the sequence-parallel minimum of the launch (the model
-        # raises the threshold to its exact minimum once the CUDA graph sizes are
-        # known, see fit_prefill_threshold_to_model) and out of the range of the
-        # decode-sized kernels.
+        # A floor for the speed: keep both halves above the sequence-parallel
+        # minimum of the launch (the model raises the threshold to its exact minimum
+        # once the CUDA graph sizes are known, see fit_prefill_threshold_to_model)
+        # and out of the range of the decode-sized kernels. It is not a bound for
+        # correctness of every possible model: a request that straddles the split
+        # reads, in the second microbatch, the KV the first one wrote in the same
+        # layer, so the first microbatch must never hand off less often than the
+        # second one up to any layer. Muse Spark holds that (a collective takes
+        # the custom path from a size on, and the first half is never the larger
+        # one), see test_muse_spark_sm120_prefill_overlap.py.
         num_ubatches = max(envs.VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_UBATCHES, 2)
         floor = num_ubatches * (
             max(envs.VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_MIN_TOKENS, 1024) + 1

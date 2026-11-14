@@ -126,6 +126,15 @@ def _num_workspace_ubatches(vllm_config: VllmConfig) -> int:
     hand-off, see ``WorkspaceManager``)."""
     pc = vllm_config.parallel_config
     if pc.ubatch_overlap_tp_collectives:
+        # Scratch is never live across a hand-off only if no collective reads rows
+        # out of it: with TP partial sums of the experts (tensor parallelism
+        # without expert parallelism) the finalize all-reduces rows that are views
+        # of the scratch, so that launch keeps one slot per microbatch (it is kept
+        # out of the overlap by the model hook; this stops a hook that forgets).
+        assert pc.enable_expert_parallel, (
+            "microbatches that overlap TP collectives share one workspace slot, "
+            "which needs expert parallelism"
+        )
         return 1
     return get_num_ubatches(pc)
 

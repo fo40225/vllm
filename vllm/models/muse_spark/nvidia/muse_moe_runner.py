@@ -92,6 +92,8 @@ from vllm.models.muse_spark.nvidia.sm120_nvfp4_moe import (
 )
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import _USE_LAYERNAME
+from vllm.v1.worker.ubatching import dbo_enabled
+from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
 
@@ -285,6 +287,17 @@ class MusePostExpertFinalize:
 
     def __call__(self, unfinalized: UnfinalizedMoEOutput, out: torch.Tensor) -> None:
         """Finalize permuted GEMM2 rows into ``out``."""
+        # The rows are a view of the experts' scratch; the TP all-reduce of TP
+        # partial sums hands off to the other microbatch, whose experts would
+        # overwrite a scratch slot they share (see _num_workspace_ubatches).
+        assert not (
+            self.pre_norm_all_reduce
+            and dbo_enabled()
+            and current_workspace_manager().shares_ubatch_slots
+        ), (
+            "TP partial sums cannot be all-reduced out of a workspace slot shared by "
+            "microbatches"
+        )
         permuted_idx = unfinalized.expanded_idx_to_permuted_idx
         num_tokens, top_k = permuted_idx.shape
         rows_all = unfinalized.gemm2_permuted

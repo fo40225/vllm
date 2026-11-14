@@ -1388,16 +1388,19 @@ class FusedMoEKernelModularImpl:
         elif use_output_alias:
             fused_out = output_alias
 
-        if (
-            dbo_enabled()
-            and current_workspace_manager().shares_ubatch_slots
-            and not fused_out_is_specialized
-            and fused_out is not output_alias
-        ):
-            # Microbatches that share one workspace slot hand off while their
-            # output is still in use (the collective that sums it): it must not
-            # live in the scratch the other microbatch's experts overwrite.
-            fused_out = torch.empty_like(fused_out)
+        if dbo_enabled() and current_workspace_manager().shares_ubatch_slots:
+            # Microbatches share the scratch only if they hand off outside the
+            # experts: a prepare/finalize that yields inside the expert op would let
+            # the other microbatch overwrite it (see _num_workspace_ubatches).
+            assert not self.prepare_finalize.supports_async(), (
+                f"{type(self.prepare_finalize).__name__} hands off inside the expert "
+                "op: microbatches cannot share a workspace slot"
+            )
+            if not fused_out_is_specialized and fused_out is not output_alias:
+                # They hand off while their output is still in use (the collective
+                # that sums it): it must not live in the scratch the other
+                # microbatch's experts overwrite.
+                fused_out = torch.empty_like(fused_out)
 
         unfinalized = self.fused_experts.apply(
             output=fused_out,

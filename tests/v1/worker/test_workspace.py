@@ -212,9 +212,27 @@ def test_workspace_slots_follow_the_kind_of_microbatching(
         ubatch_overlap_tp_collectives=tp_collective_overlap,
         use_ubatching=use_ubatching,
         num_ubatches=num_ubatches,
+        enable_expert_parallel=True,
     )
     config = cast(VllmConfig, SimpleNamespace(parallel_config=parallel_config))
     assert _num_workspace_ubatches(config) == expected
+
+
+def test_shared_workspace_slot_needs_expert_parallelism() -> None:
+    """Without expert parallelism the MoE finalize all-reduces TP partial sums that
+    are views of the scratch: such a launch may not share the slot."""
+    parallel_config = SimpleNamespace(
+        ubatch_overlap_tp_collectives=True,
+        use_ubatching=True,
+        num_ubatches=2,
+        enable_expert_parallel=False,
+    )
+    config = cast(VllmConfig, SimpleNamespace(parallel_config=parallel_config))
+    with pytest.raises(AssertionError, match="expert parallelism"):
+        _num_workspace_ubatches(config)
+    # The slot-per-microbatch layouts do not care.
+    parallel_config.ubatch_overlap_tp_collectives = False
+    assert _num_workspace_ubatches(config) == 2
 
 
 def test_one_workspace_slot_serves_every_microbatch(monkeypatch) -> None:
@@ -274,8 +292,30 @@ class _FakeExperts:
 
 
 class _FakePrepareFinalize:
+    def __init__(self, async_hand_off: bool = False) -> None:
+        self.async_hand_off = async_hand_off
+
+    def supports_async(self) -> bool:
+        return self.async_hand_off
+
     def allocate_fused_expert_output(self, shape, dtype, device, impl):
         return None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_shared_scratch_slot_rejects_a_finalize_that_hands_off_in_the_experts(
+    monkeypatch,
+) -> None:
+    """A prepare/finalize that yields inside the expert op would let the other
+    microbatch overwrite the shared scratch: refused when it would happen."""
+    with pytest.raises(AssertionError, match="hands off inside the expert op"):
+        _run_microbatched_experts(
+            monkeypatch, shared_slot=True, output_alias=True, async_hand_off=True
+        )
+    # A slot of its own per microbatch tolerates it.
+    _run_microbatched_experts(
+        monkeypatch, shared_slot=False, output_alias=True, async_hand_off=True
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
@@ -286,6 +326,29 @@ def test_microbatched_expert_output_leaves_a_shared_scratch_slot(
 ) -> None:
     """Microbatches that share one scratch slot hand off while the sum of the
     expert output is in flight, so that output may not live in the scratch."""
+    manager, experts, fused_out, out_alias = _run_microbatched_experts(
+        monkeypatch, shared_slot, output_alias
+    )
+    start, stop = experts.seen["output"]
+    ws_start, ws_stop = (
+        manager._current_workspaces[0].data_ptr(),
+        manager._current_workspaces[0].data_ptr()
+        + manager._current_workspaces[0].numel(),
+    )
+    inside_scratch = ws_start <= start and stop <= ws_stop
+    assert fused_out.data_ptr() == start
+    if output_alias:
+        assert not inside_scratch and fused_out is out_alias
+    elif shared_slot:
+        assert not inside_scratch
+    else:
+        # A slot of its own per microbatch: the output may stay in the scratch.
+        assert inside_scratch
+
+
+def _run_microbatched_experts(
+    monkeypatch, shared_slot: bool, output_alias: bool, async_hand_off: bool = False
+):
     from vllm.model_executor.layers.fused_moe import modular_kernel as mk
 
     device = torch.device("cuda")
@@ -297,7 +360,9 @@ def test_microbatched_expert_output_leaves_a_shared_scratch_slot(
     kernel = mk.FusedMoEKernelModularImpl.__new__(mk.FusedMoEKernelModularImpl)
     experts = _FakeExperts()
     kernel.fused_experts = experts  # type: ignore[assignment]
-    kernel.prepare_finalize = _FakePrepareFinalize()  # type: ignore[assignment]
+    kernel.prepare_finalize = _FakePrepareFinalize(  # type: ignore[assignment]
+        async_hand_off
+    )
 
     num_tokens, hidden = 32, 16
     a1q = torch.zeros(num_tokens, hidden, dtype=torch.bfloat16, device=device)
@@ -322,18 +387,4 @@ def test_microbatched_expert_output_leaves_a_shared_scratch_slot(
         expert_tokens_meta=None,
         output_alias=out_alias,
     )
-    start, stop = experts.seen["output"]
-    ws_start, ws_stop = (
-        manager._current_workspaces[0].data_ptr(),
-        manager._current_workspaces[0].data_ptr()
-        + manager._current_workspaces[0].numel(),
-    )
-    inside_scratch = ws_start <= start and stop <= ws_stop
-    assert fused_out.data_ptr() == start
-    if output_alias:
-        assert not inside_scratch and fused_out is out_alias
-    elif shared_slot:
-        assert not inside_scratch
-    else:
-        # A slot of its own per microbatch: the output may stay in the scratch.
-        assert inside_scratch
+    return manager, experts, fused_out, out_alias
