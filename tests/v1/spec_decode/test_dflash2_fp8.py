@@ -261,6 +261,10 @@ def test_attach_fp8_head_gates_on_the_flag(monkeypatch):
 # (Marlin) and 3.7% with e4m3 activations too (cutlass); the bounds leave 50% margin.
 BOUND_MAX = {"cutlass": 0.06, "marlin": 0.04}
 BOUND_RMS = {"cutlass": 0.065, "marlin": 0.045}
+# Three chained quantized GEMMs with the multiplicative conv coefficients and SiLU-and-mul
+# between them (the MLP half of a draft layer): the errors compound (measured relative
+# RMS 9.1% cutlass, 6.5% marlin, at 8 / 128 / 256 rows alike).
+BLOCK_BOUND_RMS = {"cutlass": 0.11, "marlin": 0.08}
 
 
 @needs_cuda
@@ -349,6 +353,61 @@ def test_cuda_graph_replay_equals_eager(kernel, m):
         graph.replay()
         torch.cuda.synchronize()
         assert torch.equal(y_static, run(x_new))
+
+
+@needs_cuda
+@pytest.mark.parametrize("kernel", KERNELS)
+def test_draft_mlp_block_forward_error(kernel, default_vllm_config):
+    """The draft layer's MLP half end to end, with the real classes at the draft's
+    hidden / intermediate sizes (8192 / 28672, TP 1): kernel projection and grouped
+    conv, gate_up, SiLU-and-mul, down, conv finish. FP8 against the bf16 block."""
+    from vllm.model_executor.models.qwen3 import Qwen3MLP
+    from vllm.model_executor.models.qwen3_dflash2 import DFlashGroupedConv
+
+    hidden, inter = 8192, 28672
+    conv = DFlashGroupedConv(
+        hidden, taps=2, group_size=16, block_size=8, params_dtype=torch.bfloat16,
+        prefix="conv",
+    ).to("cuda")
+    mlp = Qwen3MLP(hidden, inter, "silu", quant_config=None, prefix="mlp").to("cuda")
+    conv.base_kernel.data = (
+        0.5 * torch.randn(2, 2, hidden, device="cuda", dtype=torch.bfloat16)
+    )
+    conv.kernel_projection.weight.data = realistic_weight(
+        2048, hidden, seed=11, device="cuda"
+    )
+    mlp.gate_up_proj.weight.data = realistic_weight(
+        2 * inter, hidden, seed=12, device="cuda"
+    )
+    mlp.down_proj.weight.data = realistic_weight(hidden, inter, seed=13, device="cuda")
+
+    def block(h: torch.Tensor) -> torch.Tensor:
+        convolved, coefficients = conv.prepare(h)
+        return conv.finish(mlp(convolved), coefficients)
+
+    reference = {}
+    inputs = {}
+    for m in (8, 128, 256):
+        inputs[m] = torch.randn(
+            m, hidden, generator=torch.Generator().manual_seed(m)
+        ).to("cuda", torch.bfloat16)
+        reference[m] = block(inputs[m]).float()
+    for module in (conv.kernel_projection, mlp.gate_up_proj, mlp.down_proj):
+        assert quantize_draft_linear(module, kernel) > 0
+    for m in (8, 128, 256):
+        got = errors(block(inputs[m]), reference[m])
+        assert got[1] < BLOCK_BOUND_RMS[kernel], (kernel, m, got)
+    # CUDA graph replay equals eager through the whole block.
+    static = inputs[8].clone()
+    block(static)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out_static = block(static)
+    static.copy_(inputs[128][:8])
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out_static, block(inputs[128][:8].contiguous()))
 
 
 # --------------------------------------------------------------------------------
