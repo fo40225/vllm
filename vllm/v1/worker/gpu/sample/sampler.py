@@ -36,6 +36,9 @@ from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
 from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS, SamplingStates
 from vllm.v1.worker.gpu.sample.thinking_budget import ThinkingBudgetState
 from vllm.v1.worker.gpu.sample.topk_logits import (
+    TOPP_CANDIDATE_MAX_TEMPERATURE,
+    TOPP_CANDIDATE_MAX_TOP_P,
+    TOPP_CANDIDATE_MIN_TOP_K,
     TieDraw,
     TopKLogits,
     VerifyPlan,
@@ -233,6 +236,20 @@ class Sampler:
             return "sampled-rows", 0
         return None, k
 
+    def topp_candidate_class(self, idx_mapping_np: np.ndarray) -> np.ndarray:
+        """Which requests of the step are in the class of top_p requests that level 4
+        verifies from the candidates: temperature, top_p and top_k within the
+        ``TOPP_CANDIDATE_*`` bounds. Host state only, so every TP rank decides alike;
+        the bounds compare in fp32, the type of the state (a client's 0.95 is in)."""
+        states = self.sampling_states
+        max_temperature = np.float32(TOPP_CANDIDATE_MAX_TEMPERATURE)
+        max_top_p = np.float32(TOPP_CANDIDATE_MAX_TOP_P)
+        return (
+            (states.temperature.np[idx_mapping_np] <= max_temperature)
+            & (states.top_p.np[idx_mapping_np] <= max_top_p)
+            & (states.top_k.np[idx_mapping_np] >= TOPP_CANDIDATE_MIN_TOP_K)
+        )
+
     def topk_verify_split_plan(
         self,
         idx_mapping_np: np.ndarray,
@@ -249,12 +266,14 @@ class Sampler:
         request: penalties, logit bias, bad words, a thinking budget or a custom
         processor (``needs_full_logits``), a top_k above ``k``, a request with
         temperature > 0 where the launch cannot verify sampled rows (``sampled``),
-        top_p below 1 (unless ``level`` is at least 4) and top_p below 1 together with
-        min_p (the full path then takes the standalone top-p branch of its top-p
-        kernel, whose ties it treats differently). A greedy request ignores top_k,
-        top_p and min_p. A split with fewer than ``min_candidates`` candidate requests
-        is not worth its fixed cost (``SPLIT_MIN_CANDIDATE_REQS``): the whole step takes
-        the full path ("few-candidates"). Host state only: every TP rank decides alike.
+        top_p below 1 (at ``level`` 4 only outside the class of temperature, top_p and
+        top_k that ``topp_candidate_class`` keeps on the candidates: reason
+        "top-p-guard") and top_p below 1 together with min_p (the full path then takes
+        the standalone top-p branch of its top-p kernel, whose ties it treats
+        differently). A greedy request ignores top_k, top_p and min_p. A split with
+        fewer than ``min_candidates`` candidate requests is not worth its fixed cost
+        (``SPLIT_MIN_CANDIDATE_REQS``): the whole step takes the full path
+        ("few-candidates"). Host state only: every TP rank decides alike.
         """
         if (
             self.compute_nans
@@ -268,6 +287,11 @@ class Sampler:
         random = states.temperature.np[idx_mapping_np] != 0.0
         top_p_rows = random & (states.top_p.np[idx_mapping_np] != 1.0)
         min_p_rows = random & (states.min_p.np[idx_mapping_np] != 0.0)
+        # Level 4: a top_p row verifies from the candidates only inside the class that
+        # the audit bounds (``TOPP_CANDIDATE_*``).
+        top_p_outside = None
+        if level >= 4:
+            top_p_outside = top_p_rows & ~self.topp_candidate_class(idx_mapping_np)
         # Why a request needs the logits, in the order the reasons are reported.
         conditions = (
             ("logits-processing", self.needs_full_logits[idx_mapping_np]),
@@ -275,6 +299,7 @@ class Sampler:
             ("top-k-unset-or-above-k", random & (states.top_k.np[idx_mapping_np] > k)),
             ("top-p-with-min-p", top_p_rows & min_p_rows),
             ("top-p", top_p_rows if level < 4 else None),
+            ("top-p-guard", top_p_outside),
         )
         full_mask = np.zeros(idx_mapping_np.shape[0], dtype=bool)
         for _, mask in conditions:

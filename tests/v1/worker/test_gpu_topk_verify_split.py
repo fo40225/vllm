@@ -34,7 +34,13 @@ from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.sampler import Sampler
-from vllm.v1.worker.gpu.sample.topk_logits import RouteStats, VerifyPlan
+from vllm.v1.worker.gpu.sample.topk_logits import (
+    TOPP_CANDIDATE_MAX_TEMPERATURE,
+    TOPP_CANDIDATE_MAX_TOP_P,
+    TOPP_CANDIDATE_MIN_TOP_K,
+    RouteStats,
+    VerifyPlan,
+)
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
 from vllm.v1.worker.gpu.spec_decode.verify_split import (
     SPLIT_MIN_CANDIDATE_REQS,
@@ -143,6 +149,97 @@ def test_the_flags_of_the_plan_count_the_candidate_requests_only():
     assert plan.full.tolist() == [1] and not plan.min_p and not plan.top_p
     plan = split_plan(sampler, [0, 1, 2], 4)
     assert plan.full is None and plan.min_p and plan.top_p
+
+
+# Level 4 verifies a top_p request from the candidates only inside the class bounded by
+# TOPP_CANDIDATE_MAX_TEMPERATURE, TOPP_CANDIDATE_MAX_TOP_P and TOPP_CANDIDATE_MIN_TOP_K.
+IN_CLASS = {
+    "at-the-bounds": SamplingParams(
+        temperature=TOPP_CANDIDATE_MAX_TEMPERATURE,
+        top_k=K,
+        top_p=TOPP_CANDIDATE_MAX_TOP_P,
+    ),
+    "lowest-top_k": SamplingParams(
+        temperature=0.7, top_k=TOPP_CANDIDATE_MIN_TOP_K, top_p=0.8
+    ),
+    "cold": SamplingParams(temperature=0.1, top_k=40, top_p=0.5),
+}
+OUT_OF_CLASS = {
+    "hot": SamplingParams(temperature=1.5, top_k=K, top_p=0.9),
+    "just-hotter": SamplingParams(
+        temperature=float(np.nextafter(np.float32(TOPP_CANDIDATE_MAX_TEMPERATURE), 2)),
+        top_k=K,
+        top_p=0.9,
+    ),
+    "top_p-0.99": SamplingParams(temperature=1.0, top_k=K, top_p=0.99),
+    "just-above-top_p": SamplingParams(
+        temperature=1.0,
+        top_k=K,
+        top_p=float(np.nextafter(np.float32(TOPP_CANDIDATE_MAX_TOP_P), 1)),
+    ),
+    "small-top_k": SamplingParams(
+        temperature=1.0, top_k=TOPP_CANDIDATE_MIN_TOP_K - 1, top_p=0.9
+    ),
+}
+
+
+@pytest.mark.parametrize("name", sorted(OUT_OF_CLASS))
+def test_level_4_keeps_a_top_p_request_outside_the_class_on_the_full_path(name):
+    params = OUT_OF_CLASS[name]
+    sampler = sampler_with(T1K64, params, GREEDY, T1K64)
+    plan = split_plan(sampler, [0, 1, 2, 3], 4)
+    assert plan.reason is None
+    assert plan.full.tolist() == [1] and plan.candidate.tolist() == [0, 2, 3]
+    assert plan.full_reasons == {"top-p-guard": 1} and not plan.top_p
+    # Level 3 keeps every top_p request on the full path, under its own reason.
+    assert split_plan(sampler, [0, 1, 2, 3], 3).full_reasons == {"top-p": 1}
+    # Alone, the request takes the whole step to the full path.
+    assert split_plan(sampler, [1], 4).reason == "top-p-guard"
+
+
+@pytest.mark.parametrize("name", sorted(IN_CLASS))
+def test_level_4_verifies_a_top_p_request_inside_the_class_from_the_candidates(name):
+    sampler = sampler_with(T1K64, IN_CLASS[name], GREEDY, T1K64)
+    plan = split_plan(sampler, [0, 1, 2, 3], 4)
+    assert plan == VerifyPlan(None, K, None, None, {}, True, False, True)
+    assert split_plan(sampler, [0, 1, 2, 3], 3).full_reasons == {"top-p": 1}
+
+
+def test_level_4_splits_a_step_by_the_class_and_counts_the_candidates_only():
+    sampler = sampler_with(
+        IN_CLASS["at-the-bounds"],
+        OUT_OF_CLASS["hot"],
+        IN_CLASS["cold"],
+        OUT_OF_CLASS["top_p-0.99"],
+        OUT_OF_CLASS["small-top_k"],
+        T1K64,
+    )
+    plan = split_plan(sampler, list(range(6)), 4)
+    assert plan.candidate.tolist() == [0, 2, 5] and plan.full.tolist() == [1, 3, 4]
+    assert plan.full_reasons == {"top-p-guard": 3} and plan.top_p
+    # Only requests of the guarded kind: no candidate request, the whole step is full.
+    assert split_plan(sampler, [1, 3, 4], 4).reason == "top-p-guard"
+    # Without a request of the class the compiled variant has no top_p branch.
+    assert not split_plan(sampler, [1, 3, 5], 4).top_p
+
+
+def test_the_guard_leaves_requests_without_top_p_and_greedy_rows_alone():
+    sampler = sampler_with(
+        SamplingParams(temperature=0.0, top_k=K, top_p=0.99),
+        SamplingParams(temperature=2.0, top_k=K),
+        SamplingParams(temperature=1.0, top_k=K, top_p=1.0),
+    )
+    # Greedy ignores top_p; a request without top_p is a plain sampled request at any
+    # temperature: both stay candidates, and no row needs the top_p branch.
+    plan = split_plan(sampler, [0, 1, 2], 4)
+    assert plan == VerifyPlan(None, K, None, None, {}, True, False, False)
+
+
+def test_a_top_p_request_without_a_top_k_stays_on_the_full_path_at_level_4():
+    sampler = sampler_with(T1K64, SamplingParams(temperature=0.7, top_p=0.9), T1K64)
+    plan = split_plan(sampler, [0, 1, 2], 4)
+    assert plan.full.tolist() == [1]
+    assert plan.full_reasons == {"top-k-unset-or-above-k": 1}
 
 
 def test_a_greedy_row_ignores_top_k_top_p_and_min_p():
@@ -552,6 +649,22 @@ def test_top_p_requests_take_the_candidates_at_level_4():
     assert fargs[1].num_reqs == 1
 
 
+def test_a_top_p_request_outside_the_class_is_gathered_whole_at_level_4():
+    events: list = []
+    sampler = sampler_with(T1K64, OUT_OF_CLASS["hot"], PENALTY)
+    runner = split_runner(events, sampler, level=4)
+    batch = fake_input_batch([7, 7, 7], [0, 1, 2])
+    run_verify(runner, batch)
+    ((_, vkw),) = runner.rejection_sampler.verify_topk.calls
+    assert vkw == {"use_min_p": False, "use_top_p": False}
+    ((fargs, _),) = runner.rejection_sampler.calls
+    assert fargs[1].num_reqs == 2
+    assert runner.topk_verify_stats.split_reasons == {
+        "top-p-guard": 1,
+        "logits-processing": 1,
+    }
+
+
 @pytest.mark.parametrize("case", ["no-candidate-request", "logprobs", "grammar"])
 def test_a_step_with_no_candidate_request_takes_the_full_path(case):
     events: list = []
@@ -629,13 +742,16 @@ def test_the_split_step_equals_the_full_path_for_every_request(level: int):
     that need the logits (penalty, top_k above K, top_p at level 3). The accepted tokens
     and the resampled token of each equal what the full path gives for the same batch
     (every request is verified by one route only, on its own rows)."""
-    kinds = np.random.default_rng(level).integers(0, 9, 40)
-    kinds[:9] = np.arange(9)
+    kinds = np.random.default_rng(level).integers(0, 11, 44)
+    kinds[:11] = np.arange(11)
     plan = check_split_equals_full(level, kinds, seed=level)
     # Every kind of request and both routes took part; a top_p request without a top_k
-    # is on the full route.
-    assert set(kinds.tolist()) == set(range(9))
-    assert all(r in plan.full for r in range(len(kinds)) if kinds[r] == 8)
+    # or outside the class of level 4 is on the full route, one inside the class from
+    # the candidates at level 4.
+    assert set(kinds.tolist()) == set(range(11))
+    assert all(r in plan.full for r in range(len(kinds)) if kinds[r] in (8, 9))
+    in_class = [r for r in range(len(kinds)) if kinds[r] in (3, 10)]
+    assert all((r in plan.candidate) == (level == 4) for r in in_class)
     assert len(plan.candidate) >= 10 and len(plan.full) >= 10
     assert plan.min_p and (plan.top_p == (level == 4))
 
@@ -656,7 +772,9 @@ def check_split_equals_full(level, kinds, seed, num_draft=None):
     n = len(kinds)
     rng = np.random.default_rng(seed)
     # 0 greedy, 1 plain, 2 min_p, 3 top_p, 4 frequency penalty, 5 top_k above K,
-    # 6 greedy with a logit bias, 7 sampled with a logit bias, 8 top_p without a top_k
+    # 6 greedy with a logit bias, 7 sampled with a logit bias, 8 top_p without a top_k,
+    # 9 top_p at temperature 1.5 (outside the class of level 4), 10 top_p at temperature
+    # 0.7 with top_k 40 (inside it)
     params = []
     for r, kind in enumerate(kinds):
         seed = int(rng.integers(1, 1 << 30))
@@ -690,6 +808,10 @@ def check_split_equals_full(level, kinds, seed, num_draft=None):
             p = SamplingParams(temperature=1.0, top_k=200, seed=seed)
         elif kind == 8:
             p = SamplingParams(temperature=1.0, top_p=0.9, seed=seed)
+        elif kind == 9:
+            p = SamplingParams(temperature=1.5, top_k=64, top_p=0.95, seed=seed)
+        elif kind == 10:
+            p = SamplingParams(temperature=0.7, top_k=40, top_p=0.9, seed=seed)
         else:
             bias = {
                 SHARED_IDS[int(i)]: float(rng.choice([-4.0, 3.0]))

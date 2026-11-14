@@ -1355,8 +1355,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             2: "per step: a request that needs the logits sends its whole step there",
             3: "per request: a request that needs the logits is verified from the "
             "whole logits, the others from the candidates",
-            4: "per request, top_p rows from the candidates too (differs from the "
-            "full path in tie groups on a few rows)",
+            4: "per request, top_p rows of the guarded class from the candidates too "
+            "(differs from the full path in tie groups on about 1e-4 of their rows)",
         }.get(level, "")
         if not self.topk_verify_sampled:
             mode = "greedy steps only"

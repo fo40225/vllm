@@ -21,6 +21,12 @@ then top-p over the top-k set), then `rejection_sample`.
   round trip is then exact: the capped logits of Muse Spark in a decode step are up to
   10 and more), which hold with no differing token over the pinned inputs, and the
   test of the boundary ties constructs the tie groups of every size and position.
+  The equality is not guaranteed for every row (a row differs when the trim of a tie
+  group depends on bits of the sum that the candidates do not have): level 4 takes only
+  the requests of the class of ``Sampler.topp_candidate_class`` (bounds on temperature,
+  top_p and top_k), where an audit of 43,668 real decode rows found a differing row in
+  7e-5 to 1.2e-4 of them at the corner (temperature 1, top_p 0.95), and none in most
+  cells.
 """
 
 import numpy as np
@@ -35,6 +41,7 @@ from vllm.triton_utils import tl, triton
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.worker.gpu.sample.gumbel import apply_temperature
 from vllm.v1.worker.gpu.sample.min_p import apply_min_p
+from vllm.v1.worker.gpu.sample.topk_logits import TOPP_CANDIDATE_MIN_TOP_K
 from vllm.v1.worker.gpu.spec_decode.topk_rejection import _target_row, topk_verify
 
 from .test_gpu_topk_verify import (
@@ -296,6 +303,84 @@ def test_top_p_kept_set_matches_the_full_path(
         straddled += int(straddling_rows(raw, temperature, top_p).sum())
     # The test exercises the tie rule: a good number of rows split a tie group.
     assert straddled >= 20, (straddled, total)
+
+
+def differing_rows(raw, temperature, top_k, top_p):
+    """The rows whose kept set differs between the candidate kernel and the full path,
+    and how many of those differ by more than the members of one group of tokens with
+    one scaled logit (none, in every case measured: the two never disagree on a token
+    that is not tied with the nucleus boundary or the k-th place)."""
+    rows = raw.shape[0]
+    temp, tk = per_row(temperature, rows), per_row(top_k, rows, torch.int32)
+    tp = per_row(top_p, rows)
+    expected = full_path_kept(raw, temp, tk, None, tp)
+    got = candidate_kept(raw, temp, tk, None, tp)
+    bad = (expected != got).any(-1)
+    capped = soft_cap(raw)
+    scaled = capped if temperature == 1.0 else capped / temperature
+    outside_one_group = 0
+    for r in torch.nonzero(bad)[:, 0].tolist():
+        values = scaled[r, (expected[r] != got[r]).nonzero()[:, 0]]
+        outside_one_group += int(not bool((values == values[0]).all()))
+    return int(bad.sum()), outside_one_group
+
+
+@pytest.mark.parametrize("top_k", [TOPP_CANDIDATE_MIN_TOP_K, K])
+@pytest.mark.parametrize(
+    ("temperature", "top_p"),
+    [(1.0, 0.95), (0.7, 0.95), (1.0, 0.8), (0.3, 0.9), (1.0, 0.5)],
+)
+@pytest.mark.parametrize("kind", ["gauss", "flat"])
+def test_top_p_kept_sets_inside_the_level_4_class_differ_at_most_in_one_tie_group(
+    kind: str, temperature: float, top_p: float, top_k: int
+):
+    """The corners of the class that level 4 verifies from the candidates (temperature
+    up to 1, top_p up to 0.95, top_k from TOPP_CANDIDATE_MIN_TOP_K), on rows with the
+    large logits of a decode step (the capped logits of the head are about 12): the
+    kept sets are those of Qrita on all but a few rows of the pinned inputs (at most 3
+    in 2048; the real rows of the audit differ on 7e-5 to 1.2e-4 of them at the corner
+    temperature 1, top_p 0.95), and a row that differs does so by members of one tie
+    group only."""
+    differing = outside = straddled = 0
+    for seed in range(2):
+        raw = head_rows(kind, 1024, 300 + seed, offset=75.0)
+        d, o = differing_rows(raw, temperature, top_k, top_p)
+        differing, outside = differing + d, outside + o
+        straddled += int(straddling_rows(raw, temperature, top_p).sum())
+    assert outside == 0
+    assert differing <= 3, differing
+    assert straddled >= 10, straddled
+
+
+def test_the_kept_sets_differ_at_a_small_top_k_with_huge_tie_groups():
+    """Why the class has a lower bound on top_k: rows of 96 almost equal logits (a few
+    bf16 values, so tie groups of tens of tokens across the k-th place) differ on 0.3 to
+    0.6 % of the rows at top_k 10 and 20, whatever top_p, and on none at top_k 40 and
+    64. The real rows of the audit show no such dependence on top_k, which is why the
+    bound is a margin, not a measurement."""
+    small = large = 0
+    for seed in range(2):
+        raw = head_rows("flat", 1024, 300 + seed, offset=75.0)
+        d, o = differing_rows(raw, 1.0, 20, 0.8)
+        assert o == 0
+        small += d
+        large += differing_rows(raw, 1.0, TOPP_CANDIDATE_MIN_TOP_K, 0.8)[0]
+    assert small >= 1 and large == 0, (small, large)
+
+
+def test_outside_the_level_4_class_the_kept_sets_differ_on_tie_rich_rows():
+    """Why the class has bounds on the temperature and top_p: at a temperature of 2 the
+    boundary logit of rows with a smaller head is small (the exp / log round trip of the
+    duplicate rule is inexact), and the kernel and the candidates (summing in another
+    order) trim a tie group differently on a few percent of the rows, again in members
+    of one tie group only."""
+    differing = 0
+    for seed in range(2):
+        raw = head_rows("gauss", 1024, 400 + seed, offset=20.0)
+        d, o = differing_rows(raw, 2.0, K, 0.95)
+        assert o == 0
+        differing += d
+    assert differing >= 20, differing
 
 
 def test_top_p_on_a_tie_group_that_splits_the_nucleus():

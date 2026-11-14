@@ -1788,25 +1788,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # full path's, bit for bit (vLLM rejects logit_bias and a min_p above 1e-5 under
     # speculative decoding, SamplingParams._validate_spec_decode: no such request
     # reaches the verification in practice, and min_p adds nothing to the measured
-    # gain). 4: also requests with top_p below 1 (and no min_p): the nucleus of the full
-    # path's top-k + top-p kernel over the candidates. NOT distribution-exact: that
-    # kernel finds its nucleus by an fp32 pivot search whose result for tokens that tie
-    # at the boundary depends on how an exp / log round trip rounds and on the bits of a
-    # sum over the whole row, and the candidates cannot see those. On a small share of
-    # the rows (tie-rich logits of small magnitude, a temperature above 1, top_p 0.99, a
-    # nucleus that reaches the k-th place) the kept set differs from the full path's in
-    # members of a tie group, tokens that carry the boundary probability (at least (1 -
-    # top_p) / N, about 1e-3 at top_p 0.95): such a row's distribution moves by up to
-    # about 1 % in total variation. 0 of 3014 measured decode rows differ at top_p up to
-    # 0.95 (temperature 0.7 and 1), so the measured cost is nil, but the equality is not
-    # guaranteed: opt-in, never the default. The whole path is off for adaptive
-    # verification, a watermark, synthetic acceptance rates, a rejection sampler of
-    # another class, and a draft distribution narrower than the vocabulary; with a draft
-    # distribution of another width than the vocabulary, or without one, only the greedy
-    # steps take it. Needs VLLM_MUSE_SPARK_SM120_TOPK_LOGITS=1. The share of verified
-    # steps on the path and the reasons of the others are logged every 30 s ("steps with
-    # drafts"; those steps do not count in the lines of the top-k logits sampling). Read
-    # once, in load_model.
+    # gain). 4: also requests with top_p below 1 (and no min_p) inside a class of
+    # temperature (up to 1), top_p (up to 0.95) and top_k (40 to 64), bounds in
+    # vllm/v1/worker/gpu/sample/topk_logits.py: the nucleus of the full path's top-k +
+    # top-p kernel over the candidates; the other top_p requests keep the full path
+    # (reason "top-p-guard" in the route log). NOT equal to the full path on every row:
+    # that kernel finds its nucleus by an fp32 pivot search, and where the boundary
+    # splits a group of tied tokens it trims the group by a count and an exp / log round
+    # trip that depend on the bits of a sum over the whole row, which the candidates do
+    # not have. The kept sets then differ by 1-3 members of the group (each 0.1-0.5 % of
+    # the row's probability), in either direction, deterministically and identically on
+    # all ranks. Audit on 43,668 real decode rows: a differing row in 7e-5 (top_k 64)
+    # to 1.2e-4 (top_k 40) of the rows at temperature 1, top_p 0.95, fewer below, more
+    # above the class (top_p 0.99: 1.5e-3, temperature 1.5: 1.2e-3); no class has a zero
+    # rate: opt-in, the default 3 keeps every top_p request on the exact full path. The
+    # whole path is off for adaptive verification, a watermark, synthetic acceptance
+    # rates, a rejection sampler of another class, and a draft distribution narrower
+    # than the vocabulary; with a draft distribution of another width than the
+    # vocabulary, or without one, only the greedy steps take it. Needs
+    # VLLM_MUSE_SPARK_SM120_TOPK_LOGITS=1. The share of verified steps on the path and
+    # the reasons of the others are logged every 30 s ("steps with drafts"; those steps
+    # do not count in the lines of the top-k logits sampling). Read once, in load_model.
     "VLLM_MUSE_SPARK_SM120_VERIFY_TOPK_LOGITS": lambda: int(
         os.getenv("VLLM_MUSE_SPARK_SM120_VERIFY_TOPK_LOGITS", "3")
     ),

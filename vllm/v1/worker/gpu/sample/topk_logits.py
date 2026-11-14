@@ -641,6 +641,31 @@ def topk_merge_sample(
     return sampled
 
 
+# Level 4 of VLLM_MUSE_SPARK_SM120_VERIFY_TOPK_LOGITS verifies a top_p request from the
+# candidates only when its temperature, top_p and top_k (host state) are within these
+# bounds (``Sampler.topp_candidate_class``); the other top_p requests keep the full
+# path.
+#
+# The candidate kernel's kept set differs from the full path's top-k + top-p kernel
+# (Qrita) at a nucleus boundary that splits a group of tied tokens: Qrita trims the
+# group by an fp32 count and a round-trip test that depend on the bits of a sum over
+# the whole row, which the candidates do not have. The two then differ by 1-3 members
+# of the group (each 0.1-0.5 % of the row's probability), in either direction. No class
+# has a zero rate. Audit on 43,668 real decode rows (two independent captures, 22,776
+# and 20,892, in contexts of temperature 0.6-1.5, flat rows included), kept sets
+# compared row by row against Qrita: a differing row in 7e-5 (top_k 64) to 1.2e-4
+# (top_k 40) of the rows at the corner temperature 1, top_p 0.95, fewer below it. Above
+# it the rate grows: top_p 0.97 3e-4, temperature 1.25 at top_p 0.95 4e-4, temperature
+# 1.5 1.2e-3, top_p 0.99 1.5e-3, temperature 2 3e-3. The bounds are the largest audited
+# class with a worst-cell rate of about 1e-4 per row. The lower bound on top_k is a
+# margin: real rows of top_k 10 to 32 differ as rarely, but synthetic rows of almost
+# equal logits (tie groups of tens of tokens across the k-th place) differ on 0.3-0.6 %
+# of the rows at top_k 10 and 20, and on none at 40 and 64.
+TOPP_CANDIDATE_MAX_TEMPERATURE = 1.0
+TOPP_CANDIDATE_MAX_TOP_P = 0.95
+TOPP_CANDIDATE_MIN_TOP_K = 40
+
+
 @dataclass(slots=True)
 class VerifyPlan:
     """How a speculative step verifies its drafts when requests may take different
