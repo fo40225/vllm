@@ -33,6 +33,10 @@ logger = init_logger(__name__)
 # Padded token counts 1..B12X_MAX_TOKENS get a binding.
 B12X_MAX_TOKENS = 8
 # The dynamic kernel routes small row counts directly and larger ones grouped.
+# 32 rows are 4 padded tokens at top-8. The cutoff comes from the b12x gate probe
+# of 2026-10-20 (b12x 1.5.1, 8x RTX PRO 6000 Blackwell Server, 188 SMs, EP8 decode
+# shapes with hidden = intermediate = 4096); it was not re-measured on other SM120
+# parts or b12x versions, where it may move.
 _DIRECT_ROUTE_MAX_ROWS = 32
 
 
@@ -216,7 +220,8 @@ class B12xDecodeMoE:
         fused_moe = self._fused_moe
         rows = num_tokens * self.top_k
         # The decode config is pinned: the default heuristic picks the micro
-        # kernel for a few rows, which costs ~15 us per skipped row.
+        # kernel for a few rows, which costs ~15 us per skipped row (the figure
+        # of the same 2026-10-20 probe, see _DIRECT_ROUTE_MAX_ROWS).
         decode_config = self._decode_config_cls(
             backend="dynamic",
             route_planner="internal",

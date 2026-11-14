@@ -3,8 +3,8 @@
 """SM120 coverage for the NVFP4 decode MoE kernel (``_muse_C::nvfp4_decode_moe``).
 
 The kernel has fixed hidden = intermediate = 4096 and top-k 8 (any number of local
-experts; the EP8 case of 32 is used here), so the tests build one random layer of
-that size. The reference is an
+experts; the EP8 case of 32 and the EP4 case of 64 are used here), so the tests
+build one random layer of that size. The reference is an
 exact fake-quantization in torch (activations and the SiLU * up intermediate
 quantized to NVFP4 at the points the CUTLASS composition quantizes them).
 """
@@ -34,7 +34,11 @@ if _unusable is not None:
         f"The _muse_C extension cannot be built: {_unusable}", allow_module_level=True
     )
 
+# Local experts per rank: 32 is this model's EP8 layout (the engine test imports
+# it); the layer fixture also runs EP4 with 64, since the kernel's plan and
+# counters scale with the number of local experts.
 E_LOCAL = 32
+E_LOCAL_CASES = (E_LOCAL, 64)
 E_GLOBAL = 256
 H = 4096
 TOP_K = 8
@@ -109,35 +113,36 @@ def _finalize(rows, weights, gamma, valid):
 
 
 class _Layer:
-    """A random EP8 rank: [gate; up] weights, scales and the reference."""
+    """A random expert-parallel rank: [gate; up] weights, scales and the reference."""
 
-    def __init__(self, diff_s: bool, seed: int = 0):
+    def __init__(self, diff_s: bool, seed: int = 0, e_local: int = E_LOCAL):
         dev = torch.device("cuda")
+        self.e_local = e_local
         g = torch.Generator(device=dev).manual_seed(1000 + seed)
         self.diff_s = diff_s
         self.references = {}
         self.w13 = torch.randint(
-            0, 256, (E_LOCAL, 2 * H, H // 2), dtype=torch.uint8, device=dev, generator=g
+            0, 256, (e_local, 2 * H, H // 2), dtype=torch.uint8, device=dev, generator=g
         )
         self.w2 = torch.randint(
-            0, 256, (E_LOCAL, H, H // 2), dtype=torch.uint8, device=dev, generator=g
+            0, 256, (e_local, H, H // 2), dtype=torch.uint8, device=dev, generator=g
         )
 
         def block_scales(shape):
             ratio = torch.exp(-torch.randn(shape, device=dev, generator=g).abs() * 0.6)
             return (FP8_MAX * ratio).clamp(min=1.0).to(torch.float8_e4m3fn)
 
-        self.w13_sf = block_scales((E_LOCAL, 2 * H, H // 16))
-        self.w2_sf = block_scales((E_LOCAL, H, H // 16))
+        self.w13_sf = block_scales((e_local, 2 * H, H // 16))
+        self.w2_sf = block_scales((e_local, H, H // 16))
 
         def rms(t):
             return t.float().pow(2).mean(dim=(1, 2)).sqrt()
 
         def spread():
-            return torch.rand(E_LOCAL, device=dev, generator=g) * 0.7 + 0.7
+            return torch.rand(e_local, device=dev, generator=g) * 0.7 + 0.7
 
         self.s1 = (spread() / H**0.5 / (NIB_RMS * rms(self.w13_sf[:, :H]))).float()
-        ratio = torch.rand(E_LOCAL, device=dev, generator=g) * 3.5 + 0.5
+        ratio = torch.rand(e_local, device=dev, generator=g) * 3.5 + 0.5
         self.s3 = self.s1 * (ratio if diff_s else 1.0)
         self.s2 = (spread() / H**0.5 / (NIB_RMS * rms(self.w2_sf))).float()
         # Global input scales calibrated on random activations.
@@ -154,16 +159,16 @@ class _Layer:
         self.a2 = torch.tensor(HEADROOM_A2 * hmax / (FP8_MAX * FP4_MAX), device=dev)
         self.gamma = (torch.randn(H, device=dev, generator=g) * 0.1).to(torch.bfloat16)
         w13_scale_2 = torch.stack([self.s1, self.s3], 1)
-        in13 = self.a13 * (0.35 + 0.65 * torch.rand(E_LOCAL, device=dev, generator=g))
+        in13 = self.a13 * (0.35 + 0.65 * torch.rand(e_local, device=dev, generator=g))
         in13[0] = self.a13
-        in2 = self.a2 * (0.35 + 0.65 * torch.rand(E_LOCAL, device=dev, generator=g))
+        in2 = self.a2 * (0.35 + 0.65 * torch.rand(e_local, device=dev, generator=g))
         in2[0] = self.a2
         self.scales = fold_sm120_nvfp4_scales(
             w13_scale_2, in13.unsqueeze(1).expand(-1, 2), self.s2, in2
         )
         self.prm, self.gs = decode_kernel_params(self.scales)
         self.expert_map = torch.full((E_GLOBAL,), -1, dtype=torch.int32, device=dev)
-        self.expert_map[:E_LOCAL] = torch.arange(E_LOCAL, dtype=torch.int32, device=dev)
+        self.expert_map[:e_local] = torch.arange(e_local, dtype=torch.int32, device=dev)
         self.sf13 = swizzle_blockscale(self.w13_sf)
         self.sf2 = swizzle_blockscale(self.w2_sf)
 
@@ -259,10 +264,15 @@ def _extension() -> None:
     muse_c.load()
 
 
-@pytest.fixture(scope="module", params=[True, False], ids=["diff_s", "same_s"])
+@pytest.fixture(
+    scope="module",
+    params=[(diff_s, e) for e in E_LOCAL_CASES for diff_s in (True, False)],
+    ids=lambda p: f"{'diff_s' if p[0] else 'same_s'}-e{p[1]}",
+)
 def layer(request) -> _Layer:
+    diff_s, e_local = request.param
     with torch.inference_mode():
-        yield _Layer(diff_s=request.param)
+        yield _Layer(diff_s=diff_s, e_local=e_local)
 
 
 def _routing(t: int, seed: int):
@@ -278,30 +288,35 @@ def _routing(t: int, seed: int):
     return u, ids, (s / s.sum(1, keepdim=True)).float()
 
 
-def _local_ids(t: int, n_local: int | list[int], seed: int) -> torch.Tensor:
+def _local_ids(
+    t: int, n_local: int | list[int], seed: int, e_local: int = E_LOCAL
+) -> torch.Tensor:
     """Each token routes to exactly ``n_local`` local and 8 - n_local non-local
-    experts (distinct), in random slot order."""
+    experts (distinct), in random slot order; the rank owns ``e_local`` experts."""
     g = torch.Generator().manual_seed(1234 + seed)
     nl = [n_local] * t if isinstance(n_local, int) else n_local
     out = torch.empty(t, TOP_K, dtype=torch.int32)
     for i in range(t):
-        loc = torch.randperm(E_LOCAL, generator=g)[: nl[i]]
-        non = E_LOCAL + torch.randperm(E_GLOBAL - E_LOCAL, generator=g)[: TOP_K - nl[i]]
+        loc = torch.randperm(e_local, generator=g)[: nl[i]]
+        non = e_local + torch.randperm(E_GLOBAL - e_local, generator=g)[: TOP_K - nl[i]]
         row = torch.cat([loc, non])[torch.randperm(TOP_K, generator=g)]
         out[i] = row.to(torch.int32)
     return out.cuda()
 
 
-def _ids_cases(t: int, seed: int):
+def _ids_cases(t: int, seed: int, e_local: int = E_LOCAL):
     cases = {
         "random": _routing(t, seed)[1],
-        "no_local": _local_ids(t, 0, seed),
-        "one_local": _local_ids(t, 1, seed),
-        "three_local": _local_ids(t, 3, seed),
-        "all_local": _local_ids(t, 8, seed),
+        "no_local": _local_ids(t, 0, seed, e_local),
+        "one_local": _local_ids(t, 1, seed, e_local),
+        "three_local": _local_ids(t, 3, seed, e_local),
+        "all_local": _local_ids(t, 8, seed, e_local),
         # The first and last local expert of the rank.
         "first_last": torch.tensor(
-            [[0, 31] + list(range(32 + 6 * i, 38 + 6 * i)) for i in range(t)],
+            [
+                [0, e_local - 1] + list(range(e_local + 6 * i, e_local + 6 + 6 * i))
+                for i in range(t)
+            ],
             dtype=torch.int32,
             device="cuda",
         ),
@@ -391,7 +406,7 @@ def test_stages_match_the_cutlass_composition(
     rows, perm = engine.run(u, ids)
     plan = engine.plan_tables()
 
-    e = E_LOCAL
+    e = layer.e_local
     local_ids = remap_topk_to_local(ids, layer.expert_map, out_dtype=torch.int32)
     eo = torch.empty(e + 1, dtype=torch.int32, device="cuda")
     bo = torch.empty_like(eo)
@@ -477,7 +492,7 @@ def test_output_matches_the_fake_quant_reference(
 ) -> None:
     engine = _Engine(layer, up_first)
     u, _, weights = _routing(t, 7)
-    for name, ids in _ids_cases(t, 11).items():
+    for name, ids in _ids_cases(t, 11, layer.e_local).items():
         out = engine.final_output(u, ids, weights)
         key = (t, name)  # the references do not depend on the weight layout
         if key not in layer.references:
@@ -535,7 +550,9 @@ def test_bitwise_deterministic_eager_and_graph(layer: _Layer, t: int) -> None:
     for i in range(6):
         u, ids, _ = _routing(t, 40 + i)
         if i % 2:
-            ids = _local_ids(t, [1 + (i + k) % 5 for k in range(t)], 60 + i)
+            ids = _local_ids(
+                t, [1 + (i + k) % 5 for k in range(t)], 60 + i, layer.e_local
+            )
         inputs.append((u, ids))
     ref = [_valid(*engine.run(u, ids)) for u, ids in inputs]
     for i in range(50):
@@ -566,7 +583,7 @@ def test_poisoned_scratch_and_unused_experts_do_not_matter(layer: _Layer) -> Non
     engine = _Engine(layer)
     t = 4
     u, _, _ = _routing(t, 80)
-    ids = _local_ids(t, [2, 1, 3, 0], 81)
+    ids = _local_ids(t, [2, 1, 3, 0], 81, layer.e_local)
     base = _valid(*engine.run(u, ids))
     rows, perm = engine.out_buffers(t)
     rows.fill_(float("nan"))
@@ -581,7 +598,7 @@ def test_poisoned_scratch_and_unused_experts_do_not_matter(layer: _Layer) -> Non
     # The weights and the block scales of unused experts are never read either.
     used = set(engine.plan_tables()["expert"])
     saved = {}
-    for e in range(E_LOCAL):
+    for e in range(layer.e_local):
         if e not in used:
             saved[e] = (
                 layer.w13[e].clone(),
@@ -609,7 +626,7 @@ def test_poisoned_scratch_and_unused_experts_do_not_matter(layer: _Layer) -> Non
 def test_token_rows_do_not_depend_on_the_other_tokens(layer: _Layer) -> None:
     engine = _Engine(layer)
     u, _, _ = _routing(8, 90)
-    ids = _local_ids(8, [3, 2, 4, 5, 1, 6, 2, 3], 91)
+    ids = _local_ids(8, [3, 2, 4, 5, 1, 6, 2, 3], 91, layer.e_local)
     alone = engine.run(u[:1].contiguous(), ids[:1].contiguous())
     one = alone[0][:8][alone[1][:8] >= 0].clone().view(torch.int16)
     for t in (2, 4, 8):
@@ -646,8 +663,9 @@ def test_identity_expert_map(layer: _Layer, t: int) -> None:
     """Without an expert map (TP) the global ids are the local ones."""
     engine = _Engine(layer)
     u, _, _ = _routing(t, 120)
-    ids = _local_ids(t, 8, 121)
-    ids = torch.where(ids < E_LOCAL, ids, ids % E_LOCAL).to(torch.int32).contiguous()
+    ids = _local_ids(t, 8, 121, layer.e_local)
+    e_local = layer.e_local
+    ids = torch.where(ids < e_local, ids, ids % e_local).to(torch.int32).contiguous()
     # layer.expert_map is the identity on the local experts.
     with_map = _valid(*engine.run(u, ids))
     rows, perm = engine.out_buffers(t)
@@ -689,7 +707,7 @@ def test_no_local_route_leaves_everything_untouched(layer: _Layer, t: int) -> No
     written and the counters of the persistent kernel stay zero."""
     engine = _Engine(layer)
     u, _, _ = _routing(t, 130)
-    ids = _local_ids(t, 0, 131)
+    ids = _local_ids(t, 0, 131, layer.e_local)
     rows, perm = engine.out_buffers(t)
     rows.fill_(float("nan"))
     perm.fill_(7)
@@ -711,7 +729,7 @@ def test_negative_and_unmapped_ids_are_non_local_routes(layer: _Layer, t: int) -
     no work, perm_idx = -1 and leave the other rows unchanged."""
     engine = _Engine(layer)
     u, _, _ = _routing(t, 140)
-    ids = _local_ids(t, [3] * t, 141)
+    ids = _local_ids(t, [3] * t, 141, layer.e_local)
     base = _valid(*engine.run(u, ids))
     bad = ids.clone()
     non_local = (layer.expert_map[ids.long()] < 0).view(-1).nonzero().flatten()
@@ -737,7 +755,7 @@ def test_negative_and_unmapped_ids_are_non_local_routes(layer: _Layer, t: int) -
 def test_counters_are_zero_after_every_launch(layer: _Layer, t: int) -> None:
     engine = _Engine(layer)
     u, _, _ = _routing(t, 150)
-    for name, ids in _ids_cases(t, 151).items():
+    for name, ids in _ids_cases(t, 151, layer.e_local).items():
         for _ in range(2):
             engine.run(u, ids)
             assert engine.counters_are_zero(), name
@@ -754,7 +772,7 @@ def test_launch_variants_are_bitwise_equal(layer: _Layer, t: int) -> None:
     gs0 = layer.gs[:1].contiguous()
     xq_data, xq_sf = ops.scaled_fp4_quant(u, gs0, is_sf_swizzled_layout=False)
     xq = (xq_data.view(torch.uint8).contiguous(), xq_sf.view(torch.uint8).contiguous())
-    for name, ids in _ids_cases(t, 161).items():
+    for name, ids in _ids_cases(t, 161, layer.e_local).items():
         ref = _valid(*engine.run(u, ids))
         variants = {
             "two_launch": dict(flags=FLAG_TWO_LAUNCH),

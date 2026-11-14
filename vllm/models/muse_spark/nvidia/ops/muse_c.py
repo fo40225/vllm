@@ -129,7 +129,10 @@ def _build_flags(nvcc_version: tuple[int, int]) -> tuple[list[str], list[str]]:
 def _build_directory(nvcc: str, cflags: list[str], cuda_cflags: list[str]) -> str:
     # Key the build directory on everything that affects the binary, so that
     # workers with different sources, torch or nvcc never share (or clobber)
-    # one build.
+    # one build. The digest includes the nvcc path, so a cache copied to a host
+    # with another CUDA_HOME is rebuilt, not reused. VLLM_CACHE_ROOT must be
+    # node-local: the build lock is an fcntl.flock, which some network
+    # filesystems do not honor across hosts.
     digest = hashlib.sha256()
     for path in sorted(_CSRC_DIR.iterdir()):
         if path.suffix in _CSRC_SUFFIXES:
