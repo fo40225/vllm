@@ -28,6 +28,7 @@ def _create_vllm_config_for_dsd(
     cudagraph_mode: CUDAGraphMode = CUDAGraphMode.FULL_AND_PIECEWISE,
     use_dynamic_sd: bool = True,
     num_spec_per_batch_size: list[tuple[int, int, int]] | None = None,
+    max_capture_tokens: int | None = None,
 ) -> MagicMock:
     """Create a minimal config that exercises DSD cudagraph dispatch.
 
@@ -37,10 +38,12 @@ def _create_vllm_config_for_dsd(
     ``num_spec_per_batch_size`` lets a test supply an explicit DSD schedule of
     ``(range_start, range_end, num_speculative_tokens)`` tuples. When omitted,
     a schedule covering every query length in ``[1, max_decode_query_len]`` is
-    generated.
+    generated. ``max_capture_tokens`` lowers the capture ceiling (the
+    ``--max-cudagraph-capture-size``) from ``max_num_seqs * max_decode_query_len``.
     """
     max_decode_query_len = max_spec_tokens + 1
-    max_capture_tokens = max_num_seqs * max_decode_query_len
+    if max_capture_tokens is None:
+        max_capture_tokens = max_num_seqs * max_decode_query_len
 
     compilation_config = CompilationConfig(
         cudagraph_mode=cudagraph_mode,
@@ -426,6 +429,84 @@ def test_dynamic_sd_only_captures_scheduled_query_lengths(monkeypatch):
                 assert desc.num_tokens == num_tokens
                 assert desc.num_reqs is None
             assert desc.num_active_loras == 0
+
+
+# The first schedule of the drafter selection: K = 0 from 65 requests on, tiers whose
+# padded token count R * (1 + K) stays within 128.
+CUTOFF_SCHEDULE = [(1, 16, 7), (17, 32, 3), (33, 64, 1), (65, 256, 0)]
+
+
+@pytest.mark.parametrize("max_capture_tokens", [None, 256])
+def test_dynamic_sd_k0_tier_is_a_full_plain_decode_graph(
+    monkeypatch, max_capture_tokens
+):
+    """K = 0 is the plain decode tier (one token per request) and gets FULL graphs.
+
+    With the cutoff schedule the steady-state step at every batch size (K from the
+    schedule, 1 + K tokens per request) replays a FULL graph, K = 0 up to the
+    largest batch included.
+    """
+    from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
+
+    max_num_seqs, max_spec_tokens = 256, 7
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    vllm_config = _create_vllm_config_for_dsd(
+        max_num_seqs=max_num_seqs,
+        max_spec_tokens=max_spec_tokens,
+        num_spec_per_batch_size=CUTOFF_SCHEDULE,
+        max_capture_tokens=max_capture_tokens,
+    )
+    manager = gpu_cudagraph_utils.CudaGraphManager(
+        vllm_config=vllm_config,
+        device=torch.device("cpu"),
+        cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+        decode_query_len=max_spec_tokens + 1,
+    )
+    manager._graphs_captured = True
+
+    tiers = {
+        desc.uniform_token_count for desc in manager._capture_descs[CUDAGraphMode.FULL]
+    }
+    assert tiers == {8, 4, 2, 1}
+    k0_reqs = [
+        desc.num_reqs
+        for desc in manager._capture_descs[CUDAGraphMode.FULL]
+        if desc.uniform_token_count == 1
+    ]
+    assert max(k0_reqs) == max_num_seqs
+
+    lookup = build_dynamic_sd_schedule_lookup(
+        CUTOFF_SCHEDULE,
+        vllm_max_batch_size=max_num_seqs,
+        vllm_num_speculative_tokens=max_spec_tokens,
+    )
+    for num_reqs in range(1, max_num_seqs + 1):
+        query_len = 1 + lookup[num_reqs]
+        num_tokens = num_reqs * query_len
+        uniform_tok_count = get_uniform_decode_token_count(
+            num_reqs, num_tokens, query_len, decode_graph_eligible=True
+        )
+        assert uniform_tok_count == query_len
+        desc = manager.dispatch(
+            num_reqs=num_reqs,
+            num_tokens=num_tokens,
+            uniform_token_count=uniform_tok_count,
+            num_active_loras=0,
+        )
+        assert desc.cg_mode == CUDAGraphMode.FULL, (num_reqs, query_len)
+        assert desc.uniform_token_count == query_len
+        assert desc.num_reqs == num_reqs and desc.num_tokens == num_tokens
+    assert lookup[max_num_seqs] == 0 and lookup[65] == 0 and lookup[64] == 1
+
+    # The K = 0 step of a full batch: 256 requests, one token each.
+    desc = manager.dispatch(
+        num_reqs=256, num_tokens=256, uniform_token_count=1, num_active_loras=0
+    )
+    assert desc.cg_mode == CUDAGraphMode.FULL and desc.uniform_token_count == 1
 
 
 @pytest.mark.parametrize("max_spec_tokens", [3, 7])

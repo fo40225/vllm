@@ -172,9 +172,9 @@ class CudaGraphManager:
         self.cudagraph_mode = cudagraph_mode
         self.decode_query_len = decode_query_len
         # False: the caller always runs ``decode_query_len`` tokens per request,
-        # whatever the dynamic speculative decoding schedule asks of the target, so
-        # only that uniform decode tier is ever dispatched and the others are not
-        # captured.
+        # whatever the dynamic speculative decoding schedule asks of the target (or
+        # no step at all, at K == 0), so only that uniform decode tier is ever
+        # dispatched and the others are not captured.
         self.dynamic_decode_query_len = dynamic_decode_query_len
         self.varlen_decode = varlen_decode
         # DBO supports FULL CUDA graphs only.
