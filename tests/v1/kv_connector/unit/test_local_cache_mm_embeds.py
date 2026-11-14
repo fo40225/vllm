@@ -137,4 +137,4 @@ def test_language_model_only_consumer(name, enable_mm_embeds, allow_missing):
     mm_config.enable_mm_embeds = enable_mm_embeds
     VllmConfig._resolve_mm_embedding_inputs(fake)
     assert mm_config.allow_missing_mm_embeddings is allow_missing
-    assert mm_config.enable_mm_embeds is enable_mm_embeds or allow_missing
+    assert mm_config.enable_mm_embeds is (enable_mm_embeds or allow_missing)

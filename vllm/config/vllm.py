@@ -2876,9 +2876,9 @@ class VllmConfig:
 
         try:
             connector_cls = KVConnectorFactory.get_connector_class(kv_config)
+            return connector_cls.receives_remote_kv(kv_config.kv_connector_extra_config)
         except (ValueError, AttributeError, ImportError):
             return True
-        return connector_cls.receives_remote_kv(kv_config.kv_connector_extra_config)
 
     def _resolve_mm_embedding_inputs(self) -> None:
         """Accept embedding inputs, tensor optional, on disaggregated consumers.
@@ -2898,7 +2898,6 @@ class VllmConfig:
         ec_config = self.ec_transfer_config
         kv_config = self.kv_transfer_config
         is_ec_consumer = ec_config is not None and ec_config.is_ec_consumer
-        is_kv_consumer = kv_config is not None and kv_config.is_kv_consumer
         # Derived, so overwrite unconditionally rather than honouring a value
         # that was set by hand.
         # A language-model-only KV consumer (text-only P/D) stays text-only
@@ -2907,7 +2906,8 @@ class VllmConfig:
         # no consumer here, with or without --language-model-only (the Muse
         # Spark launch limits every modality to 0 instead of setting that flag).
         mm_config.allow_missing_mm_embeddings = is_ec_consumer or (
-            is_kv_consumer
+            kv_config is not None
+            and kv_config.is_kv_consumer
             and (not mm_config.language_model_only or mm_config.enable_mm_embeds)
             and self._kv_connector_receives_remote_kv(kv_config)
         )
