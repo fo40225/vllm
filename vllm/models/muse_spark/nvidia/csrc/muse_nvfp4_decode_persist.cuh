@@ -342,8 +342,9 @@ __global__ void __launch_bounds__(kBlockThreads, 1)
         const int col0 = plan.col0[g];
         uint8_t* hs = uni + slot * (CMAX * kHcolBytes);
         if constexpr (BULK) {
-          // Lane n < cnt: codes of hq row col0 + n; lane cnt + n: its scales.
-          const int n = lane < cnt ? lane : lane - cnt;
+          // Lane n < cnt: codes of hq row col0 + n; lane cnt + n: its scales. The lanes
+          // beyond 2 cnt copy nothing; the clamp keeps their (unused) source in range.
+          const int n = lane < cnt ? lane : min(lane - cnt, cnt - 1);
           const uint8_t* src =
               lane < cnt ? p.hq_data + static_cast<size_t>(col0 + n) * kRowBytes +
                                s * kHalfBytes
@@ -374,8 +375,9 @@ __global__ void __launch_bounds__(kBlockThreads, 1)
         const int cnt = plan.cnt[g];
         uint8_t* hs = uni + slot * (CMAX * kHcolBytes);
         if constexpr (BULK) {
-          // Lane n < cnt: codes of the token of column n; lane cnt + n: its scales.
-          const int n = lane < cnt ? lane : lane - cnt;
+          // Lane n < cnt: codes of the token of column n; lane cnt + n: its scales. The
+          // lanes beyond 2 cnt copy nothing; the clamp keeps their (unused) source in range.
+          const int n = lane < cnt ? lane : min(lane - cnt, cnt - 1);
           const int tok = lane < 2 * cnt ? plan.route[g][n] >> 3 : 0;
           const uint8_t* src =
               lane < cnt ? p.xq_buf + static_cast<size_t>(tok) * kRowBytes +
