@@ -172,6 +172,8 @@ if TYPE_CHECKING:
     VLLM_MUSE_SPARK_SM120_TOPK_LOGITS_MIN_TOKENS: int = 2
     VLLM_MUSE_SPARK_SM120_VERIFY_TOPK_LOGITS: int = 3
     VLLM_MUSE_SPARK_SM120_DRAFT_FC_SHARD: int = 2
+    VLLM_MUSE_SPARK_SM120_DRAFT_FP8: int = 0
+    VLLM_MUSE_SPARK_SM120_DRAFT_FP8_KERNEL: str = "cutlass"
     VLLM_MUSE_SPARK_SM120_FI_HOST_LENS: int = 2
     VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT: bool = True
     VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT_TABLE: str | None = None
@@ -1846,6 +1848,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Read once, when the draft model is constructed.
     "VLLM_MUSE_SPARK_SM120_DRAFT_FC_SHARD": lambda: int(
         os.getenv("VLLM_MUSE_SPARK_SM120_DRAFT_FC_SHARD", "2")
+    ),
+    # Muse Spark on SM120: the DFlash2 draft's weights in FP8 (e4m3, one scale per output
+    # channel, quantized at load from the bf16 checkpoint). At decode the draft's GEMMs
+    # (gate_up, down, QKV, O and the ten kernel projections) are weight-streaming bound
+    # at 1.2-1.4 TB/s, so e4m3 halves their time. 0: bf16 (the draft as loaded). 1: the
+    # linear layers of the draft layers and their kernel projections; the aux fc stays
+    # bf16 (FC_SHARD=2 slices and gathers it) and so do the candidate head, which is the
+    # target's lm_head, and the fused context K/V weight. The verification is exact (the
+    # draft is a proposal, the rejection sampler keeps the output distribution); the
+    # cost is acceptance length, so every change of the value needs the AL check. Frees
+    # about 670 MiB per rank (re-derive --kv-cache-memory-bytes). Read once, when the
+    # draft model is loaded.
+    "VLLM_MUSE_SPARK_SM120_DRAFT_FP8": lambda: int(
+        os.getenv("VLLM_MUSE_SPARK_SM120_DRAFT_FP8", "0")
+    ),
+    # Muse Spark on SM120: the GEMM behind VLLM_MUSE_SPARK_SM120_DRAFT_FP8: "marlin" =
+    # weight-only FP8 (bf16 activations: the lowest error, the same time as cutlass up to
+    # 64 rows, slower above) or "cutlass" = FP8 weights and dynamic per-token FP8
+    # activations on the FP8 tensor cores.
+    "VLLM_MUSE_SPARK_SM120_DRAFT_FP8_KERNEL": lambda: os.getenv(
+        "VLLM_MUSE_SPARK_SM120_DRAFT_FP8_KERNEL", "cutlass"
     ),
     # Muse Spark on SM120: when the FlashInfer metadata builder reads the sequence
     # lengths back from the device (seq_lens.cpu(): a pageable DtoH that synchronizes

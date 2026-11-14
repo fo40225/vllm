@@ -23,6 +23,7 @@ from vllm.model_executor.layers.linear import (
     UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.muse_draft_fp8 import quantize_draft_linear
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -453,6 +454,45 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
             vllm_config.model_config.get_vocab_size(),
             scale=float(draft_config.get("output_multiplier", 1.0)),
             soft_cap=softcap if softcap > 0 else None,
+        )
+
+    def process_weights_after_loading(self) -> None:
+        """Quantize the draft layers to FP8 (VLLM_MUSE_SPARK_SM120_DRAFT_FP8 >= 1).
+
+        Runs from the model loader after the weights are loaded and finalized, which
+        is after ``load_weights`` built the fused context K/V weight: that stays bf16
+        (the context projection is a prefill-sized GEMM, 21 MB per rank). The aux fc
+        stays bf16 as well: VLLM_MUSE_SPARK_SM120_DRAFT_FC_SHARD=2 slices its rows.
+        """
+        mode = envs.VLLM_MUSE_SPARK_SM120_DRAFT_FP8
+        if mode not in (0, 1):
+            raise ValueError(f"VLLM_MUSE_SPARK_SM120_DRAFT_FP8={mode}: expected 0 or 1.")
+        if mode == 0:
+            return
+        kernel = envs.VLLM_MUSE_SPARK_SM120_DRAFT_FP8_KERNEL
+        count = 0
+        freed = 0
+        for layer in self.model.layers:
+            for linear in (
+                layer.self_attn.qkv_proj,
+                layer.self_attn.o_proj,
+                layer.mlp.gate_up_proj,
+                layer.mlp.down_proj,
+                layer.attention_conv.kernel_projection,
+                layer.mlp_conv.kernel_projection,
+            ):
+                saved = quantize_draft_linear(linear, kernel)
+                count += saved > 0
+                freed += saved
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()  # hand the bf16 weights back to the driver
+        logger.info(
+            "DFlash2 draft weights in FP8 (VLLM_MUSE_SPARK_SM120_DRAFT_FP8=%d, "
+            "kernel %s): %d linear layers quantized, %.0f MiB freed per rank.",
+            mode,
+            kernel,
+            count,
+            freed / 2**20,
         )
 
     @staticmethod
