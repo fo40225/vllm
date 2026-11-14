@@ -80,6 +80,14 @@ TORCH_LIBRARY(_muse_C, m) {
       "Tensor sf13, Tensor w2, Tensor sf2, bool up_first, int num_ctas, "
       "int budget_bytes, bool pdl, Tensor!? dump=None) -> ()");
 
+  // Skinny split-K GEMM of the decode layers, see muse_c_ops.h.
+  m.def(
+      "decode_gemm(Tensor x, Tensor w, Tensor! out, Tensor! scratch, "
+      "int cfg=-1, bool early_w=False, bool pdl=False) -> ()");
+  m.def("decode_gemm_scratch_floats(int N, int rows, int bn, int split) -> int");
+  m.def("decode_gemm_num_configs() -> int");
+  m.def("decode_gemm_config(int i) -> int[]");
+
   // Router GEMV of the decode layer, see muse_c_ops.h.
   m.def("router_gemv(Tensor x, Tensor w, Tensor! out, bool pdl) -> ()");
 
@@ -99,6 +107,13 @@ TORCH_LIBRARY(_muse_C, m) {
       "-> ()");
 }
 
+// The tile table of decode_gemm: no tensor argument, so no backend key to dispatch on.
+TORCH_LIBRARY_IMPL(_muse_C, CompositeExplicitAutograd, m) {
+  m.impl("decode_gemm_num_configs", &muse_spark::decode_gemm_num_configs);
+  m.impl("decode_gemm_config", &muse_spark::decode_gemm_config);
+  m.impl("decode_gemm_scratch_floats", &muse_spark::decode_gemm_scratch_floats);
+}
+
 TORCH_LIBRARY_IMPL(_muse_C, CUDA, m) {
   m.impl("mul_and_silu_scaled_fp4_experts_quant",
          &muse_spark::mul_and_silu_scaled_fp4_experts_quant);
@@ -116,6 +131,7 @@ TORCH_LIBRARY_IMPL(_muse_C, CUDA, m) {
   m.impl("l2_prefetch", &muse_spark::l2_prefetch);
   m.impl("expert_prefetch", &muse_spark::expert_prefetch);
   m.impl("router_gemv", &muse_spark::router_gemv);
+  m.impl("decode_gemm", &muse_spark::decode_gemm);
   m.impl("muse_spark_mul_tanh_soft_cap",
          &muse_spark::muse_spark_mul_tanh_soft_cap);
   m.impl("fused_muse_spark_qknorm_rope_kv_insert",

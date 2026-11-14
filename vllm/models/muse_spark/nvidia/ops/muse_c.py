@@ -48,6 +48,7 @@ _SOURCES = (
     "muse_spark_expert_prefetch.cu",
     "muse_spark_l2_prefetch.cu",
     "muse_spark_router_gemv.cu",
+    "muse_spark_decode_gemm.cu",
     "muse_spark_mul_tanh_soft_cap.cu",
     "muse_spark_qknorm_rope_kv_insert.cu",
 )

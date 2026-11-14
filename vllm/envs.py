@@ -171,6 +171,7 @@ if TYPE_CHECKING:
     VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT: bool = True
     VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT_TABLE: str | None = None
     VLLM_MUSE_SPARK_SM120_DENSE_Q: bool = False
+    VLLM_MUSE_SPARK_SM120_DECODE_GEMM: bool = False
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
     VLLM_ROCM_USE_AITER_LINEAR_HIPBMM: bool = False
     VLLM_ROCM_USE_AITER_MOE: bool = True
@@ -1736,6 +1737,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the model is constructed.
     "VLLM_MUSE_SPARK_SM120_DENSE_Q": lambda: bool(
         int(os.getenv("VLLM_MUSE_SPARK_SM120_DENSE_Q", "0"))
+    ),
+    # Muse Spark on SM120: run the QKV projection and the sharded pooler / unpooler of up
+    # to 64 rows (padded decode batches) as one kernel, ``_muse_C::decode_gemm``, instead
+    # of the cuBLAS cutlass GEMM plus its split-K reduction kernel
+    # (``cublasLt::splitKreduce_kernel``, 2 to 3 us and a launch per GEMM). K is split
+    # over a thread block cluster of 4 or 8 CTAs, every CTA stores its fp32 partial tile to
+    # a scratch buffer and, after one cluster barrier, adds the pieces of its rows in rank
+    # order. Rounding-level change: another (fixed) order of the additions than cuBLAS, a
+    # fp32 partial sum where cuBLAS keeps a bf16 workspace for some shapes; deterministic,
+    # the same on every TP rank and independent of the row count. Above 64 rows, with a
+    # bias, with LoRA (for the QKV projection) or off SM120 the cuBLAS path stays.
+    # Default off. Read once, when the model is constructed.
+    "VLLM_MUSE_SPARK_SM120_DECODE_GEMM": lambda: bool(
+        int(os.getenv("VLLM_MUSE_SPARK_SM120_DECODE_GEMM", "0"))
     ),
     # use aiter linear op if aiter ops are enabled
     # The following list of related ops

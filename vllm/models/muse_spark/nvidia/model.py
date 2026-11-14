@@ -52,7 +52,7 @@ import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
 from vllm.compilation.decorators import ignore_torch_compile
-from vllm.config import CacheConfig, VllmConfig
+from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
@@ -69,6 +69,7 @@ from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4Config
@@ -121,6 +122,7 @@ from vllm.models.muse_spark.nvidia.muse_moe_runner import (
     MuseSparkRoutedExperts,
     expert_placement_blocker,
 )
+from vllm.models.muse_spark.nvidia.ops import decode_gemm as decode_gemm_ops
 from vllm.models.muse_spark.nvidia.ops import fused_boundary, muse_c
 from vllm.models.muse_spark.nvidia.ops.cute_dsl.qk_norm import (
     qk_norm,
@@ -1060,6 +1062,11 @@ class MuseSpark1xMoE(nn.Module):
         self._projection_gemm = dispatch_unquantized_gemm(
             vllm_config.kernel_config.linear_backend
         )
+        if envs.VLLM_MUSE_SPARK_SM120_DECODE_GEMM and _on_sm120():
+            # The sharded projections of up to 64 rows as one split-K kernel.
+            self._projection_gemm = decode_gemm_ops.wrap_projection(
+                self._projection_gemm
+            )
         self.min_sharded_unpooler_tokens = (
             _MULTI_NODE_SHARDED_UNPOOLER_MIN_TOKENS
             if self.shard_unpooler and tp_group_spans_nodes()
@@ -2153,6 +2160,19 @@ class MuseSpark1xAttention(nn.Module):
             and self.default_dtype in (torch.bfloat16, torch.float16)
             and supports_fused_kv_insert(self.attn)
         )
+        # The QKV projection of up to 64 rows as one split-K kernel instead of cuBLAS
+        # and its reduction kernel.
+        self.decode_gemm = (
+            envs.VLLM_MUSE_SPARK_SM120_DECODE_GEMM
+            and _on_sm120()
+            and self.qkv_proj.bias is None
+            and isinstance(self.qkv_proj.quant_method, UnquantizedLinearMethod)
+            # A LoRA wrapper of qkv_proj would be bypassed by the direct weight read.
+            and get_current_vllm_config().lora_config is None
+            and decode_gemm_ops.available()
+        )
+        if self.decode_gemm:
+            decode_gemm_ops.reserve_scratch()
         # The fused kernel writes Q densely, so that FlashInfer does not copy it.
         self.dense_q = (
             envs.VLLM_MUSE_SPARK_SM120_DENSE_Q
@@ -2248,7 +2268,14 @@ class MuseSpark1xAttention(nn.Module):
         With ``defer_all_reduce`` the output is this rank's partial sum: the caller
         reduces it (together with the residual boundary, where it can).
         """
-        qkv, _ = self.qkv_proj(hidden_states)
+        if (
+            self.decode_gemm
+            and decode_gemm_ops.usable(hidden_states)
+            and decode_gemm_ops.supports_weight(self.qkv_proj.weight)
+        ):
+            qkv = decode_gemm_ops.decode_gemm(hidden_states, self.qkv_proj.weight)
+        else:
+            qkv, _ = self.qkv_proj(hidden_states)
         if self.after_qkv_hook is not None:
             self.after_qkv_hook(qkv.shape[0])
 

@@ -196,6 +196,23 @@ void fused_muse_spark_qknorm_rope_kv_insert(
     std::optional<at::Tensor> const& q_scale,
     std::optional<at::Tensor> const& q_out);
 
+// Skinny bf16 GEMM out[T, N] = x[T, K] . w[N, K]^T of the decode layers (1 <= T <= 128),
+// fp32 accumulation, split-K inside a thread block cluster with the partial tiles added
+// through a global scratch buffer, in rank order (muse_spark_decode_gemm.cu). cfg
+// indexes the tile table (decode_gemm_config; it includes the K split), -1: the tuned
+// choice for the shape. With pdl the kernel is a programmatic dependent of its
+// predecessor (griddepcontrol.wait before it reads x), early_w requests the first
+// weight tiles before that wait.
+void decode_gemm(at::Tensor const& x, at::Tensor const& w, at::Tensor& out,
+                 at::Tensor& scratch, int64_t cfg, bool early_w, bool pdl);
+int64_t decode_gemm_num_configs();
+// fp32 elements of `scratch` that a config with 16-row tiles x `rows`, bn columns and
+// the K split needs for a GEMM of N columns.
+int64_t decode_gemm_scratch_floats(int64_t N, int64_t rows, int64_t bn,
+                                   int64_t split);
+// {MT (16-row tiles), BN, warps along M, warps along N, stages, K split} of config i.
+std::vector<int64_t> decode_gemm_config(int64_t i);
+
 // Asynchronous L2 prefetch of up to 4 contiguous 16 B aligned tensors
 // (muse_spark_l2_prefetch.cu): each CTA issues cp.async.bulk.prefetch.L2 for its
 // share of `chunk_kib` KiB chunks and exits. With evict_last the lines get the
