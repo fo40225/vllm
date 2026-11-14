@@ -775,6 +775,86 @@ def test_identity_expert_map(layer: _Layer, t: int) -> None:
     assert torch.equal(with_map[1], without_map[1])
 
 
+def _relabeled(layer: _Layer, ids: torch.Tensor, seed: int):
+    """``ids`` and the map after the global expert ids are permuted by a random pi.
+
+    The map sends pi(g) to the slot that the layer's map sends g to, so the layer
+    holds the same weights in the same slots under other, scattered global ids, and
+    every route goes to the same slot as before. That is what an expert placement does
+    to a rank: it changes which global ids are local and where, not the weights'
+    arithmetic.
+    """
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    pi = torch.randperm(E_GLOBAL, device="cuda", generator=g)
+    emap = torch.empty_like(layer.expert_map)
+    emap[pi] = layer.expert_map
+    return pi[ids.long()].to(torch.int32).contiguous(), emap
+
+
+@pytest.mark.parametrize("up_first", [False, True])
+@pytest.mark.parametrize("t", [1, 2, 4, 8, 9, 24, MAX_LARGE_T])
+@torch.inference_mode()
+def test_scattered_expert_map_gives_the_same_rows(
+    layer: _Layer, t: int, up_first: bool
+) -> None:
+    """The small- and large-batch kernels find the local routes through the expert
+    map alone: under a map that sends scattered global ids to the slots (any order,
+    local ids anywhere in 0 .. E_GLOBAL) they write the very rows, and the same
+    permute map, as under the layer's own (static placement of the experts)."""
+    engine = _Engine(layer, up_first=up_first)
+    u, mixed, _ = _routing(t, 130 + t)
+    local_routes = 0
+    for ids in (
+        mixed,
+        _local_ids(t, 8, 131 + t, layer.e_local),
+        _local_ids(t, [1 + k % 5 for k in range(t)], 132 + t, layer.e_local),
+    ):
+        want = _valid(*engine.run(u, ids))
+        local_routes += int(want[1].ge(0).sum())
+        for seed in (1, 2):
+            ids_pi, emap = _relabeled(layer, ids, seed)
+            got = _valid(*engine.run(u, ids_pi, expert_map=emap))
+            assert torch.equal(got[0], want[0]) and torch.equal(got[1], want[1])
+    assert local_routes >= 8 * t
+
+
+@pytest.mark.parametrize("t", [1, 8, 33])
+@torch.inference_mode()
+def test_scattered_expert_map_replays_from_a_graph(layer: _Layer, t: int) -> None:
+    """The captured launch reads the map and the ids from device memory: replays with
+    other relabelings (ids and the map change in place) write the rows of the layer's
+    own map."""
+    engine = _Engine(layer)
+    inputs = []
+    for i in range(3):
+        u, ids, _ = _routing(t, 150 + i)
+        if i == 1:
+            ids = _local_ids(t, 8, 151, layer.e_local)
+        ids_pi, emap = _relabeled(layer, ids, 20 + i)
+        inputs.append((u, ids, ids_pi, emap))
+    want = [_valid(*engine.run(u, ids)) for u, ids, _, _ in inputs]
+    u_s = inputs[0][0].clone()
+    ids_s = inputs[0][2].clone()
+    emap_s = inputs[0][3].clone()
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        engine.run(u_s, ids_s, expert_map=emap_s)
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        rows, perm = engine.run(u_s, ids_s, expert_map=emap_s)
+    for i in range(6):
+        k = i % len(inputs)
+        u_s.copy_(inputs[k][0])
+        ids_s.copy_(inputs[k][2])
+        emap_s.copy_(inputs[k][3])
+        graph.replay()
+        got = _valid(rows, perm)
+        assert torch.equal(got[0], want[k][0]) and torch.equal(got[1], want[k][1])
+
+
 @pytest.mark.parametrize("t", [2, 24])
 @torch.inference_mode()
 def test_no_host_synchronization(layer: _Layer, t: int) -> None:

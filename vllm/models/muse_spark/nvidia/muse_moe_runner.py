@@ -988,6 +988,40 @@ class MuseSparkRoutedExperts(MuseSparkConsolidatedRoutedExperts):
         return MuseSparkUnquantizedFusedMoE(moe_config)
 
 
+def expert_placement_blocker(routed_experts: MuseSparkRoutedExperts) -> str | None:
+    """Why this layer cannot run another expert placement than the linear one, None if
+    it can (``ops/expert_placement.py``).
+
+    A placement is the layer's ``expert_map``. The SM120 native NVFP4 experts and the
+    route-major Triton experts of the BF16 layers locate the routes of a rank through
+    it; the monolithic TRT-LLM kernels derive the local range from the rank number
+    (``local_expert_offset``), and the EPLB machinery owns the map where it is on.
+    """
+    quant_method = routed_experts.quant_method
+    if isinstance(quant_method, MuseSparkModelOptNvFp4FusedMoE):
+        if not quant_method.use_sm120_native:
+            return (
+                "the NVFP4 experts of the layer are not the SM120 native ones (the "
+                "other kernels take the local expert range from the rank number)"
+            )
+    elif isinstance(quant_method, MuseSparkUnquantizedFusedMoE):
+        if not (
+            quant_method.use_route_major and quant_method.experts_cls is TritonExperts
+        ):
+            return (
+                "the BF16 experts of the layer are not the route-major Triton ones "
+                "(the TRT-LLM kernel takes the local expert range from the rank "
+                "number)"
+            )
+    else:
+        return f"unknown quant method {type(quant_method).__name__}"
+    if routed_experts.moe_config.moe_parallel_config.enable_eplb:
+        return "EPLB moves the experts itself"
+    if uses_modular_all2all(routed_experts.moe_config):
+        return "the all2all backend dispatches by the linear placement"
+    return None
+
+
 class MuseMoERunner(MoERunner):
     """MoE runner that splices MuseSpark1x's post-expert norm into the experts."""
 

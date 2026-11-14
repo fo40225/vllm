@@ -168,6 +168,8 @@ if TYPE_CHECKING:
     VLLM_MUSE_SPARK_SM120_TOPK_LOGITS: bool = True
     VLLM_MUSE_SPARK_SM120_TOPK_LOGITS_K: int = 64
     VLLM_MUSE_SPARK_SM120_TOPK_LOGITS_MIN_TOKENS: int = 2
+    VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT: bool = False
+    VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT_TABLE: str | None = None
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
     VLLM_ROCM_USE_AITER_LINEAR_HIPBMM: bool = False
     VLLM_ROCM_USE_AITER_MOE: bool = True
@@ -1697,6 +1699,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # two rows, so the default keeps batch 1 on the full path.
     "VLLM_MUSE_SPARK_SM120_TOPK_LOGITS_MIN_TOKENS": lambda: int(
         os.getenv("VLLM_MUSE_SPARK_SM120_TOPK_LOGITS_MIN_TOKENS", "2")
+    ),
+    # Muse Spark on SM120: place the experts of every MoE layer on the EP ranks by the
+    # table of the model snapshot (vllm/models/muse_spark/nvidia/data/
+    # expert_placement_<snapshot>.json) instead of the linear placement (rank r owns
+    # experts 32 r .. 32 r + 31). The table balances the prefill routes and the decode
+    # experts per rank over natural text, which shortens the wait of the ranks for the
+    # slowest one. Only where the layer is on the SM120 native NVFP4 experts or the BF16
+    # Triton experts, EP is on, and the table fits the model (snapshot, 62 layers, 256
+    # experts, EP8); any other layer, or a table that does not fit, keeps the linear
+    # placement with a warning. Not with EPLB. The routing, its ids and the model's
+    # function stay as they are; the experts of a rank are summed in another grouping,
+    # so the outputs differ at the rounding level (deterministically). A weight reload
+    # keeps the placement. Default off. Read once, when the model is constructed.
+    "VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT": lambda: bool(
+        int(os.getenv("VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT", "0"))
+    ),
+    # Muse Spark on SM120: path of an expert placement table to use instead of the
+    # packaged one (VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT=1). It is used whatever it
+    # is named; a snapshot that cannot be read from the model is trusted.
+    "VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT_TABLE": lambda: (
+        os.getenv("VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT_TABLE") or None
     ),
     # use aiter linear op if aiter ops are enabled
     # The following list of related ops

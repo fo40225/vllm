@@ -15,8 +15,10 @@ import torch.nn.functional as F
 
 import vllm.envs as envs
 from tests.kernels.moe.muse_spark_utils import (
+    install_placement,
     make_runner,
     nvfp4_quant_config,
+    random_placement_table,
     run_moe,
 )
 from vllm.config import set_current_vllm_config
@@ -804,6 +806,8 @@ HIDDEN = 1024
 # The expert paths of the model: NVFP4 W4A4 (CUTLASS grouped GEMMs, layers 1-60),
 # BF16 (Triton, layers 0 and 61) and the Marlin W4A16 route-major experts.
 BRANCH_KINDS = ("nvfp4_cutlass", "bf16_triton", "nvfp4_marlin")
+# The ones that take an expert placement (see muse_moe_runner.expert_placement_blocker).
+PLACEMENT_BRANCH_KINDS = ("nvfp4_cutlass", "bf16_triton")
 # 257 is the smallest batch the stream takes (33 rows per rank, the last padded).
 BRANCH_TOKENS = (1024, 700, 257)
 
@@ -835,8 +839,9 @@ def _marlin_checkpoint() -> dict[str, torch.Tensor]:
     }
 
 
-def _branch_experts(kind: str, expert_bias, parallel):
-    """(router, runner, vllm_config) of the expert path ``kind`` under ``parallel``."""
+def _branch_experts(kind: str, expert_bias, parallel, before_load=None):
+    """(router, runner, vllm_config) of the expert path ``kind`` under ``parallel``;
+    ``before_load`` runs on the runner ahead of its weights (an expert placement)."""
     if kind == "bf16_triton":
         g = torch.Generator(device="cuda").manual_seed(1)
         ckpt = {
@@ -871,10 +876,13 @@ def _branch_experts(kind: str, expert_bias, parallel):
         top_k=TOPK,
         moe_backend=backend,
         parallel_config=parallel,
+        before_load=before_load,
     )
 
 
-def _sharded_branch_worker(rank: int, world: int, port: int, out_path: str) -> None:
+def _sharded_branch_worker(
+    rank: int, world: int, port: int, out_path: str, placement: bool = False
+) -> None:
     from vllm.config import KernelConfig, ParallelConfig, VllmConfig
     from vllm.distributed import (
         init_distributed_environment,
@@ -912,8 +920,24 @@ def _sharded_branch_worker(rank: int, world: int, port: int, out_path: str) -> N
     muse_c.gather_packed_fp4_experts = spy
 
     results = {}
-    for kind in BRANCH_KINDS:
-        router, runner, vllm_config = _branch_experts(kind, expert_bias, parallel)
+    # With a placement the layer deals its experts to the ranks by a random table
+    # instead of in blocks (the Marlin experts are not a placement path), and the
+    # same branch on the linear placement is the reference.
+    table = random_placement_table(E, world, TOPK, seed=world) if placement else None
+    for kind in PLACEMENT_BRANCH_KINDS if placement else BRANCH_KINDS:
+        router, runner, vllm_config = _branch_experts(
+            kind,
+            expert_bias,
+            parallel,
+            before_load=install_placement(table) if placement else None,
+        )
+        if placement:
+            assert runner.routed_experts.expert_map_manager.placement_strategy == (
+                "custom"
+            )
+            _, linear_runner, linear_config = _branch_experts(
+                kind, expert_bias, parallel
+            )
         with set_current_vllm_config(vllm_config), torch.device("cuda"):
             pooler = ReplicatedLinear(
                 HIDDEN, K, bias=False, params_dtype=torch.bfloat16, quant_config=None
@@ -977,6 +1001,17 @@ def _sharded_branch_worker(rank: int, world: int, port: int, out_path: str) -> N
                         hidden_states=norm(pooler(x)[0]), router_logits=gate(x)[0]
                     )
                 )[0]
+                if placement:
+                    with (
+                        set_current_vllm_config(linear_config),
+                        set_forward_context(None, linear_config),
+                    ):
+                        linear_reference = unpooler(
+                            linear_runner.forward(
+                                hidden_states=norm(pooler(x)[0]),
+                                router_logits=gate(x)[0],
+                            )
+                        )[0].float()
                 # The sharded one: this rank's rows only, padded to a multiple of
                 # the world size.
                 rows = -(-num_tokens // world)
@@ -1023,7 +1058,23 @@ def _sharded_branch_worker(rank: int, world: int, port: int, out_path: str) -> N
                 torch.cuda.synchronize()
             reference = reference.float()
             diff = output.float() - reference
+            extra = {}
+            if placement:
+                linear_diff = output.float() - linear_reference
+                extra = dict(
+                    linear_rel_l2=float(linear_diff.norm() / linear_reference.norm()),
+                    linear_max_row_rel_l2=float(
+                        (
+                            linear_diff.norm(dim=1)
+                            / linear_reference.norm(dim=1).clamp_min(1e-12)
+                        ).max()
+                    ),
+                    replicated_vs_linear_rel_l2=float(
+                        (reference - linear_reference).norm() / linear_reference.norm()
+                    ),
+                )
             results[f"{kind}:{num_tokens}"] = dict(
+                **extra,
                 rel_l2=float(diff.norm() / reference.norm()),
                 max_row_rel_l2=float(
                     (diff.norm(dim=1) / reference.norm(dim=1).clamp_min(1e-12)).max()
@@ -1096,6 +1147,52 @@ def test_sharded_branch_matches_the_replicated_one(tmp_path, world: int) -> None
         assert result["nonzero"] > 0.99, (key, result)
         assert result["rel_l2"] < 1e-2, (key, result)
         assert result["max_row_rel_l2"] < 2e-2, (key, result)
+
+
+@requires_sm120
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires 2 or more GPUs")
+@pytest.mark.parametrize("world", [2, 8])
+def test_sharded_branch_on_an_expert_placement_matches_the_linear_one(
+    tmp_path, world: int
+) -> None:
+    """The experts dealt to the ranks by a random table instead of in blocks (the
+    layer's expert map replaced before its weights load): the real router, runner,
+    sequence-parallel stream with the packed latent, and a captured graph. Against
+    the replicated branch of the same layer and against the linear placement the
+    outputs differ by rounding only (another set of experts is summed on every rank);
+    a weight in the wrong slot, a route to the wrong rank or an expert left out would
+    be O(1)."""
+    if torch.cuda.device_count() < world:
+        pytest.skip(f"Requires {world} GPUs")
+    out_path = str(tmp_path / "results.json")
+    port = 29700 + os.getpid() % 1000 + world
+    mp.spawn(_sharded_branch_worker, args=(world, port, out_path, True), nprocs=world)
+    with open(out_path) as f:
+        results = json.load(f)
+    assert len(results) == len(PLACEMENT_BRANCH_KINDS) * len(BRANCH_TOKENS)
+    for key, result in results.items():
+        assert result["finite"] and result["nonzero"] > 0.99, (key, result)
+        # Bitwise repeatable, the same bits from a graph, and the packed latent is
+        # the bf16 latent gathered: what the linear placement guarantees too.
+        assert result["deterministic"] and result["graph_equal"], (key, result)
+        assert result["router_input_equal"] and result["packed_equal"], (key, result)
+        assert (result["packed_calls"] > 0) == key.startswith("nvfp4_cutlass"), (
+            key,
+            result,
+        )
+        assert result["skewed_packed_calls"] == 0 and result["skewed_equal"], (
+            key,
+            result,
+        )
+        # The sharded branch against the replicated one of the same layer: the
+        # rounding of the collectives (see the linear test above).
+        assert result["rel_l2"] < 1e-2, (key, result)
+        assert result["max_row_rel_l2"] < 2e-2, (key, result)
+        # And both against the linear placement of the same experts and router.
+        assert result["replicated_vs_linear_rel_l2"] < 1e-2, (key, result)
+        # Measured on 8 SM120 GPUs: 5.0e-3 and 6.0e-3 to 6.2e-3.
+        assert result["linear_rel_l2"] < 1e-2, (key, result)
+        assert result["linear_max_row_rel_l2"] < 2e-2, (key, result)
 
 
 # ------------------------------------------------------------------------------

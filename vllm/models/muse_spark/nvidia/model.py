@@ -118,11 +118,16 @@ from vllm.models.muse_spark.nvidia.muse_moe_runner import (
     MuseSpark1xRouter,
     MuseSparkMoEConfig,
     MuseSparkRoutedExperts,
+    expert_placement_blocker,
 )
 from vllm.models.muse_spark.nvidia.ops import fused_boundary, muse_c
 from vllm.models.muse_spark.nvidia.ops.cute_dsl.qk_norm import (
     qk_norm,
     supports_qk_norm,
+)
+from vllm.models.muse_spark.nvidia.ops.expert_placement import (
+    install_expert_placement,
+    load_matching_table,
 )
 from vllm.models.muse_spark.nvidia.ops.expert_prefetch import ExpertPrefetch
 from vllm.models.muse_spark.nvidia.ops.l2_prefetch import (
@@ -976,6 +981,9 @@ class MuseSpark1xMoE(nn.Module):
 
         # Set by the model for the decode expert prefetch.
         self.expert_prefetch: ExpertPrefetch | None = None
+        # The experts (global ids, by local slot) this rank holds under a static
+        # expert placement (VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT), None: linear.
+        self.expert_placement: tuple[int, ...] | None = None
         # Aux streams have hung on ROCm.
         self._router_events = (torch.cuda.Event(), torch.cuda.Event())
         self._router_aux_stream = (
@@ -1107,6 +1115,12 @@ class MuseSpark1xMoE(nn.Module):
             )
         )
         if self.use_mega_moe:
+            if envs.VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT:
+                logger.warning_once(
+                    "MuseSpark: VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT=1 does not "
+                    "apply to MegaMoE, which takes its experts from the rank number: "
+                    "the linear placement stays."
+                )
             max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
             if self.is_sequence_parallel:
                 # Unsharded small batches carry up to tp_size - 1 tokens.
@@ -1161,6 +1175,62 @@ class MuseSpark1xMoE(nn.Module):
                 "the routing from the caller; the monolithic "
                 f"--moe-backend {vllm_config.kernel_config.moe_backend} does not."
             )
+        self._install_expert_placement(vllm_config, layer_idx)
+
+    def _install_expert_placement(
+        self, vllm_config: VllmConfig, layer_idx: int
+    ) -> None:
+        """Replace the linear expert map of this layer by the table's placement, under
+        VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT.
+
+        Runs in the constructor, so that the weights that load afterwards land in the
+        slots of the new map (see ``ops/expert_placement.py``). A layer that cannot
+        take it, or a table that does not fit the model, leaves the layer linear with a
+        warning; ``expert_placement`` says which.
+        """
+        if not envs.VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT:
+            return
+        routed = cast(MuseMoERunner, self.experts).routed_experts
+        manager = routed.expert_map_manager
+        model_config = vllm_config.model_config
+        why = expert_placement_blocker(routed)
+        if why is None:
+            table, why = load_matching_table(
+                model=model_config.model,
+                revision=model_config.revision,
+                num_hidden_layers=model_config.hf_text_config.num_hidden_layers,
+                num_experts=self.num_experts,
+                top_k=self.top_k,
+                ep_size=manager.ep_size,
+                ep_rank=manager.ep_rank,
+                local_num_experts=manager.local_num_experts,
+                placement=manager.placement_strategy,
+                path=envs.VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT_TABLE,
+            )
+            if table is not None:
+                try:
+                    self.expert_placement = install_expert_placement(
+                        routed, table, layer_idx
+                    )
+                except ValueError as e:
+                    why = str(e)
+                else:
+                    logger.debug(
+                        "MuseSpark layer %d: expert placement of %s, %d of %d experts "
+                        "off their linear rank, EP rank %d holds %s",
+                        layer_idx,
+                        table.source or "the packaged table",
+                        table.num_moved(layer_idx),
+                        table.num_experts,
+                        manager.ep_rank,
+                        list(self.expert_placement),
+                    )
+                    return
+        logger.warning_once(
+            "MuseSpark: VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT=1, but a layer keeps "
+            "the linear expert placement: %s.",
+            why,
+        )
 
     def finalize_mega_moe_weights(self) -> None:
         if self.use_mega_moe:
@@ -2646,6 +2716,8 @@ class MuseSpark1xModel(LlamaModel):
             self._configure_expert_prefetch()
         # After the expert prefetch: the router GEMV needs the layers that queue it.
         self._configure_router_gemv()
+        if envs.VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT:
+            self._log_expert_placement()
         if self.is_sequence_parallel:
             from vllm.models.muse_spark.nvidia.ops.gemm_rs import (
                 maybe_create_gemm_rs,
@@ -2662,6 +2734,21 @@ class MuseSpark1xModel(LlamaModel):
                 for attn in attention_layers:
                     if gemm_rs.supports_projection(attn.o_proj):
                         attn.gemm_rs = gemm_rs
+
+    def _log_expert_placement(self) -> None:
+        """Say how many MoE layers run a static expert placement."""
+        moe = [
+            layer.feed_forward
+            for layer in islice(self.layers, self.start_layer, self.end_layer)
+            if isinstance(layer.feed_forward, MuseSpark1xMoE)
+        ]
+        placed = sum(m.expert_placement is not None for m in moe)
+        logger.info(
+            "MuseSpark: static expert placement "
+            "(VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT=1) in %d of %d MoE layers.",
+            placed,
+            len(moe),
+        )
 
     def _configure_sequence_parallel_row_gate(self) -> None:
         """Admit the batch sizes whose sharded projections equal the replicated."""
@@ -3240,6 +3327,17 @@ class MuseSpark1xForCausalLM(LlamaForCausalLM, SupportsLoRA, MixtureOfExperts):
         num_local_physical_experts: int,
     ) -> None:
         assert self.num_local_physical_experts == num_local_physical_experts
+        if any(
+            isinstance(layer.feed_forward, MuseSpark1xMoE)
+            and layer.feed_forward.expert_placement is not None
+            for layer in self.model.layers
+            if not isinstance(layer, PPMissingLayer)
+        ):
+            raise RuntimeError(
+                "VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT=1 fixes where the experts "
+                "live: the physical experts cannot be changed (no EPLB, no elastic "
+                "EP)."
+            )
         self.num_physical_experts = num_physical_experts
         self.num_local_physical_experts = num_local_physical_experts
         self.num_redundant_experts = num_physical_experts - self.num_logical_experts

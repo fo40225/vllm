@@ -22,11 +22,48 @@ from vllm.models.muse_spark.nvidia.muse_moe_runner import (
     MuseSpark1xRouter,
     MuseSparkRoutedExperts,
 )
+from vllm.models.muse_spark.nvidia.ops.expert_placement import (
+    ExpertPlacementTable,
+    install_expert_placement,
+)
 
 # route_scale must be 1.0 and scoring sigmoid for the routing to classify as
 # MiniMax2, which is what lets the monolithic kernel run MuseSpark's router.
 ROUTE_SCALE = 1.0
 DIVISION_EPS = 1e-15
+
+
+def random_placement_table(
+    num_experts: int, ep_size: int, top_k: int, seed: int = 0
+) -> ExpertPlacementTable:
+    """A one-layer table that deals the experts to the ranks at random, ``num_experts
+    // ep_size`` each."""
+    per_rank = num_experts // ep_size
+    g = torch.Generator().manual_seed(seed)
+    order = torch.randperm(num_experts, generator=g).tolist()
+    rank_of = [0] * num_experts
+    for position, expert in enumerate(order):
+        rank_of[expert] = position // per_rank
+    return ExpertPlacementTable(
+        snapshot="test",
+        num_hidden_layers=1,
+        num_experts=num_experts,
+        top_k=top_k,
+        ep_size=ep_size,
+        experts_per_rank=per_rank,
+        base_placement="linear",
+        layers={0: tuple(rank_of)},
+    )
+
+
+def install_placement(table: ExpertPlacementTable) -> Callable[[MuseMoERunner], None]:
+    """A ``make_runner`` ``before_load`` that gives the layer (layer 0) the placement
+    of ``table`` ahead of its weights."""
+
+    def install(runner: MuseMoERunner) -> None:
+        install_expert_placement(runner.routed_experts, table, layer_idx=0)
+
+    return install
 
 
 def nvfp4_quant_config() -> ModelOptNvFp4Config:
@@ -50,8 +87,13 @@ def make_runner(
     top_k: int,
     moe_backend: str = "auto",
     parallel_config: ParallelConfig | None = None,
+    before_load: Callable[[MuseMoERunner], None] | None = None,
 ):
-    """Build a MuseSpark runner, load ``ckpt`` and finalize its weights."""
+    """Build a MuseSpark runner, load ``ckpt`` and finalize its weights.
+
+    ``before_load`` gets the runner once it is built, ahead of the weights (where a
+    model installs an expert placement).
+    """
     num_experts = expert_bias.numel()
     vllm_config = VllmConfig(
         parallel_config=parallel_config or ParallelConfig(),
@@ -85,6 +127,8 @@ def make_runner(
         )
     runner.cuda()
     routed = runner.routed_experts
+    if before_load is not None:
+        before_load(runner)
     loaded = list(routed.load_weights(list(ckpt.items())))
     assert len(loaded) == len(ckpt)
     routed.quant_method.process_weights_after_loading(routed)

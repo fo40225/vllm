@@ -193,6 +193,30 @@ def test_every_byte_of_every_entry_once_and_nothing_else(layer):
         assert (covered.reshape(E_LOCAL, per_expert // 1024) == want[:, None]).all()
 
 
+@pytest.mark.parametrize("t", [1, 4, 8])
+def test_requests_follow_a_scattered_expert_map(layer, t):
+    """Under a static expert placement the local experts are scattered global ids in
+    any slot order: the requests are those of the same routes under the layer's own
+    map, in the same order, and still follow the consumption order of the slots."""
+    for seed in (1, 2, 3):
+        ids = _routing(t, 40 + seed)[1]
+        want = _dump(layer, ids)
+        g = torch.Generator(device=DEVICE).manual_seed(seed)
+        pi = torch.randperm(E_GLOBAL, device=DEVICE, generator=g)
+        expert_map = torch.empty_like(layer.expert_map)
+        expert_map[pi] = layer.expert_map
+        ids_pi = pi[ids.long()].to(torch.int32).contiguous()
+        got = _dump(layer, ids_pi, expert_map=expert_map)
+        assert np.array_equal(got, want)
+        # The order of first appearance of the slots is the order of the requests.
+        slots = []
+        for g_id in ids_pi.flatten().tolist():
+            slot = int(expert_map[g_id])
+            if slot >= 0 and slot not in slots:
+                slots.append(slot)
+        _check_order(layer, got, slots)
+
+
 def test_a_remote_only_batch_prefetches_nothing(layer):
     ids = _local_ids(4, 0, 3, E_LOCAL)
     assert (_dump(layer, ids) == -1).all()
