@@ -147,7 +147,8 @@ void nvfp4_decode_moe(at::Tensor const& hidden, at::Tensor const& topk_ids,
 //   hq_sf [>= T * 8, 256] u8 the intermediate, xq_data [>= T, 2048] u8 and xq_sf
 //   [>= T, 256] u8 the quantized activations (scratch, written by the first
 //   launch), plan (int32, >= 6084 entries) and ctl (int32, >= 322 entries, zero it
-//   once, every launch leaves it zero) as above. flags: 4 = zero the rows
+//   once, every launch leaves it zero) as above (16 columns per entry; the 8-column
+//   build, MUSE_LARGE_COLS=8, needs 4228 and 386). flags: 4 = zero the rows
 //   of non-local routes, 8 = no programmatic dependent launches, 16 = the loader
 //   warp fetches the B operand with bulk copies (the scratch above must be 16-byte
 //   aligned, as it is for every launch); bits 16.. override the grid size of the

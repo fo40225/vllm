@@ -89,6 +89,7 @@ constexpr int kEntryCols = MUSE_LARGE_COLS;  // routes of one expert in one entr
 constexpr int kLargeStages = MUSE_LARGE_STAGES;
 constexpr int kLargeMaxEntries = kLargeMaxLocal + kLargeMaxTokens * kTopK / kEntryCols;
 static_assert(kEntryCols == 8 || kEntryCols == 16, "one or two MMA column groups");
+static_assert(kLargeStages >= 2, "the ring needs two stages");
 constexpr int kUnitsPerEntry = 256;    // 4096 / 16 tiles of 16 rows
 
 // Op flags (the upper 16 bits override the grid size, 0 = one CTA per SM).
@@ -946,6 +947,10 @@ template <bool BULK>
 void launch_large_kernels(const DecodeParams& p, int grid, cudaStream_t stream) {
   static std::atomic<int> attr{0};
   constexpr int kSmem = smem_bytes_persist<kLargeMaxTokens, true>();
+  static_assert(kSmem <= 99 * 1024,
+                "the ring and the B operand slots of the large-batch kernel do not "
+                "fit the shared memory of an SM120 block (MUSE_LARGE_COLS, "
+                "MUSE_LARGE_STAGES)");
   ensure_smem_checked(k_persistent<kLargeMaxTokens, true, BULK>, kSmem, attr);
   const int prep_grid = 1 + (p.T + kPrepRowsPerCta - 1) / kPrepRowsPerCta;
   if (!(p.flags & kFlagNoPdl)) {

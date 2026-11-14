@@ -146,6 +146,8 @@ if TYPE_CHECKING:
     )
     VLLM_MUSE_SPARK_SM120_DECODE_MAX_TOKENS: int = 128
     VLLM_MUSE_SPARK_SM120_LARGE_BULK_LOADER: bool = False
+    VLLM_MUSE_SPARK_SM120_LARGE_COLS: int | None = None
+    VLLM_MUSE_SPARK_SM120_LARGE_STAGES: int | None = None
     VLLM_MUSE_SPARK_SM120_EXACT_GEMM1: bool = True
     VLLM_MUSE_SPARK_SM120_PREFILL_LOCAL_ROWS: bool = True
     VLLM_MUSE_SPARK_SM120_PREFILL_LATENT_FP4: bool = True
@@ -1367,6 +1369,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # between a CUDA graph capture and its replay.
     "VLLM_MUSE_SPARK_SM120_LARGE_BULK_LOADER": lambda: bool(
         int(os.getenv("VLLM_MUSE_SPARK_SM120_LARGE_BULK_LOADER", "0"))
+    ),
+    # Muse Spark on SM120: the routes of one expert in one entry of the large-batch
+    # decode kernel (8 or 16; unset = the kernel's default, 16) and its weight ring
+    # depth (2 or 3; unset = 2). They are compile-time constants of the _muse_C
+    # extension, set when it is built (a different value builds into a directory of
+    # its own), for A/B tests: 8 columns with 3 stages (92,672 B of shared memory) is
+    # the one other combination that fits, and it is slower than the default in every
+    # routing measured (real routing at 64 / 128 tokens +2.7 / +6.5%, with the bulk
+    # loader +2.4 / +5.6%, each against the default build with the same loader). The
+    # rows do not change.
+    "VLLM_MUSE_SPARK_SM120_LARGE_COLS": lambda: (
+        int(v) if (v := os.getenv("VLLM_MUSE_SPARK_SM120_LARGE_COLS")) else None
+    ),
+    "VLLM_MUSE_SPARK_SM120_LARGE_STAGES": lambda: (
+        int(v) if (v := os.getenv("VLLM_MUSE_SPARK_SM120_LARGE_STAGES")) else None
     ),
     # Muse Spark on SM120: run GEMM1 of the CUTLASS grouped-GEMM NVFP4 MoE with
     # the gate and up global weight scales apart (one group per half, and the

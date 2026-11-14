@@ -154,6 +154,18 @@ def _build_flags(nvcc_version: tuple[int, int]) -> tuple[list[str], list[str]]:
         "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
         "-U__CUDA_NO_HALF2_OPERATORS__",
     ]
+    # Compile-time shape of the large-batch decode kernel (A/B tests); unset keeps the
+    # defaults of the source, and with them the build of every other host.
+    for name, macro, allowed in (
+        ("VLLM_MUSE_SPARK_SM120_LARGE_COLS", "MUSE_LARGE_COLS", (8, 16)),
+        ("VLLM_MUSE_SPARK_SM120_LARGE_STAGES", "MUSE_LARGE_STAGES", (2, 3)),
+    ):
+        value = getattr(envs, name)
+        if value is None:
+            continue
+        if value not in allowed:
+            raise ValueError(f"{name} must be one of {allowed}, got {value}")
+        cuda_cflags.append(f"-D{macro}={value}")
     return cflags, cuda_cflags
 
 
@@ -197,11 +209,11 @@ def preflight() -> str | None:
     try:
         nvcc = _nvcc_path()
         nvcc_version = _nvcc_version(nvcc)
+        cflags, cuda_cflags = _build_flags(nvcc_version)
     except Exception as e:
         return str(e)
     if (reason := _uncovered_device(nvcc_version)) is not None:
         return reason
-    cflags, cuda_cflags = _build_flags(nvcc_version)
     build_dir = _build_directory(nvcc, cflags, cuda_cflags)
     if _built_library(build_dir) is None and not cpp_extension.is_ninja_available():
         return f"Building the {_EXT_NAME} extension needs ninja, which was not found."

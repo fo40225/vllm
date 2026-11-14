@@ -56,7 +56,8 @@ TOP_K = 8
 # LARGE_CAP entries: 256 local experts plus the experts split over entries.
 MAX_LARGE_T = 128
 LARGE_ROUTES = MAX_LARGE_T * TOP_K
-LARGE_ENTRY_COLS = 16
+# 16 columns, unless the extension is built for 8 (VLLM_MUSE_SPARK_SM120_LARGE_COLS).
+LARGE_ENTRY_COLS = envs.VLLM_MUSE_SPARK_SM120_LARGE_COLS or 16
 LARGE_CAP = 256 + LARGE_ROUTES // LARGE_ENTRY_COLS
 # Token counts of the large-batch kernel the generic tests run: the first CUDA graph
 # sizes above 8 (and the speculative-decoding ones, 1 x 9 and 1 x 16), a size that is
@@ -1148,6 +1149,41 @@ def test_large_batch_rejects_misaligned_scratch(
     assert engine.counters_are_zero()
 
 
+def test_large_kernel_shape_env_selects_the_build(monkeypatch) -> None:
+    """VLLM_MUSE_SPARK_SM120_LARGE_COLS / _STAGES are compile-time constants: set,
+    they add the -D flags and move the build to a directory of its own; unset, the
+    build is the default one."""
+    cols_env = "VLLM_MUSE_SPARK_SM120_LARGE_COLS"
+    stages_env = "VLLM_MUSE_SPARK_SM120_LARGE_STAGES"
+    version = (13, 3)
+    monkeypatch.delenv(cols_env, raising=False)
+    monkeypatch.delenv(stages_env, raising=False)
+    _, default = muse_c._build_flags(version)
+    assert not any("MUSE_LARGE" in flag for flag in default)
+    monkeypatch.setenv(cols_env, "8")
+    monkeypatch.setenv(stages_env, "3")
+    _, variant = muse_c._build_flags(version)
+    assert variant[len(default) :] == ["-DMUSE_LARGE_COLS=8", "-DMUSE_LARGE_STAGES=3"]
+    nvcc = muse_c._nvcc_path()
+    assert muse_c._build_directory(nvcc, [], default) != muse_c._build_directory(
+        nvcc, [], variant
+    )
+    monkeypatch.setenv(cols_env, "12")
+    with pytest.raises(ValueError, match="LARGE_COLS"):
+        muse_c._build_flags(version)
+    monkeypatch.setenv(cols_env, "16")
+    monkeypatch.setenv(stages_env, "4")
+    with pytest.raises(ValueError, match="LARGE_STAGES"):
+        muse_c._build_flags(version)
+    # The preflight reports it instead of raising.
+    muse_c.preflight.cache_clear()
+    try:
+        assert "LARGE_STAGES" in muse_c.preflight()
+    finally:
+        monkeypatch.delenv(stages_env)
+        muse_c.preflight.cache_clear()
+
+
 @pytest.mark.parametrize("t", [9, 24, MAX_LARGE_T])
 @torch.inference_mode()
 def test_large_batch_plan_is_a_deterministic_partition_of_the_local_routes(
@@ -1250,9 +1286,9 @@ def layer256() -> _Layer:
 @torch.inference_mode()
 def test_large_batch_with_every_expert_local(layer256: _Layer) -> None:
     """TP-only layout: 256 local experts and up to 1024 local routes. The plan
-    holds the largest number of entries a batch of 128 tokens can need (304 with one
-    route for some experts and 17 for others), and the rows are the small-batch
-    kernel's."""
+    holds the largest number of entries a batch of 128 tokens can need (with 16
+    columns 304: one route for some experts and 17 for others; 352 with 8), and the
+    rows are the small-batch kernel's."""
     layer = layer256
     engine = _Engine(layer)
     t = MAX_LARGE_T
@@ -1265,7 +1301,8 @@ def test_large_batch_with_every_expert_local(layer256: _Layer) -> None:
     # Without a map the global ids are the local ones.
     no_map = engine.run(u, ids, expert_map=None)
     _assert_rows_equal(no_map, want, "no map")
-    # The busiest plan: 208 experts with one route, 48 with 17 (two entries each).
+    # The busiest plan: 208 experts with one route, 48 with 17 (two entries each, three
+    # with 8 columns).
     flat = torch.cat(
         [torch.arange(208), torch.arange(208, E_GLOBAL).repeat_interleave(17)]
     )
@@ -1275,7 +1312,7 @@ def test_large_batch_with_every_expert_local(layer256: _Layer) -> None:
     want = _small_batch_rows(engine, u, ids)
     got = engine.run(u, ids)
     _assert_rows_equal(got, want, "busiest plan")
-    assert engine.plan_tables()["n_entries"] == 208 + 2 * 48
+    assert engine.plan_tables()["n_entries"] == 208 + 48 * -(-17 // LARGE_ENTRY_COLS)
     assert engine.counters_are_zero()
 
 
