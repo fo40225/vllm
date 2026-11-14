@@ -53,7 +53,6 @@ void split_gemm1_prepare(at::Tensor const& a_fp4,
                          at::Tensor& blockscale_offsets_x2,
                          at::Tensor& problem_sizes_x2);
 
-
 // The stock scaled_fp4_experts_quant of an activation matrix permuted by row_map,
 // without the permuted copy: row r of the result is the quantization of row
 // input[row_map[r]], with the global scale and scale-factor layout of the expert

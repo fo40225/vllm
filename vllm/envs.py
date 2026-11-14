@@ -1330,8 +1330,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # intermediate is rounded like the muse decode kernel and the exact
     # fake-quant definition do, instead of folding the up / gate scale ratio into
     # a later scale (~3% rel L2 apart from them where the scales differ). Set to
-    # 0 to keep the folded single-alpha GEMM1 (no extension needed). Read when
-    # the weights are loaded.
+    # 0 to keep the folded single-alpha GEMM1 (no extension needed). The flag
+    # makes every SM120 NVFP4 layer load the extension, also with --moe-backend
+    # cutlass, batch-invariant mode and without CUDA graphs: a host without nvcc
+    # and ninja (or where the build fails) falls back to the folded GEMM1 with a
+    # warning, and its outputs then differ from a host with the toolchain. Set the
+    # flag to 0 for a result that does not depend on the toolchain. Read when a
+    # layer is constructed and when its weights are loaded.
     "VLLM_MUSE_SPARK_SM120_EXACT_GEMM1": lambda: bool(
         int(os.getenv("VLLM_MUSE_SPARK_SM120_EXACT_GEMM1", "1"))
     ),
@@ -1342,7 +1347,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # activations spend most of their time on the remote routes (seven in eight
     # under EP8). Bitwise identical results; set to 0 for the stock ops, e.g. for
     # A/B tests. Needs the _muse_C extension to be loaded already (a decode
-    # engine loads it). Read once, when a layer is constructed.
+    # engine or the exact GEMM1 loads it). Read once, when a layer is constructed.
     "VLLM_MUSE_SPARK_SM120_PREFILL_LOCAL_ROWS": lambda: bool(
         int(os.getenv("VLLM_MUSE_SPARK_SM120_PREFILL_LOCAL_ROWS", "1"))
     ),

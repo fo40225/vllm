@@ -2593,4 +2593,3 @@ def test_muse_c_routing_treats_ids_past_the_map_as_remote() -> None:
     )
     assert offsets.tolist() == [0] * 5 and ps1[:, 0].tolist() == [0] * 4
     assert a_map.eq(-1).all() and c_map.eq(-1).all()
-

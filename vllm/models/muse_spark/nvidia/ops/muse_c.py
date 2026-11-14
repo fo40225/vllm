@@ -473,7 +473,6 @@ def _allocate_experts_quant_outputs(
     return output, output_scales
 
 
-
 def moe_route_local(
     topk_ids: torch.Tensor,
     expert_map: torch.Tensor | None,

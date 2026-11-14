@@ -256,8 +256,10 @@ class MuseDecodeMoE:
             scratch.plan,
             scratch.ctl,
             None,
-            # Launched as a programmatic dependent of the routing kernel (it
-            # waits for it before it reads the ids) unless PDL is off.
+            # Launched as a programmatic dependent of the kernel before it in the
+            # stream (the routing kernel, or the pre-expert norm when the routing
+            # runs on the aux stream and joins by an event). It waits for it before
+            # it reads the ids and the activations. Plain launch if PDL is off.
             self._flags | (0 if muse_pdl_enabled() else _FLAG_NO_PDL),
             None,
             None,

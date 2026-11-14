@@ -810,17 +810,19 @@ def test_launch_variants_are_bitwise_equal(layer: _Layer, t: int) -> None:
 def test_persistent_kernel_waits_for_the_routing_and_the_norm(
     layer: _Layer, t: int, use_graph: bool, capfd
 ) -> None:
-    """The kernel is a programmatic dependent of the routing kernel: it may start
-    while the top-k ids and the activations are still being written, and must wait
-    before it reads either (``ids`` and ``u`` start as other valid inputs and are
-    both written late, by one producer). Without the wait the CTAs build different
-    plans and the kernel hangs: ``synchronize_or_exit`` ends the process then."""
+    """The kernel is a programmatic dependent of the kernel before it in the stream
+    (the routing, or the pre-expert norm when the routing runs on the aux stream and
+    joins by an event): it may start while the top-k ids and the activations are
+    still being written, and must wait before it reads either (``ids`` and ``u``
+    start as other valid inputs and are both written late, by one producer).
+    Without the wait the CTAs build different plans and the kernel hangs:
+    ``synchronize_or_exit`` ends the process then."""
     engine = _Engine(layer)
     u, _, _ = _routing(t, 170)
-    ids = _ids_cases(t, 171)["three_local"]
+    ids = _ids_cases(t, 171, layer.e_local)["three_local"]
     ref = _valid(*engine.run(u, ids, flags=FLAG_NO_PDL))
     stale_u, _, _ = _routing(t, 172)
-    stale_ids = _ids_cases(t, 173)["all_local"]
+    stale_ids = _ids_cases(t, 173, layer.e_local)["all_local"]
 
     u_in, ids_in = stale_u.clone(), stale_ids.clone()
 

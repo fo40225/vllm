@@ -25,9 +25,13 @@ order (and the stock SiLU * up quantization kernel in its CUTLASS path) except
 one that runs the b12x engine: it stores them as ``[up; gate]`` instead (see
 ``swap_gate_up_halves_``), the order the b12x kernels consume without touching
 the weights, and its CUTLASS path quantizes the intermediate with the fused
-``_muse_C`` kernel that reads the halves in that order. The JIT-built extension
-(nvcc and ninja) is needed only where a decode engine runs.
+``_muse_C`` kernel that reads the halves in that order.
 ``MuseSparkSm120NvFp4Experts.up_gate_layout`` says which layout a layer holds.
+
+The JIT-built extension (nvcc and ninja) is needed by the decode engines, by the
+exact GEMM1 (on by default, so by every layer unless it is switched off or the
+extension cannot be built) and by the local-routes path below. A layer that cannot
+load it keeps the stock kernels and the folded GEMM1.
 
 Where the extension is loaded, the CUTLASS path also sorts and quantizes the
 local routes only (``_local_rows_usable``): an EP rank owns about one route in
@@ -479,9 +483,10 @@ class MuseSparkSm120NvFp4Experts(mk.FusedMoEExpertsModular):
         self.after_gemm2_hook: Callable[[int], None] | None = None
         self.b12x: B12xDecodeMoE | None = None
         self.muse: MuseDecodeMoE | None = None
-        # The exact (unfolded) scales of the muse kernel, captured from the raw
-        # checkpoint scales where the native weights are processed. The CUTLASS
-        # and b12x paths use the folded quant config.
+        # The exact (unfolded) scales, captured from the raw checkpoint scales
+        # where the native weights are processed. They feed the muse kernel and the
+        # exact GEMM1 of the CUTLASS path (``exact_scales`` is derived from them).
+        # The stock-ops CUTLASS path and b12x use the folded quant config.
         self.decode_scales: Sm120NvFp4Scales | None = None
         # Set by the owner: whether the CUTLASS path runs GEMM1 with the gate and
         # up alphas apart (it needs ``decode_scales`` and the ``_muse_C``
@@ -902,8 +907,9 @@ class MuseSparkSm120NvFp4Experts(mk.FusedMoEExpertsModular):
 
         That is the ``_muse_C`` routing (``moe_route_local``) and the row-gather
         quantization of GEMM1's activations. They live in the extension, which is
-        never built just for them: the layers that run a decode engine have loaded
-        it by the first forward pass, any other keeps the stock path.
+        never built just for them: a layer that loaded it for a decode engine or for
+        the exact GEMM1 has it by the first forward pass, any other keeps the stock
+        path.
         """
         return (
             self.local_rows
