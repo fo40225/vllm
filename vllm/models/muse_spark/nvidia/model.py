@@ -669,10 +669,6 @@ def _fp32_split_k_reduction() -> Iterator[None]:
         matmul.allow_bf16_reduced_precision_reduction = previous
 
 
-# A decision that has not been made yet (None is a decision).
-_UNDECIDED = object()
-
-
 def _agreed_by_tp_group(verdict: bool) -> bool:
     """The verdict of the whole TP group, whose ranks must take one branch."""
     group = get_tp_group()
@@ -683,6 +679,28 @@ def _agreed_by_tp_group(verdict: bool) -> bool:
         flag, op=torch.distributed.ReduceOp.MIN, group=group.cpu_group
     )
     return bool(flag.item())
+
+
+def _agreed_scale_by_tp_group(scale: float | None) -> bool:
+    """Whether every rank of the TP group has a scale and all have the same one.
+
+    Rows that one rank quantized are consumed by the experts of every rank, so a
+    scale that differs between ranks (say, an input scale that is a rank-local max
+    and not the global one) would silently rescale the output of the layer. One
+    collective carries the presence and, as the minimum of ``v`` and of ``-v``, the
+    smallest and the largest value.
+    """
+    usable = scale is not None and math.isfinite(scale) and scale > 0
+    group = get_tp_group()
+    if group.world_size == 1:
+        return usable
+    value = scale if usable else 0.0
+    stats = torch.tensor([float(usable), value, -value], dtype=torch.float64)
+    torch.distributed.all_reduce(
+        stats, op=torch.distributed.ReduceOp.MIN, group=group.cpu_group
+    )
+    present, lowest, negated_highest = stats.tolist()
+    return present == 1.0 and lowest == -negated_highest
 
 
 class _SequenceParallelRowGate:
@@ -955,8 +973,9 @@ class MuseSpark1xMoE(nn.Module):
             config, "muse_spark_tep_aux_stream_routing", tep_default
         )
         self.all_gather_norm_quant: Any | None = None
-        # See _packed_latent_scale.
-        self._latent_scale: Any = _UNDECIDED
+        # Whether the pooled latent is gathered as NVFP4 (None until the first
+        # sequence-parallel batch); see _packed_latent_scale.
+        self._latent_fp4: bool | None = None
         # Whether the TP communicator may run the pre-expert norm as the epilogue
         # of the pooler all-gather (ops/fused_boundary.py).
         self.fuses_boundary_collectives = (
@@ -1520,24 +1539,49 @@ class MuseSpark1xMoE(nn.Module):
     def _packed_latent_scale(self) -> torch.Tensor | None:
         """The global scale of the latent this layer gathers as NVFP4, or None.
 
-        The decision is made once per layer, on the first sequence-parallel batch,
-        and agreed by the TP group: ranks that gathered rows of different widths
-        would hang in the collective.
+        Whether the layer gathers it packed is decided once, on the first
+        sequence-parallel batch, and agreed by the TP group: ranks that gathered rows
+        of different widths would hang in the collective, and rows quantized with
+        another rank's scale would be rescaled by the experts. Only the decision is
+        kept: the scale is read from the experts on every call, because a weight
+        reload builds new experts with new scales.
         """
-        if self._latent_scale is _UNDECIDED:
-            scale = None
+        if self._latent_fp4 is None:
+            value = None
             if envs.VLLM_MUSE_SPARK_SM120_PREFILL_LATENT_FP4:
-                scale = self.experts.packed_latent_scale()
-            self._latent_scale = (
-                scale if _agreed_by_tp_group(scale is not None) else None
-            )
-            if self._latent_scale is not None:
+                # Every rank has to reach the collective below, so no exception
+                # leaves this block: a rank that fails takes the bf16 gather, and
+                # so does the group.
+                try:
+                    scale = self.experts.packed_latent_scale()
+                    value = None if scale is None else float(scale)
+                except Exception as e:
+                    logger.warning_once(
+                        "MuseSpark SM120 sequence parallel: the pooled latent stays "
+                        "bf16 on this rank, its NVFP4 scale could not be read "
+                        "(%s: %s).",
+                        type(e).__name__,
+                        e,
+                    )
+            self._latent_fp4 = _agreed_scale_by_tp_group(value)
+            if self._latent_fp4:
                 logger.info_once(
                     "MuseSpark SM120 sequence parallel: the pooled latent is "
                     "quantized to NVFP4 before its all-gather "
                     "(VLLM_MUSE_SPARK_SM120_PREFILL_LATENT_FP4=1)."
                 )
-        return self._latent_scale
+        if not self._latent_fp4:
+            return None
+        scale = self.experts.packed_latent_scale()
+        if scale is None:
+            # The group gathers packed rows; a rank that would gather bf16 ones
+            # would hang the others in the collective.
+            raise RuntimeError(
+                "MuseSpark SM120 sequence parallel: the experts no longer take the "
+                "pooled latent as NVFP4 (a weight reload changed them), but the "
+                "TP group gathers it packed."
+            )
+        return scale
 
     def forward_sequence_parallel(
         self,

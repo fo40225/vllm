@@ -952,7 +952,7 @@ def _sharded_branch_worker(rank: int, world: int, port: int, out_path: str) -> N
             moe_router=router,
             router=gate,
             experts=runner,
-            _latent_scale=muse_model._UNDECIDED,
+            _latent_fp4=None,
         )
         layer._packed_latent_scale = lambda layer=layer: (
             muse_model.MuseSpark1xMoE._packed_latent_scale(layer)
@@ -987,13 +987,29 @@ def _sharded_branch_worker(rank: int, world: int, port: int, out_path: str) -> N
                 second = sharded(local, num_tokens)
                 packed_used = len(packed_calls)
                 # The same rows with the bf16 latent gathered, as the flag off does.
-                layer._latent_scale = muse_model._UNDECIDED
+                layer._latent_fp4 = None
                 os.environ[LATENT_FP4] = "0"
                 bf16_latent = sharded(local, num_tokens)
                 os.environ[LATENT_FP4] = "1"
-                layer._latent_scale = muse_model._UNDECIDED
+                # One rank with another input scale than the rest (a rank-local max
+                # where the global one is meant) makes the whole group gather bf16.
+                packed_scale = runner.packed_latent_scale
+
+                def skewed_scale(packed_scale=packed_scale):
+                    scale = packed_scale()
+                    return None if scale is None else scale * 1.5
+
+                if rank == world - 1:
+                    runner.packed_latent_scale = skewed_scale
+                layer._latent_fp4 = None
+                packed_calls.clear()
+                skewed = sharded(local, num_tokens)
+                skewed_packed_calls = len(packed_calls)
+                runner.__dict__.pop("packed_latent_scale", None)
                 # The boundary kernel's fp32 copy of the rows is what the router
-                # would cast itself.
+                # would cast itself. The decision is made here again, ahead of the
+                # graph capture, which cannot run its collective.
+                layer._latent_fp4 = None
                 widened = sharded(local, num_tokens, router_input=local.float())
                 output = tensor_model_parallel_all_gather(first, 0)[:num_tokens]
                 # The same branch captured in a CUDA graph, as a decode-sized batch
@@ -1017,6 +1033,8 @@ def _sharded_branch_worker(rank: int, world: int, port: int, out_path: str) -> N
                 deterministic=bool(torch.equal(first, second)),
                 packed_calls=packed_used,
                 packed_equal=bool(torch.equal(first, bf16_latent)),
+                skewed_packed_calls=skewed_packed_calls,
+                skewed_equal=bool(torch.equal(skewed, bf16_latent)),
                 router_input_equal=bool(torch.equal(first, widened)),
                 graph_equal=bool(torch.equal(captured, first)),
                 graph_rel_l2=float(
@@ -1068,9 +1086,171 @@ def test_sharded_branch_matches_the_replicated_one(tmp_path, world: int) -> None
             key,
             result,
         )
+        # A scale that differs between the ranks keeps every one of them on bf16.
+        assert result["skewed_packed_calls"] == 0, (key, result)
+        if not key.startswith("nvfp4_marlin"):
+            assert result["skewed_equal"], (key, result)
         # Measured on 8 SM120 GPUs: 3.9e-3 to 4.0e-3 and 5.3e-3 to 6.1e-3, the
         # rounding of the collectives and of the pooled rows (which also moves
         # some FP4 codes of the experts' input).
         assert result["nonzero"] > 0.99, (key, result)
         assert result["rel_l2"] < 1e-2, (key, result)
         assert result["max_row_rel_l2"] < 2e-2, (key, result)
+
+
+# ------------------------------------------------------------------------------
+# The decision to gather the pooled latent as packed NVFP4
+# ------------------------------------------------------------------------------
+def _latent_layer(read) -> SimpleNamespace:
+    """The members of MuseSpark1xMoE that _packed_latent_scale uses, with experts
+    whose ``packed_latent_scale`` is ``read``."""
+    return SimpleNamespace(
+        experts=SimpleNamespace(packed_latent_scale=read), _latent_fp4=None
+    )
+
+
+def _packed_latent_scale(layer: SimpleNamespace) -> torch.Tensor | None:
+    return muse_model.MuseSpark1xMoE._packed_latent_scale(layer)
+
+
+def _fake_tp_group(monkeypatch, others: list[float | None]) -> list[torch.Tensor]:
+    """A TP group of ``1 + len(others)`` ranks, whose other ranks have the scales
+    ``others`` (None: no scale). Returns what this rank handed to the collective."""
+    sent: list[torch.Tensor] = []
+
+    def all_reduce(tensor, op, group):
+        assert op == torch.distributed.ReduceOp.MIN
+        sent.append(tensor.clone())
+        for other in others:
+            usable = other is not None
+            value = other if usable else 0.0
+            theirs = torch.tensor([float(usable), value, -value], dtype=tensor.dtype)
+            tensor.copy_(torch.minimum(tensor, theirs))
+
+    monkeypatch.setattr(
+        muse_model,
+        "get_tp_group",
+        lambda: SimpleNamespace(world_size=1 + len(others), cpu_group=None),
+    )
+    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+    return sent
+
+
+def test_sm120_packed_latent_scale_is_read_from_the_experts_on_every_call(
+    monkeypatch,
+) -> None:
+    """Only the decision is kept. The scales of the experts are rebuilt by every
+    weight reload, so a scale kept from before it would quantize the latent with a
+    stale value that the GEMM1 alphas do not match."""
+    _fake_tp_group(monkeypatch, [])
+    current = [torch.tensor([2.0])]
+    layer = _latent_layer(lambda: current[0])
+    assert _packed_latent_scale(layer) is current[0]
+    assert layer._latent_fp4 is True
+    current[0] = torch.tensor([3.0])
+    assert _packed_latent_scale(layer) is current[0]
+    # Experts that cannot take the packed latent any more cannot be left to gather
+    # bf16 rows on their own: the rest of the group gathers packed ones.
+    current[0] = None
+    with pytest.raises(RuntimeError, match="no longer take the pooled latent"):
+        _packed_latent_scale(layer)
+
+
+def test_sm120_packed_latent_scale_stays_bf16_when_the_flag_is_off(
+    monkeypatch,
+) -> None:
+    sent = _fake_tp_group(monkeypatch, [])
+    reads: list[int] = []
+    layer = _latent_layer(lambda: reads.append(1) or torch.tensor([2.0]))
+    monkeypatch.setenv(LATENT_FP4, "0")
+    assert _packed_latent_scale(layer) is None
+    assert layer._latent_fp4 is False and not reads
+    monkeypatch.setenv(LATENT_FP4, "1")
+    # The decision is final for the layer.
+    assert _packed_latent_scale(layer) is None
+    assert not sent  # one rank: nobody to agree with
+
+
+@pytest.mark.parametrize(
+    "mine, others, packed",
+    [
+        (2.0, [2.0], True),
+        (2.0, [2.0, 2.0, 2.0], True),
+        # The presence is agreed on, and so is the value.
+        (2.0, [None], False),
+        (None, [2.0], False),
+        (2.0, [2.0, None, 2.0], False),
+        (2.0, [2.0 * (1 + 2**-23)], False),
+        (2.0, [2.0, 2.0, 1.5], False),
+        (2.0, [2.0, 4.0, 2.0], False),
+        (0.0, [0.0], False),
+        (float("nan"), [float("nan")], False),
+        (float("inf"), [float("inf")], False),
+    ],
+)
+def test_sm120_packed_latent_scale_is_gathered_only_where_the_group_agrees(
+    monkeypatch, mine, others, packed
+) -> None:
+    sent = _fake_tp_group(monkeypatch, others)
+    scale = None if mine is None else torch.tensor([mine])
+    layer = _latent_layer(lambda: scale)
+    assert (_packed_latent_scale(layer) is not None) == packed
+    assert layer._latent_fp4 is packed
+    assert len(sent) == 1
+
+
+def test_sm120_packed_latent_scale_that_cannot_be_read_still_joins_the_collective(
+    monkeypatch,
+) -> None:
+    """The rank whose experts raise (say, a CUDA error while the scale is checked)
+    has to reach the collective as well, or the others wait in it for the process
+    group timeout: it takes bf16, and so does the group."""
+    sent = _fake_tp_group(monkeypatch, [2.0, 2.0])
+
+    def read():
+        raise RuntimeError("CUDA error")
+
+    layer = _latent_layer(read)
+    assert _packed_latent_scale(layer) is None
+    assert layer._latent_fp4 is False
+    assert len(sent) == 1 and sent[0][0] == 0.0
+
+
+def _latent_agreement_worker(rank: int, world: int, port: int) -> None:
+    """The decisions of ``_packed_latent_scale`` over a real gloo group."""
+    torch.distributed.init_process_group(
+        "gloo", init_method=f"tcp://127.0.0.1:{port}", world_size=world, rank=rank
+    )
+    muse_model.get_tp_group = lambda: SimpleNamespace(
+        world_size=world, cpu_group=torch.distributed.group.WORLD
+    )
+    odd_one = rank == world - 1
+    scale = torch.tensor([2.5])
+    nudged = torch.nextafter(scale, torch.tensor([3.0]))
+
+    def raise_error():
+        raise RuntimeError("CUDA error")
+
+    cases = {
+        "same": (lambda: scale, True),
+        "one_ulp": (lambda: nudged if odd_one else scale, False),
+        "rank_local_max": (lambda: scale * 1.5 if odd_one else scale, False),
+        "absent": (lambda: None if odd_one else scale, False),
+        "raises": (raise_error if odd_one else lambda: scale, False),
+        "same_again": (lambda: scale, True),
+    }
+    for name, (read, packed) in cases.items():
+        layer = _latent_layer(read)
+        assert (_packed_latent_scale(layer) is not None) == packed, (rank, name)
+        assert layer._latent_fp4 is packed, (rank, name)
+    torch.distributed.barrier()
+    torch.distributed.destroy_process_group()
+
+
+@pytest.mark.parametrize("world", [2, 4])
+def test_sm120_packed_latent_decision_is_agreed_over_the_cpu_group(world: int) -> None:
+    """Every rank takes the one branch the whole group can take, over a real
+    collective: a scale that differs by one bit, or is missing, or cannot be read on
+    one rank keeps all of them on bf16."""
+    port = 30700 + os.getpid() % 1000 + world
+    mp.spawn(_latent_agreement_worker, args=(world, port), nprocs=world)

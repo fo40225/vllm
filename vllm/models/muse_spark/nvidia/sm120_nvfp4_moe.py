@@ -525,7 +525,8 @@ class MuseSparkSm120NvFp4Experts(mk.FusedMoEExpertsModular):
         self.exact_gemm1 = False
         self.exact_scales: ExactGemm1Scales | None = None
         self.local_rows = envs.VLLM_MUSE_SPARK_SM120_PREFILL_LOCAL_ROWS
-        # The input scale of packed_input_scale, once verified.
+        # The input scale of packed_input_scale, once verified. It goes with this
+        # object: a weight reload builds new experts, with new scales.
         self._packed_scale: torch.Tensor | None = None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
