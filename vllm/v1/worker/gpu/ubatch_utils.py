@@ -343,7 +343,8 @@ class UBatchRunner:
         # The microbatch threads plus the thread that starts them.
         self.ready_barrier = threading.Barrier(self.num_ubatches + 1)
         self._pending_finish: Callable[[], Any] | None = None
-        self._logged_first_step = False
+        # The first step is logged once per runner (a profile runner stays quiet).
+        self.first_step_logged = False
         self.sm_control = create_sm_control_context(self.parallel_config)
 
     def prepare(
@@ -488,8 +489,8 @@ class UBatchRunner:
         ubatch_slices = ubatch_state.slices
         assert len(ubatch_slices) == len(ubatch_state.forward_contexts)
         assert len(ubatch_slices) == self.num_ubatches
-        if not self._logged_first_step:
-            self._logged_first_step = True
+        if not self.first_step_logged:
+            self.first_step_logged = True
             logger.info(
                 "First microbatched step: %s tokens in %d microbatches, %s.",
                 tuple(s.num_tokens for s in ubatch_slices),

@@ -3272,6 +3272,7 @@ class VllmConfig:
             "Microbatching of the tensor-parallel collectives is turned off: %s.",
             reason,
         )
+        # The thresholds the hook raised are inert without microbatching.
         pc.ubatch_overlap_tp_collectives = False
         pc.ubatch_size = 0
 

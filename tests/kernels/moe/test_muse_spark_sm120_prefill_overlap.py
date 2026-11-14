@@ -513,6 +513,8 @@ def test_the_memory_profile_also_runs_the_split_batch():
     # outlive the profile: the real one is built with the KV cache layout.
     assert build.call_args.args[3] == [] and build.call_args.args[4] is None
     assert runner.ubatch_runner is None
+    # The throw-away runner does not log "First microbatched step".
+    assert profile_runner.first_step_logged
 
 
 def test_the_memory_profile_stays_whole_where_no_batch_is_split():

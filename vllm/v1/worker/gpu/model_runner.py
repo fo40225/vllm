@@ -1116,6 +1116,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 cast(KVCacheConfig, None),
                 self.max_num_reqs,
             )
+            # The first real microbatched step is the one worth a log line.
+            self.ubatch_runner.first_step_logged = True
         try:
             hidden_states, _ = self._dummy_run(
                 self.max_num_tokens,
