@@ -843,9 +843,7 @@ def test_sequence_parallel_row_gate_matches_the_real_projections(
             valid = min(rows, num_tokens - rank * rows)
             with muse_model._fp32_split_k_reduction():
                 local = module(padded[rank * rows : (rank + 1) * rows])[0]
-            equal &= torch.equal(
-                full[rank * rows : rank * rows + valid], local[:valid]
-            )
+            equal &= torch.equal(full[rank * rows : rank * rows + valid], local[:valid])
     assert gate(num_tokens) == equal, num_tokens
 
 
@@ -1471,9 +1469,34 @@ def test_sm120_sequence_parallel_graph_floor(
     assert muse_model.sm120_sequence_parallel_graph_min_tokens(config) == expected
     # The eager floor is the one of every other batch and does not move.
     monkeypatch.setenv(MIN_TOKENS, "384")
-    assert muse_model.sm120_sequence_parallel_min_tokens(
-        _vllm_config(max_graph_tokens=256)
-    ) == 384
+    assert (
+        muse_model.sm120_sequence_parallel_min_tokens(
+            _vllm_config(max_graph_tokens=256)
+        )
+        == 384
+    )
+
+
+@pytest.mark.parametrize(
+    "decode_max, expected", [(None, 128), ("64", 64), ("1", 8), ("200", 128)]
+)
+def test_decode_engine_max_tokens_is_what_the_graph_floor_starts_above(
+    monkeypatch, decode_max, expected
+) -> None:
+    """The boot line carries the engine limit the floor was raised above, which the
+    launch check reads instead of assuming the production 128."""
+    if decode_max is None:
+        monkeypatch.delenv(DECODE_MAX_TOKENS, raising=False)
+    else:
+        monkeypatch.setenv(DECODE_MAX_TOKENS, decode_max)
+    assert muse_model._decode_engine_max_tokens() == expected
+    monkeypatch.setenv(GRAPH_MIN_TOKENS, "1")
+    assert (
+        muse_model.sm120_sequence_parallel_graph_min_tokens(
+            _vllm_config(max_graph_tokens=256)
+        )
+        == expected + 1
+    )
 
 
 def test_sm120_sequence_parallel_graph_floor_is_off_by_default(monkeypatch) -> None:
@@ -1638,17 +1661,9 @@ GRAPH_SP_TOKENS = (136, 137, 200, 256, 263, 264, 272, 376, 384, 400, 512)
 GRAPH_SP_REPLAYS = 20000
 
 
-def _graph_stream_worker(rank: int, world: int, port: int, out_path: str) -> None:
+def _init_tp_world(rank: int, world: int, port: int) -> None:
     from vllm.config import ParallelConfig, VllmConfig
-    from vllm.distributed import (
-        get_tp_group,
-        init_distributed_environment,
-        initialize_model_parallel,
-        tensor_model_parallel_all_gather,
-        tensor_model_parallel_all_reduce,
-    )
-    from vllm.distributed.parallel_state import graph_capture
-    from vllm.models.common.ops.sequence_parallel import sp_all_gather
+    from vllm.distributed import init_distributed_environment, initialize_model_parallel
 
     torch.cuda.set_device(rank)
     if os.environ.get("MUSE_TOPO_ENABLE") == "1":
@@ -1666,6 +1681,18 @@ def _graph_stream_worker(rank: int, world: int, port: int, out_path: str) -> Non
             backend="nccl",
         )
         initialize_model_parallel(tensor_model_parallel_size=world)
+
+
+def _graph_stream_worker(rank: int, world: int, port: int, out_path: str) -> None:
+    from vllm.distributed import (
+        get_tp_group,
+        tensor_model_parallel_all_gather,
+        tensor_model_parallel_all_reduce,
+    )
+    from vllm.distributed.parallel_state import graph_capture
+    from vllm.models.common.ops.sequence_parallel import sp_all_gather
+
+    _init_tp_world(rank, world, port)
 
     hidden, local_width = 8192, 1024
     g = torch.Generator(device="cuda").manual_seed(100 + rank)
@@ -1822,3 +1849,142 @@ def test_sharded_stream_replays_from_a_full_decode_graph(tmp_path) -> None:
         if collectives == "muse_topo":
             assert result["bitwise_vs_all_reduce"], (tokens, result)
         assert result["rel_l2"] < 1e-2, (tokens, result)
+
+
+def _graph_moe_chain_worker(rank: int, world: int, port: int, out_path: str) -> None:
+    """The collectives the sharded MoE branch runs in a decode graph, in the order and
+    with the shapes of ``forward_sequence_parallel``: the gather of the routes ([rows,
+    16] int32, 64 B per row), of the packed NVFP4 latent ([rows, 2304] uint8), the
+    reduce-scatter of the experts' partial sums ([T, 4096] bf16) and the gather of the
+    aux combiner's rows ([rows, 8192] bf16): the small kernels the attention-output
+    soak above does not exercise."""
+    from vllm.distributed import (
+        get_tp_group,
+        tensor_model_parallel_all_gather,
+        tensor_model_parallel_all_reduce,
+    )
+    from vllm.distributed.parallel_state import graph_capture
+    from vllm.models.common.ops.sequence_parallel import (
+        sp_all_gather,
+        sp_reduce_scatter,
+    )
+
+    _init_tp_world(rank, world, port)
+    g = torch.Generator(device="cuda").manual_seed(300 + rank)
+    results = {}
+    for num_tokens in GRAPH_SP_TOKENS:
+        rows = -(-num_tokens // world)
+        routes = torch.randint(
+            -(2**31),
+            2**31 - 1,
+            (rows, 16),
+            generator=g,
+            device="cuda",
+            dtype=torch.int32,
+        )
+        packed = torch.randint(
+            0, 256, (rows, 2304), generator=g, device="cuda", dtype=torch.uint8
+        )
+        partial = torch.randn(num_tokens, 4096, generator=g, device="cuda").to(
+            torch.bfloat16
+        )
+        aux = torch.randn(rows, 8192, generator=g, device="cuda").to(torch.bfloat16)
+        other = torch.randn(512, 4096, generator=g, device="cuda").to(torch.bfloat16)
+
+        def chain(routes=routes, packed=packed, partial=partial, aux=aux, n=num_tokens):
+            gathered_routes = sp_all_gather(routes)[:n]
+            gathered_packed = sp_all_gather(packed)[:n]
+            mine = sp_reduce_scatter(partial)
+            gathered_aux = sp_all_gather(aux)[:n]
+            return [gathered_routes, gathered_packed, mine, gathered_aux]
+
+        with torch.inference_mode():
+            warm = [t.clone() for t in chain()]
+            reference = tensor_model_parallel_all_reduce(partial.clone())
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with (
+                graph_capture(device=torch.device("cuda", rank)) as capture,
+                torch.cuda.graph(graph, stream=capture.stream),
+            ):
+                captured = chain()
+            graph.replay()
+            torch.cuda.synchronize()
+            first = [t.clone() for t in captured]
+            replays = GRAPH_SP_REPLAYS if num_tokens in (136, 272) else 200
+            soak_equal = True
+            for i in range(replays):
+                graph.replay()
+                if i % 97 == 0:
+                    # Eager calls of other sizes between the replays, the same
+                    # collectives in the same order.
+                    sp_reduce_scatter(other[: 136 + i % 7])
+                    sp_all_gather(routes[: 17 + i % 3])
+                if i % 1999 == 0 or i == replays - 1:
+                    torch.cuda.synchronize()
+                    soak_equal &= all(
+                        bool(torch.equal(a, b)) for a, b in zip(captured, first)
+                    )
+            torch.cuda.synchronize()
+            mine_rows = reference[rank * rows : (rank + 1) * rows]
+            if mine_rows.shape[0] < rows:  # the padded rows of the last rank
+                mine_rows = torch.nn.functional.pad(
+                    mine_rows, (0, 0, 0, rows - mine_rows.shape[0])
+                )
+            diff = first[2].float() - mine_rows.float()
+            everyone = tensor_model_parallel_all_gather(
+                torch.cat([t.reshape(-1).view(torch.uint8) for t in first[:2]]).reshape(
+                    1, -1
+                ),
+                0,
+            )
+            # Every rank sees the same gathered routes, packed rows and aux rows.
+            everyone_aux = tensor_model_parallel_all_gather(
+                first[3].reshape(1, -1).view(torch.uint8), 0
+            )
+        results[str(num_tokens)] = dict(
+            graph_equal=all(bool(torch.equal(a, b)) for a, b in zip(first, warm)),
+            soak_equal=soak_equal,
+            rel_l2=float(diff.norm() / mine_rows.float().norm()),
+            same_on_all_ranks=bool(
+                (everyone == everyone[0]).all()
+                and (everyone_aux == everyone_aux[0]).all()
+            ),
+            replays=replays,
+        )
+        torch.distributed.barrier()
+    if rank == 0:
+        topo = getattr(get_tp_group().device_communicator, "topo_comm", None)
+        results["_collectives"] = "muse_topo" if topo is not None else "nccl"
+        with open(out_path, "w") as f:
+            json.dump(results, f)
+    torch.distributed.barrier()
+
+
+@requires_sm120
+@pytest.mark.skipif(torch.cuda.device_count() < 8, reason="Requires 8 GPUs")
+def test_sharded_moe_collectives_replay_from_a_full_decode_graph(tmp_path) -> None:
+    """The small gathers and the reduce-scatter of the sharded MoE branch, captured in
+    CUDA graphs of 136..512 tokens on the collectives of the launch: the replay gives
+    the bits of the eager pass, 20,000 replays next to eager calls of other sizes give
+    them again, every rank gathers the same rows, and the reduce-scattered rows are
+    the all-reduce's up to rounding."""
+    world = 8
+    out_path = str(tmp_path / "moe_results.json")
+    port = 30900 + os.getpid() % 1000
+    mp.spawn(_graph_moe_chain_worker, args=(world, port, out_path), nprocs=world)
+    with open(out_path) as f:
+        results = json.load(f)
+    collectives = results.pop("_collectives")
+    print(f"collectives: {collectives}; {json.dumps(results)}")
+    if os.environ.get("MUSE_TOPO_ENABLE") == "1":
+        assert collectives == "muse_topo", "the host plugin has no collectives"
+    assert set(results) == {str(t) for t in GRAPH_SP_TOKENS}
+    for tokens, result in results.items():
+        assert result["graph_equal"], (tokens, result)
+        assert result["soak_equal"], (tokens, result)
+        assert result["same_on_all_ranks"], (tokens, result)
+        assert result["rel_l2"] < (1e-6 if collectives == "muse_topo" else 1e-2), (
+            tokens,
+            result,
+        )
