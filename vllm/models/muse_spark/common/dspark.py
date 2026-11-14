@@ -198,9 +198,17 @@ class MuseSparkDSparkModel(DFlashQwen3Model):
     def _project_muse_context_kv(self, context_states: torch.Tensor) -> torch.Tensor:
         """Apply the two trained Muse input norms, then each layer's K/V map."""
         fc_output = self.hidden_norm(context_states)
-        per_layer_context = torch.stack(
-            [norm(fc_output) for norm in self._context_pre_norms], dim=0
-        )
+        # Filled one layer at a time: ``torch.stack`` of a list holds every layer's
+        # normed copy twice (5 x 128 MiB each at 8192 context rows).
+        per_layer_context: torch.Tensor | None = None
+        for layer_idx, norm in enumerate(self._context_pre_norms):
+            normed = norm(fc_output)
+            if per_layer_context is None:
+                per_layer_context = normed.new_empty(
+                    (len(self._context_pre_norms), *normed.shape)
+                )
+            per_layer_context[layer_idx].copy_(normed)
+        assert per_layer_context is not None
         return torch.bmm(per_layer_context, self._stacked_kv_weight.transpose(1, 2))
 
     def precompute_and_store_context_kv(
