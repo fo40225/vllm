@@ -875,8 +875,20 @@ def host_seq_lens_plan(
     Returns (needs_seq_lens_cpu, use_upper_bound). The levels are those of
     VLLM_MUSE_SPARK_SM120_FI_HOST_LENS; level 0 is the behaviour before the flag.
     prefill_rows_exact: every row counted in num_prefills is a prefilling request, so
-    the host bound is exact on it (a causal batch split by the query-length threshold
-    alone: the decode rows of a speculative step have at most the threshold's tokens).
+    the host bound is exact on it. That holds when all of these hold (the caller
+    checks them, see `host_bound_supported` and the query-length check in build()):
+    - the batch is causal and split by the query-length threshold alone, so a row
+      with at most the threshold's tokens (a decode row with its drafts) is never
+      counted as a prefill row;
+    - every row after the split has more query tokens than the threshold (a decode
+      row behind a longer row would carry the over-counted bound);
+    - a request that is still prefilling carries no draft tokens, so no rejection can
+      make the device length differ from num_computed_tokens + the scheduled chunk
+      (the scheduler attaches drafts only after the prefill, with at most 1 + K query
+      tokens; upstream relies on the same: "seq_lens_cpu_upper_bound is precise for
+      prefill rows in all modes", mamba_attn.py);
+    - no adaptive verification (it reshapes the rows against the scheduled counts) and
+      no prefill context parallelism (it rewrites the bounds).
     """
     if level <= 0:
         needs = use_dcp or not all_uses_trtllm
@@ -897,6 +909,87 @@ def host_seq_lens_plan(
     # query lengths).
     exact = level >= 2 and not use_dcp and not host_decode_rows and prefill_rows_exact
     return needs, needs and exact and has_upper_bound
+
+
+def host_bound_supported(vllm_config: VllmConfig) -> bool:
+    """Whether the host upper bound of a prefilling row can be exact in this launch.
+
+    Adaptive verification changes the query lengths of the decode rows against the
+    scheduled counts, and prefill context parallelism rewrites the per-rank bounds;
+    neither is part of the production launch, and neither is analyzed for level 2 of
+    VLLM_MUSE_SPARK_SM120_FI_HOST_LENS, so such a launch keeps the fetch.
+    """
+    speculative_config = vllm_config.speculative_config
+    if speculative_config is not None and getattr(
+        speculative_config, "enable_adaptive_verification", False
+    ):
+        return False
+    return getattr(vllm_config.parallel_config, "prefill_context_parallel_size", 1) <= 1
+
+
+def prefill_rows_all_long(
+    qo_indptr_cpu: torch.Tensor, num_decodes: int, num_reqs: int, threshold: int
+) -> bool:
+    """Whether every row after the decode/prefill split has more than `threshold`
+    query tokens, i.e. no decode row (with drafts, hence an over-counted host bound)
+    sits behind the first long row. split_decodes_and_prefills counts everything
+    after the first long row as a prefill row; the batch order (rows with drafts
+    first, then ascending sizes) makes this hold, and the check keeps the host bound
+    from ever being used on a decode row if that order changes."""
+    q_lens = (
+        qo_indptr_cpu[num_decodes + 1 : num_reqs + 1]
+        - qo_indptr_cpu[num_decodes:num_reqs]
+    )
+    return bool((q_lens > threshold).all())
+
+
+class PlanFence:
+    """Orders the plan() calls of one FlashInfer wrapper on the stream.
+
+    plan() stages its schedule in the wrapper's persistent page-locked workspace
+    (`_pin_memory_int_workspace_buffer`) and enqueues the host-to-device copy of it
+    without waiting. The next plan() of the same wrapper rewrites that workspace, so
+    it must not start before the copy of the previous one has run, or the kernels of
+    the previous step read the schedule of the next. Until FI_HOST_LENS the
+    seq_lens.cpu() fetch of every build drained the stream first; a build that skips
+    the fetch has to keep the order itself. The fence records one event per wrapper
+    after plan() and waits for it before the next plan() of that wrapper: free when
+    the copy has run, otherwise a wait for the queued GPU work in front of the copy
+    (under speculation the draft of the step before sits there, 2-5 ms).
+
+    With the fence the wrapper workspace does not depend on how far the host runs
+    ahead of the GPU (the engine bounds it to max_concurrent_batches steps).
+    """
+
+    def __init__(self) -> None:
+        self._events: dict[int, tuple[object, torch.cuda.Event]] = {}
+        self.waits = 0
+        self.blocked = 0
+
+    @staticmethod
+    def _active() -> bool:
+        # No events inside a graph capture (plan() is not captured).
+        return not torch.cuda.is_current_stream_capturing()
+
+    def wait(self, wrapper: object) -> None:
+        entry = self._events.get(id(wrapper))
+        if entry is None or not self._active():
+            return
+        self.waits += 1
+        event = entry[1]
+        if not event.query():
+            self.blocked += 1
+            event.synchronize()
+
+    def record(self, wrapper: object) -> None:
+        if not self._active():
+            return
+        entry = self._events.get(id(wrapper))
+        if entry is None:
+            # The wrapper is kept alive with its event, so its id stays unique.
+            entry = (wrapper, torch.cuda.Event())
+            self._events[id(wrapper)] = entry
+        entry[1].record()
 
 
 class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
@@ -921,6 +1014,15 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 "VLLM_MUSE_SPARK_SM120_FI_HOST_LENS must be 0, 1 or 2, got "
                 f"{self._host_lens_level}"
             )
+        logger.info_once(
+            "FlashInfer host sequence lengths: level %d "
+            "(VLLM_MUSE_SPARK_SM120_FI_HOST_LENS).",
+            self._host_lens_level,
+            scope="process",
+        )
+        self._host_bound_supported = host_bound_supported(vllm_config)
+        # Level 0 keeps the build exactly as before (the fetch drains the stream).
+        self._plan_fence = PlanFence() if self._host_lens_level >= 1 else None
         self._workspace_buffer = None
         self._prefill_wrapper: (
             BatchPrefillWithPagedKVCacheWrapper | BatchDCPPrefillWrapper | None
@@ -1598,6 +1700,40 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self.paged_kv_last_page_len.copy_to_gpu(num_reqs)
         return paged_kv_indices
 
+    def _wait_plan(self, wrapper: object) -> None:
+        """Before plan(): the previous plan() of this wrapper has been copied."""
+        if self._plan_fence is not None:
+            self._plan_fence.wait(wrapper)
+
+    def _mark_plan(self, wrapper: object) -> None:
+        """After plan(): the point of the stream by which its copy has run."""
+        if self._plan_fence is not None:
+            self._plan_fence.record(wrapper)
+
+    def _prefill_rows_exact(
+        self,
+        causal: bool,
+        qo_indptr_cpu: torch.Tensor,
+        num_decodes: int,
+        num_prefills: int,
+        num_reqs: int,
+    ) -> bool:
+        """Whether the host bound is exact on every row counted as a prefill row."""
+        # A split by the query-length threshold alone (no uniform-length rule), in a
+        # launch where the bound of a prefilling request is analyzed (see
+        # host_seq_lens_plan).
+        if not (
+            causal
+            and (self.use_xqa or self.use_trtllm_gen_varlen_decode)
+            and self._host_bound_supported
+        ):
+            return False
+        if self._host_lens_level < 2 or num_prefills == 0:
+            return True  # the answer is not used (no bound, or no prefill row)
+        return prefill_rows_all_long(
+            qo_indptr_cpu, num_decodes, num_reqs, self.reorder_batch_threshold
+        )
+
     def build(
         self,
         common_prefix_len: int,
@@ -1724,9 +1860,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             decode_with_flashinfer_trtllm_api=decode_with_flashinfer_trtllm_api,
             num_speculative_tokens=self._num_speculative_tokens,
             has_upper_bound=common_attn_metadata.seq_lens_cpu_upper_bound is not None,
-            # The split by the query-length threshold alone (no uniform-length rule).
-            prefill_rows_exact=bool(causal)
-            and (self.use_xqa or self.use_trtllm_gen_varlen_decode),
+            prefill_rows_exact=self._prefill_rows_exact(
+                causal, qo_indptr_cpu, num_decodes, num_prefills, num_reqs
+            ),
         )
         if needs_seq_lens_cpu:
             if use_seq_lens_upper_bound:
@@ -1894,6 +2030,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     kv_lens_prefill_cpu = kv_lens_prefill_cpu.pin_memory()
                 if self.use_dcp:
                     assert isinstance(prefill_wrapper, BatchDCPPrefillWrapper)
+                    self._wait_plan(prefill_wrapper)
                     prefill_wrapper.plan(
                         qo_indptr_cpu=qo_indptr_prefill_cpu,
                         paged_kv_indptr_cpu=paged_kv_indptr_prefill_cpu,
@@ -1914,6 +2051,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         disable_split_kv=self.disable_split_kv,
                         block_tables=block_table_tensor[prefill_start:],
                     )
+                    self._mark_plan(prefill_wrapper)
                 else:
                     assert isinstance(
                         prefill_wrapper,
@@ -1925,6 +2063,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     o_dtype = (
                         FP8_DTYPE if self.nvfp4_trtllm else self.model_config.dtype
                     )
+                    self._wait_plan(prefill_wrapper)
                     prefill_wrapper.plan(
                         qo_indptr=qo_indptr_prefill_cpu,
                         paged_kv_indptr=paged_kv_indptr_prefill_cpu,
@@ -1945,6 +2084,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         fixed_split_size=self.prefill_fixed_split_size,
                         disable_split_kv=self.disable_split_kv,
                     )
+                    self._mark_plan(prefill_wrapper)
                 attn_metadata.prefill = FIPrefill(wrapper=prefill_wrapper)
 
         ## DECODE PATHWAY
@@ -2035,6 +2175,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 )
                 if PIN_MEMORY:
                     kv_lens_decode_cpu = kv_lens_decode_cpu.pin_memory()
+                self._wait_plan(decode_wrapper)
                 fast_plan_decode(
                     decode_wrapper,
                     indptr_cpu=paged_kv_indptr_cpu,
@@ -2057,6 +2198,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     disable_split_kv=self.disable_split_kv,
                     q_len_per_req=q_len_per_req,
                 )
+                self._mark_plan(decode_wrapper)
                 attn_metadata.decode = FIDecode(wrapper=decode_wrapper)
         return attn_metadata
 

@@ -1862,12 +1862,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # of a prefilling request is exact (num_computed_tokens plus the scheduled chunk, no
     # acceptance involved), and the decode rows of such a batch run the XQA / trtllm
     # decode, which reads the device lengths. Only for causal batches split by the
-    # query-length threshold alone (the target): a non-causal draft on the native
-    # wrapper, DCP and uniform-length splits keep the fetch. The attention result is
-    # bitwise the same for every level (in a mixed batch the page-index offsets of the
-    # prefill rows shift with the host bound of the decode rows in front of them, on
-    # the write and the read side alike). Values other than 0, 1 and 2 are rejected when
-    # the builder is constructed (the value is read there, once).
+    # query-length threshold alone (the target) whose rows after the split all have
+    # more query tokens than the threshold: a non-causal draft on the native wrapper,
+    # DCP, uniform-length splits, adaptive verification and prefill context parallelism
+    # keep the fetch. The attention result is bitwise the same for every level (in a
+    # mixed batch the page-index offsets of the prefill rows shift with the host bound
+    # of the decode rows in front of them, on the write and the read side alike). Gain
+    # (speculative launch, CPU-bound steps only): about 0.2-0.65 ms per decode step
+    # (0.4-1.1 %), about 9 ms per prefill-chunk step after the first chunk of a prompt
+    # (multi-chunk prompts and chunks that run beside decode rows; a single chunk gains
+    # nothing). Levels 1 and 2 also fence the plan() calls: plan() stages its schedule
+    # in the wrapper's persistent pinned workspace and copies it asynchronously, and the
+    # fetch that used to drain the stream before the next plan() of the wrapper may be
+    # gone; an event per wrapper keeps the order. Values other than 0, 1 and 2 are
+    # rejected when the builder is constructed (the value is read there, once).
     "VLLM_MUSE_SPARK_SM120_FI_HOST_LENS": lambda: int(
         os.getenv("VLLM_MUSE_SPARK_SM120_FI_HOST_LENS", "0")
     ),

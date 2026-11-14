@@ -22,7 +22,9 @@ from vllm.v1.attention.backends import flashinfer as fi  # noqa: E402
 from vllm.v1.attention.backends.flashinfer import (  # noqa: E402
     FlashInferDecodeKernel,
     FlashInferMetadataBuilder,
+    host_bound_supported,
     host_seq_lens_plan,
+    prefill_rows_all_long,
 )
 
 
@@ -167,13 +169,31 @@ class _CountingLens(torch.Tensor):
         return torch.Tensor.cpu(self.as_subclass(torch.Tensor), *args, **kwargs)
 
 
-def _stub_builder(level, *, use_xqa, num_spec):
+class _FakeFence:
+    """Records the order of the fence calls and the plan() calls of a build."""
+
+    def __init__(self, log):
+        self.log = log
+
+    def wait(self, wrapper):
+        self.log.append(("wait", id(wrapper)))
+
+    def record(self, wrapper):
+        self.log.append(("record", id(wrapper)))
+
+
+def _stub_builder(level, *, use_xqa, num_spec, bound_ok=True, fence_log=None):
     plan_calls = []
     kv_calls = []
     wrapper = mock.MagicMock(spec=fi.BatchPrefillWithPagedKVCacheWrapper)
-    wrapper.plan.side_effect = lambda **kw: plan_calls.append(kw)
+    wrapper.plan.side_effect = lambda **kw: (
+        plan_calls.append(kw),
+        fence_log.append(("plan", id(wrapper))) if fence_log is not None else None,
+    )
     stub = types.SimpleNamespace(
         _host_lens_level=level,
+        _host_bound_supported=bound_ok,
+        _plan_fence=_FakeFence(fence_log) if fence_log is not None else None,
         _num_speculative_tokens=num_spec,
         attention_config=types.SimpleNamespace(use_trtllm_attention=None),
         model_config=types.SimpleNamespace(dtype=torch.bfloat16),
@@ -217,9 +237,15 @@ def _stub_builder(level, *, use_xqa, num_spec):
     )
     stub._get_prefill_wrapper = lambda causal=True: wrapper
     stub._get_decode_mask = lambda *a, **k: None
-    stub._compute_decode_query_lens = types.MethodType(
-        FlashInferMetadataBuilder._compute_decode_query_lens, stub
-    )
+    for name in (
+        "_compute_decode_query_lens",
+        "_prefill_rows_exact",
+        "_wait_plan",
+        "_mark_plan",
+    ):
+        setattr(
+            stub, name, types.MethodType(getattr(FlashInferMetadataBuilder, name), stub)
+        )
 
     def kv_meta(num_blocks_np, seq_lens_np, block_table_tensor, num_reqs, page_size):
         kv_calls.append((num_blocks_np.copy(), seq_lens_np.copy(), num_reqs))
@@ -339,3 +365,71 @@ def test_native_noncausal_draft_keeps_the_fetch(level):
     assert cpu_calls == 1
     assert md.num_prefills == 3 and md.num_decodes == 0
     assert plans[0]["seq_lens"].tolist() == s
+
+
+@pytest.mark.parametrize("level", [0, 1, 2])
+def test_short_row_behind_a_long_row_keeps_the_fetch(level):
+    """A decode row (drafts, over-counted bound) behind a long first row is counted
+    as a prefill row by the split; the host bound must not be used for it."""
+    q, s = [4096, 8, 4096], [4096, 600, 3000 + 4096]
+    cam = _common(q, s, causal=True)
+    cam.seq_lens_cpu_upper_bound = torch.tensor([4096, 607, 7096], dtype=torch.int32)
+    stub, plans, _ = _stub_builder(level, use_xqa=True, num_spec=7)
+    md, cpu_calls = _build(stub, cam)
+    assert md.num_decodes == 0 and md.num_prefills == 3
+    assert cpu_calls == 1
+    assert plans[0]["seq_lens"].tolist() == s  # the exact lengths, not the bound
+
+
+@pytest.mark.parametrize("level", [0, 1, 2])
+def test_unsupported_launch_keeps_the_fetch(level):
+    """Adaptive verification / prefill context parallelism: no host bound."""
+    stub, _, _ = _stub_builder(level, use_xqa=True, num_spec=7, bound_ok=False)
+    _, cpu_calls = _build(stub, _common([4096, 4096], [8192, 7096], causal=True))
+    assert cpu_calls == 1
+
+
+def test_prefill_rows_all_long():
+    qsl = torch.tensor([0, 8, 16, 4112, 8208], dtype=torch.int32)
+    assert prefill_rows_all_long(qsl, 2, 4, 8)
+    assert not prefill_rows_all_long(qsl, 0, 4, 8)  # rows 0 and 1 are short
+    assert not prefill_rows_all_long(qsl, 1, 4, 8)
+    assert prefill_rows_all_long(qsl, 2, 4, 4095)
+    assert not prefill_rows_all_long(qsl, 2, 4, 4096)  # a row of exactly 4096
+
+
+def _config(adaptive=None, pcp=1):
+    spec = (
+        None
+        if adaptive is None
+        else types.SimpleNamespace(enable_adaptive_verification=adaptive)
+    )
+    return types.SimpleNamespace(
+        speculative_config=spec,
+        parallel_config=types.SimpleNamespace(prefill_context_parallel_size=pcp),
+    )
+
+
+def test_host_bound_supported():
+    assert host_bound_supported(_config())  # no speculation
+    assert host_bound_supported(_config(adaptive=False))
+    assert not host_bound_supported(_config(adaptive=True))
+    assert not host_bound_supported(_config(adaptive=False, pcp=2))
+    assert not host_bound_supported(_config(pcp=4))
+
+
+@pytest.mark.parametrize("level", [0, 1, 2])
+def test_plan_is_fenced_on_the_wrapper(level):
+    """Wait before and record after every plan() of a build (levels 1 and 2 only)."""
+    log = []
+    stub, plans, _ = _stub_builder(
+        level, use_xqa=True, num_spec=7, fence_log=log if level else None
+    )
+    _build(stub, _common([4096, 4096], [8192, 7096], causal=True))
+    assert len(plans) == 1
+    if level == 0:
+        assert stub._plan_fence is None
+        return
+    kinds = [k for k, _ in log]
+    assert kinds == ["wait", "plan", "record"]
+    assert len({w for _, w in log}) == 1  # one wrapper
