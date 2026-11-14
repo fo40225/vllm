@@ -55,9 +55,9 @@ def supports_dense_q(attn_layer: torch.nn.Module) -> bool:
     """Whether the insert can write Q densely for this layer's attention backend.
 
     Only the ``_muse_C`` op has the output (the stock ``torch.ops._C`` one does not),
-    and only FlashInfer gains from it: its decode and prefill paths make Q dense with
-    a copy when it is a strided view of the QKV row. Call it from layer construction,
-    after ``supports_fused_kv_insert``.
+    and only FlashInfer gains from it: its decode path (and its TRT-LLM prefill path)
+    makes Q dense with a copy when it is a strided view of the QKV row. Call it from
+    layer construction, after ``supports_fused_kv_insert``.
     """
     if attn_layer.attn_backend.get_name() != "FLASHINFER":
         return False

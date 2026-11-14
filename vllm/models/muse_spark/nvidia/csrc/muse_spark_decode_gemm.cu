@@ -29,8 +29,10 @@
 // (128-byte rows, 16-byte chunks XOR-swizzled by the row for ldmatrix);
 // mma.sync m16n8k16 bf16 with fp32 accumulators.
 //
-// Order of the additions of one output element, independent of T, of the tile
-// configuration, of the grid and of the run (only SPLIT changes it):
+// Order of the additions of one output element, independent of the tile
+// configuration, of the grid and of the run, and of T as long as SPLIT is the same
+// (SPLIT changes it; the QKV projection takes SPLIT 4 up to 32 rows and 8 above, so
+// its bits step at 33 rows, as the algorithm cuBLAS picks depends on the row count):
 //   slice:   the k16 steps of the slice in ascending order (the accumulation
 //            of one mma of the tensor core)
 //   cluster: p_0 + p_1, then + p_2, ... in ascending cluster rank, fp32
@@ -51,22 +53,21 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 
-#include <cooperative_groups.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <atomic>
 #include <cstdint>
 #include <vector>
 
 #include "muse_c_ops.h"
-
-namespace cg = cooperative_groups;
 
 namespace muse_spark {
 namespace dgemm {
 
 constexpr int kBK = 64;  // bf16 elements per tile row (128 bytes)
 constexpr int kMaxSplit = 8;
+constexpr int kMaxDevices = 64;  // devices of one process
 
 __device__ __forceinline__ uint32_t smem_u32(const void* p) {
   return static_cast<uint32_t>(__cvta_generic_to_shared(p));
@@ -383,11 +384,15 @@ void launch(const __nv_bfloat16* x, const __nv_bfloat16* w,
             int ldo, bool early_w, bool pdl, cudaStream_t stream) {
   constexpr int smem = STAGES * (MT * 16 + BN) * 128;
   auto kernel = decode_gemm_kernel<MT, BN, WM, WN, STAGES, SPLIT>;
-  static bool configured = false;  // per function, not per call
-  if (!configured) {
+  // The attribute belongs to the function of a device: once per instantiation and device.
+  static std::atomic<bool> configured[kMaxDevices];
+  int device = 0;
+  C10_CUDA_CHECK(cudaGetDevice(&device));
+  TORCH_CHECK(device >= 0 && device < kMaxDevices, "decode_gemm: device ", device);
+  if (!configured[device].load(std::memory_order_acquire)) {
     C10_CUDA_CHECK(cudaFuncSetAttribute(
         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
-    configured = true;
+    configured[device].store(true, std::memory_order_release);
   }
   cudaLaunchConfig_t cfg = {};
   cfg.gridDim = dim3((N / BN) * SPLIT);
@@ -430,6 +435,11 @@ inline int find_config(int mt, int bn, int wm, int wn, int stages, int split) {
 // 32 rows, 8 above), the tile shape, which does not change a bit, follows the
 // row count. Shapes that are not the TP8 ones of the model get a generic
 // choice.
+inline bool is_tuned_shape(int N, int K) {
+  return (N == 512 && K == 8192) || (N == 1024 && K == 4096) ||
+         (N == 2304 && K == 8192);
+}
+
 inline int pick_config(int T, int N, int K) {
   const int mt = (T + 15) / 16;
   int cfg = -1;
@@ -464,6 +474,10 @@ inline int pick_config(int T, int N, int K) {
 }  // namespace dgemm
 
 int64_t decode_gemm_num_configs() { return dgemm::kNumConfigs; }
+
+bool decode_gemm_is_tuned(int64_t N, int64_t K) {
+  return dgemm::is_tuned_shape(static_cast<int>(N), static_cast<int>(K));
+}
 
 int64_t decode_gemm_scratch_floats(int64_t N, int64_t rows, int64_t bn,
                                    int64_t split) {

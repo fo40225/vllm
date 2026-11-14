@@ -319,6 +319,51 @@ def test_usable_and_supports_weight():
     assert not dg.supports_weight(w.float())
 
 
+def test_only_the_tuned_tp8_shapes_are_served():
+    """A draft model or another TP size keeps cuBLAS: the generic tiles are untuned."""
+    muse_c.load()
+    dg.reserve_scratch(DEVICE)
+    is_tuned = torch.ops._muse_C.decode_gemm_is_tuned
+    for n, k in SHAPES.values():
+        assert is_tuned(n, k)
+        assert dg.supports_weight(data(1, n, k)[1])
+    for n, k in ((512, 4096), (1024, 8192), (4608, 8192), (2304, 4096), (1152, 8192)):
+        assert not is_tuned(n, k)
+        assert not dg.supports_weight(data(1, n, k)[1]), (n, k)
+    # Through the wrapper: the fallback runs, whatever the rows.
+    calls = []
+
+    def fallback(layer, x, weight, bias=None):
+        calls.append(tuple(weight.shape))
+        return F.linear(x, weight, bias)
+
+    gemm = dg.wrap_projection(fallback)
+    x, w = data(16, 4608, 8192)
+    gemm(None, x, w, None)
+    assert calls == [(4608, 8192)]
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Needs two GPUs")
+def test_every_device_gets_the_dynamic_shared_memory_attribute(configs):
+    """The attribute of a function is set per device, not once per process."""
+    muse_c.load()
+    op = torch.ops._muse_C.decode_gemm
+    n, k = SHAPES["qkv"]
+    # QKV, 33 .. 64 rows: 3 stages of (64 + 128) rows of 128 B = 72 KiB, above the
+    # default 48 KiB of a block.
+    for index in (0, 1, 0, 1):
+        with torch.cuda.device(index):
+            device = torch.device("cuda", index)
+            x, w = data(40, n, k, seed=index)
+            x, w = x.to(device), w.to(device)
+            scratch = torch.empty(4 << 20, dtype=torch.float32, device=device)
+            out = torch.empty(40, n, dtype=torch.bfloat16, device=device)
+            op(x, w, out, scratch, -1, False, False)
+            torch.cuda.synchronize(device)
+            ref = x.double() @ w.double().t()
+            assert bool(((out.double() - ref).abs() <= 0.05 * ref.abs().max()).all())
+
+
 def test_decode_gemm_matches_the_op_and_wraps_the_projection():
     muse_c.load()
     dg.reserve_scratch(DEVICE)

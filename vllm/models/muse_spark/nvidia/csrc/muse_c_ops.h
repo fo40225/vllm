@@ -206,6 +206,9 @@ void fused_muse_spark_qknorm_rope_kv_insert(
 void decode_gemm(at::Tensor const& x, at::Tensor const& w, at::Tensor& out,
                  at::Tensor& scratch, int64_t cfg, bool early_w, bool pdl);
 int64_t decode_gemm_num_configs();
+// Whether (N, K) is one of the three TP8 shapes of the model that the table is tuned for
+// (any other shape gets a generic config, which is not known to beat cuBLAS).
+bool decode_gemm_is_tuned(int64_t N, int64_t K);
 // fp32 elements of `scratch` that a config with 16-row tiles x `rows`, bn columns and
 // the K split needs for a GEMM of N columns.
 int64_t decode_gemm_scratch_floats(int64_t N, int64_t rows, int64_t bn,

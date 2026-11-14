@@ -11,9 +11,11 @@ cluster, every CTA stores its fp32 partial tile to a scratch buffer, one cluster
 barrier, and each CTA of the cluster adds the pieces of its rows in rank order.
 
 The result is not the cuBLAS one: the order of the additions is another one (fixed,
-independent of the row count, of the tile configuration, of the run and of the rank;
-it depends on the K split of the shape only), and the partial sums stay in fp32 where
-cuBLAS keeps them in a bf16 workspace for some shapes. See
+the same in every run and on every rank, independent of the tile configuration, and of
+the row count as long as the K split is the same), and the partial sums stay in fp32
+where cuBLAS keeps them in a bf16 workspace for some shapes. The K split of the QKV
+projection steps from 4 to 8 at 33 rows, so a token's QKV bits depend on the padded
+batch size it runs in, as they do with the algorithm cuBLAS picks per row count. See
 ``csrc/muse_spark_decode_gemm.cu``.
 
 All calls of a device share one fp32 scratch buffer for the partial tiles. That is
@@ -24,6 +26,7 @@ a caller that ran two of them concurrently on different streams would need a buf
 stream.
 """
 
+import functools
 from collections.abc import Callable
 
 import torch
@@ -56,15 +59,26 @@ def _op() -> Callable | None:
     return resolve_compiled_op(_OP)
 
 
+@functools.cache
+def _is_tuned(n: int, k: int) -> bool:
+    return bool(torch.ops._muse_C.decode_gemm_is_tuned(n, k))
+
+
 def supports_weight(weight: torch.Tensor) -> bool:
-    """Whether the kernel can take this weight, and the op is available."""
+    """Whether the kernel can take this weight, and the op is available.
+
+    Only the three TP8 shapes of the model the kernel is tuned for: the other layers
+    that use the same projection classes (the weights of a draft model, another TP size)
+    get a generic tile choice that is not known to beat cuBLAS, so they stay on it.
+    """
     if _op() is None:
         return False
     if weight.dtype != torch.bfloat16 or weight.dim() != 2:
         return False
     n, k = weight.shape
     return (
-        weight.stride(1) == 1
+        _is_tuned(n, k)
+        and weight.stride(1) == 1
         and weight.stride(0) == k
         and weight.data_ptr() % 16 == 0
         and n % 64 == 0

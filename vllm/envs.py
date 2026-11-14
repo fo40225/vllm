@@ -1746,8 +1746,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # a scratch buffer and, after one cluster barrier, adds the pieces of its rows in rank
     # order. Rounding-level change: another (fixed) order of the additions than cuBLAS, a
     # fp32 partial sum where cuBLAS keeps a bf16 workspace for some shapes; deterministic,
-    # the same on every TP rank and independent of the row count. Above 64 rows, with a
-    # bias, with LoRA (for the QKV projection) or off SM120 the cuBLAS path stays.
+    # the same on every TP rank and, per K split, independent of the row count (the QKV
+    # split steps from 4 to 8 at 33 rows, so its bits depend on the padded batch size, as
+    # cuBLAS's do). Only the three TP8 shapes of the model are served (a draft model or
+    # another TP size stays on cuBLAS); above 64 rows, with a bias, with LoRA (for the QKV
+    # projection) or off SM120 the cuBLAS path stays.
     # Default off. Read once, when the model is constructed.
     "VLLM_MUSE_SPARK_SM120_DECODE_GEMM": lambda: bool(
         int(os.getenv("VLLM_MUSE_SPARK_SM120_DECODE_GEMM", "0"))

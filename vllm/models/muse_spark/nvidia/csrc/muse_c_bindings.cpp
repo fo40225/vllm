@@ -86,6 +86,7 @@ TORCH_LIBRARY(_muse_C, m) {
       "int cfg=-1, bool early_w=False, bool pdl=False) -> ()");
   m.def("decode_gemm_scratch_floats(int N, int rows, int bn, int split) -> int");
   m.def("decode_gemm_num_configs() -> int");
+  m.def("decode_gemm_is_tuned(int N, int K) -> bool");
   m.def("decode_gemm_config(int i) -> int[]");
 
   // Router GEMV of the decode layer, see muse_c_ops.h.
@@ -110,6 +111,7 @@ TORCH_LIBRARY(_muse_C, m) {
 // The tile table of decode_gemm: no tensor argument, so no backend key to dispatch on.
 TORCH_LIBRARY_IMPL(_muse_C, CompositeExplicitAutograd, m) {
   m.impl("decode_gemm_num_configs", &muse_spark::decode_gemm_num_configs);
+  m.impl("decode_gemm_is_tuned", &muse_spark::decode_gemm_is_tuned);
   m.impl("decode_gemm_config", &muse_spark::decode_gemm_config);
   m.impl("decode_gemm_scratch_floats", &muse_spark::decode_gemm_scratch_floats);
 }
