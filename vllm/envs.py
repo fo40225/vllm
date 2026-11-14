@@ -1771,7 +1771,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # request asks for logprobs, penalties, logit bias / allowed token ids / bad words,
     # a thinking budget, a grammar bitmask, or, at temperature > 0, min_p, top_p, or a
     # top_k above K: ONE such request sends all the rows of its step to the full path.
-    # 3 (default): the same decision per request: the rows of a request that needs the
+    # 3: the same decision per request: the rows of a request that needs the
     # logits (penalties, logit bias, bad words, a thinking budget, a top_k above K,
     # top_p) are gathered whole and verified by the full path, the other requests of the
     # step verify from the candidates (one lm_head projection serves both, the outputs
@@ -1788,8 +1788,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # full path's, bit for bit (vLLM rejects logit_bias and a min_p above 1e-5 under
     # speculative decoding, SamplingParams._validate_spec_decode: no such request
     # reaches the verification in practice, and min_p adds nothing to the measured
-    # gain). 4: also requests with top_p below 1 (and no min_p) inside a class of
-    # temperature (up to 1), top_p (up to 0.95) and top_k (40 to 64), bounds in
+    # gain). 4 (default): also requests with top_p below 1 (and no min_p) inside a class
+    # of temperature (up to 1), top_p (up to 0.95) and top_k (40 to 64), bounds in
     # vllm/v1/worker/gpu/sample/topk_logits.py: the nucleus of the full path's top-k +
     # top-p kernel over the candidates; the other top_p requests keep the full path
     # (reason "top-p-guard" in the route log), and so do all of them at level 3. NOT
@@ -1817,7 +1817,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the reasons of the others are logged every 30 s ("steps with drafts"; those steps
     # do not count in the lines of the top-k logits sampling). Read once, in load_model.
     "VLLM_MUSE_SPARK_SM120_VERIFY_TOPK_LOGITS": lambda: int(
-        os.getenv("VLLM_MUSE_SPARK_SM120_VERIFY_TOPK_LOGITS", "3")
+        os.getenv("VLLM_MUSE_SPARK_SM120_VERIFY_TOPK_LOGITS", "4")
     ),
     # Muse Spark on SM120: how the aux projection (fc, [5 * 8192 -> 8192], 671 MB) of
     # the DFlash2 draft is computed. It runs eagerly in the propose step on all the rows

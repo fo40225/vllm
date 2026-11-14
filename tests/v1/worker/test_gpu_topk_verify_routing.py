@@ -170,12 +170,13 @@ def test_the_split_levels_need_a_model_that_splits_the_gather(monkeypatch, level
 
 
 def test_the_flag_is_on_by_default(monkeypatch):
-    """The default is level 3: greedy and sampled steps are verified from the
-    candidates, per request (the accuracy policy: identical for greedy,
-    distribution-exact for sampled rows; top_p rows stay on the full route, level 4
-    is opt-in)."""
+    """The default is level 4: greedy and sampled steps are verified from the
+    candidates, per request, top_p rows of the guarded class (temperature, top_p and
+    top_k bounds) too; the other top_p rows stay on the full route. The accuracy
+    policy admits the rounding-level difference of the guarded rows (a tie-group
+    difference on about 1e-4 of them, deterministic, identical on all ranks)."""
     got, runner = resolve(monkeypatch, None)
-    assert got == 3 and runner.topk_verify_sampled
+    assert got == 4 and runner.topk_verify_sampled
     assert runner.topk_verify_stats is not None
 
 
