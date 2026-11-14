@@ -123,6 +123,7 @@ from vllm.models.muse_spark.nvidia.ops.cute_dsl.qk_norm import (
     qk_norm,
     supports_qk_norm,
 )
+from vllm.models.muse_spark.nvidia.ops.expert_prefetch import ExpertPrefetch
 from vllm.models.muse_spark.nvidia.ops.l2_prefetch import (
     AFTER_EXPERTS_CTAS,
     L2_PREFETCH_MAX_TOKENS,
@@ -132,6 +133,10 @@ from vllm.models.muse_spark.nvidia.ops.mnnvl_fusions import (
     maybe_create_all_gather_dual_norm,
     maybe_create_all_gather_norm_quant,
     tp_group_spans_nodes,
+)
+from vllm.models.muse_spark.nvidia.ops.muse_decode_moe import (
+    EXPERT_PREFETCH_MAX_TOKENS,
+    MUSE_MAX_TOKENS,
 )
 from vllm.models.muse_spark.nvidia.ops.prepare_megamoe_nvfp4 import (
     prepare_megamoe_nvfp4_with_norm,
@@ -687,6 +692,8 @@ class MuseSpark1xMoE(nn.Module):
             prefix=f"{prefix}.unpooler",
         )
 
+        # Set by the model for the decode expert prefetch.
+        self.expert_prefetch: ExpertPrefetch | None = None
         # Aux streams have hung on ROCm.
         self._router_events = (torch.cuda.Event(), torch.cuda.Event())
         self._router_aux_stream = (
@@ -954,6 +961,10 @@ class MuseSpark1xMoE(nn.Module):
         pays only where the cast is on the critical path: beside the pooler it
         hides, and the extra store would slow the boundary by about 0.5 us.
 
+        With the expert prefetch the routing is on the critical path as well: the
+        prefetch starts when the routing ends, and every microsecond the routing
+        ends earlier is one more that the experts' first tiles are already in L2.
+
         SM120 only: that is where the fused store was measured (and shown bitwise
         equal). On the other GPUs the routers keep the cast of their own, even where
         their last tier would accept the widened input (SM90).
@@ -962,7 +973,10 @@ class MuseSpark1xMoE(nn.Module):
             _on_sm120()
             and not self.is_sequence_parallel
             and not self.wants_fp32_router_input(num_tokens)
-            and not self.router_overlaps_pooler(num_tokens)
+            and (
+                not self.router_overlaps_pooler(num_tokens)
+                or self.prefetches_experts(num_tokens)
+            )
             and self.router.widens_bf16_input()
         ):
             return False
@@ -971,6 +985,21 @@ class MuseSpark1xMoE(nn.Module):
             "the router would cast it on the critical path."
         )
         return True
+
+    def prefetches_experts(self, num_tokens: int) -> bool:
+        """Whether the decode graph of this size queues the expert prefetch.
+
+        It needs the routing on the aux stream and the muse decode kernel (padded
+        batches of up to ``MUSE_MAX_TOKENS``, of which the prefetch maps the first
+        ``EXPERT_PREFETCH_MAX_TOKENS``); the layers on another expert path would pay
+        the fused router cast for nothing.
+        """
+        return (
+            self.expert_prefetch is not None
+            and num_tokens <= min(MUSE_MAX_TOKENS, EXPERT_PREFETCH_MAX_TOKENS)
+            and self._routes_on_aux_stream(num_tokens)
+            and cast(MuseMoERunner, self.experts).has_muse_decode_engine
+        )
 
     def _route_and_pool(
         self, hidden_states: torch.Tensor, router_input: torch.Tensor
@@ -1024,6 +1053,10 @@ class MuseSpark1xMoE(nn.Module):
             self._router_events[1],
             self._router_aux_stream if parallel else None,
         )
+        if parallel and self.prefetches_experts(hidden_states.shape[0]):
+            # Behind the routing kernel on the aux stream, after the event that
+            # hands the routing to the experts: they do not wait for it.
+            self.expert_prefetch.launch(self.experts, ids)
 
         return pooled, weights, ids
 
@@ -1998,6 +2031,9 @@ class MuseSpark1xModel(LlamaModel):
         self._l2_prefetcher: L2Prefetcher | None = None
         if envs.VLLM_MUSE_SPARK_SM120_L2_PREFETCH and _on_sm120():
             self._configure_l2_prefetch()
+        self._expert_prefetch: ExpertPrefetch | None = None
+        if envs.VLLM_MUSE_SPARK_SM120_EXPERT_PREFETCH and _on_sm120():
+            self._configure_expert_prefetch()
         if self.is_sequence_parallel:
             from vllm.models.muse_spark.nvidia.ops.gemm_rs import (
                 maybe_create_gemm_rs,
@@ -2111,6 +2147,33 @@ class MuseSpark1xModel(LlamaModel):
                 eps=norm.variance_epsilon, gain_center=norm.fused_gain_center
             )
 
+    def _configure_expert_prefetch(self) -> None:
+        """Prefetch the routed experts of a decode layer into L2 (see
+        ``ops/expert_prefetch.py``).
+
+        The layers whose experts run the muse decode kernel behind routing on the
+        router's aux stream queue it; it is a cache hint that changes no output.
+        """
+        moes = [
+            layer.feed_forward
+            for layer in islice(self.layers, self.start_layer, self.end_layer)
+            if isinstance(layer.feed_forward, MuseSpark1xMoE)
+            and isinstance(layer.feed_forward.experts, MuseMoERunner)
+            and layer.feed_forward.experts.supports_after_gemm2_hook
+            and layer.feed_forward._router_aux_stream is not None
+        ]
+        if not moes:
+            return
+        prefetch = ExpertPrefetch(moes[0]._router_aux_stream)
+        for moe in moes:
+            moe.expert_prefetch = prefetch
+        self._expert_prefetch = prefetch
+        logger.info_once(
+            "MuseSpark: expert L2 prefetch of the first %d MiB in %d layers.",
+            prefetch.budget_bytes >> 20,
+            len(moes),
+        )
+
     def _configure_l2_prefetch(self) -> None:
         """Prefetch weights into L2 behind the collectives of the layer before.
 
@@ -2172,7 +2235,7 @@ class MuseSpark1xModel(LlamaModel):
                         [
                             *moe.sharded_weights(num_tokens, moe.pooler),
                             moe.router.weight.data,
-                        ]
+                        ],
                     )
 
             return hook
@@ -2286,6 +2349,8 @@ class MuseSpark1xModel(LlamaModel):
 
         if self._l2_prefetcher is not None:
             self._l2_prefetcher.join()
+        if self._expert_prefetch is not None:
+            self._expert_prefetch.join()
 
         if not get_pp_group().is_last_rank:
             assert isinstance(x, torch.Tensor)  # fuse_across_layers is off here

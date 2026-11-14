@@ -268,6 +268,7 @@ def make_moe_stub(monkeypatch, *, widens=True, aux_stream=True, fp32_feature=Fal
     moe.tp_size = 8
     moe.router = SimpleNamespace(widens_bf16_input=lambda: widens)
     moe.aux_stream_routing = True
+    moe.expert_prefetch = None
     # An experts runner that supports routing done by the caller.
     moe.experts = object.__new__(_RoutedRunner)
     torch.nn.Module.__init__(moe.experts)

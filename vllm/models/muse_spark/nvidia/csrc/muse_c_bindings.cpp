@@ -59,6 +59,10 @@ TORCH_LIBRARY(_muse_C, m) {
   m.def(
       "l2_prefetch(Tensor[] tensors, int num_ctas, int chunk_kib, "
       "bool evict_last) -> ()");
+  m.def(
+      "expert_prefetch(Tensor topk_ids, Tensor? expert_map, Tensor w13, "
+      "Tensor sf13, Tensor w2, Tensor sf2, bool up_first, int num_ctas, "
+      "int budget_bytes, bool pdl, Tensor!? dump=None) -> ()");
 
   // Muse Spark attention ops of vllm-project/vllm#62132; the schemas are those
   // of the stock torch.ops._C ops.
@@ -87,6 +91,7 @@ TORCH_LIBRARY_IMPL(_muse_C, CUDA, m) {
   m.impl("nvfp4_decode_moe", &muse_spark::nvfp4_decode_moe);
   m.impl("nvfp4_decode_act_quant", &muse_spark::nvfp4_decode_act_quant);
   m.impl("l2_prefetch", &muse_spark::l2_prefetch);
+  m.impl("expert_prefetch", &muse_spark::expert_prefetch);
   m.impl("muse_spark_mul_tanh_soft_cap",
          &muse_spark::muse_spark_mul_tanh_soft_cap);
   m.impl("fused_muse_spark_qknorm_rope_kv_insert",

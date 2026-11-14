@@ -75,6 +75,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kNvfp4Static,
 )
 from vllm.models.muse_spark.common.moe import needs_pre_norm_all_reduce
+from vllm.models.muse_spark.common.ops import muse_pdl_enabled
 from vllm.models.muse_spark.nvidia.ops import muse_c
 from vllm.models.muse_spark.nvidia.ops.b12x_decode_moe import (
     B12X_MAX_TOKENS,
@@ -82,7 +83,9 @@ from vllm.models.muse_spark.nvidia.ops.b12x_decode_moe import (
     b12x_unusable_reason,
     mark_b12x_setup_failed,
 )
+from vllm.models.muse_spark.nvidia.ops.expert_prefetch import EXPERT_PREFETCH_CTAS
 from vllm.models.muse_spark.nvidia.ops.muse_decode_moe import (
+    EXPERT_PREFETCH_MAX_TOKENS,
     MUSE_MAX_TOKENS,
     MuseDecodeMoE,
     mark_muse_setup_failed,
@@ -791,6 +794,35 @@ class MuseSparkSm120NvFp4Experts(mk.FusedMoEExpertsModular):
         if self.after_gemm2_hook is not None:
             self.after_gemm2_hook(hidden_states.shape[0])
         self._run_post_gemm2_hook(unfinalized, output)
+
+    def prefetch_routed_experts(
+        self,
+        topk_ids: torch.Tensor,
+        expert_map: torch.Tensor | None,
+        budget_bytes: int,
+    ) -> bool:
+        """Queue an L2 prefetch of the experts the muse kernel reads for ``topk_ids``.
+
+        Meant for a side stream behind the routing kernel, in a CUDA graph capture
+        that goes on to call ``apply`` with the same ids: it only warms the cache
+        for the launch that ``apply`` makes, and does nothing where ``apply`` would
+        not run the muse kernel. Returns whether a prefetch was queued.
+        """
+        if not (
+            self.use_muse_decode
+            and self.muse is not None
+            and _capturing()
+            and topk_ids.shape[0] <= min(MUSE_MAX_TOKENS, EXPERT_PREFETCH_MAX_TOKENS)
+        ):
+            return False
+        self.muse.prefetch(
+            topk_ids,
+            expert_map,
+            num_ctas=EXPERT_PREFETCH_CTAS,
+            budget_bytes=budget_bytes,
+            pdl=muse_pdl_enabled(),
+        )
+        return True
 
     def _apply_muse(
         self,

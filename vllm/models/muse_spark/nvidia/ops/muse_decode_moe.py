@@ -35,6 +35,8 @@ logger = init_logger(__name__)
 # Padded token counts 1..MUSE_MAX_TOKENS are served (as 1, 2, 4 or 8).
 MUSE_MAX_TOKENS = 8
 _T_PADS = (1, 2, 4, 8)
+# The expert prefetch maps the routes of up to this many tokens (64 routes) in one CTA.
+EXPERT_PREFETCH_MAX_TOKENS = 8
 # The fixed problem of the kernel, apart from the number of local experts.
 MUSE_HIDDEN = 4096
 MUSE_INTERMEDIATE = 4096
@@ -215,6 +217,41 @@ class MuseDecodeMoE:
         torch.accelerator.synchronize()
         if bool(self._scratch.ctl.any()):
             raise RuntimeError("The muse decode kernel left its counters dirty.")
+
+    def prefetch(
+        self,
+        topk_ids: torch.Tensor,
+        expert_map: torch.Tensor | None,
+        *,
+        num_ctas: int,
+        budget_bytes: int,
+        pdl: bool,
+        dump: torch.Tensor | None = None,
+    ) -> None:
+        """Queue an L2 prefetch of the experts that ``run`` will read for ``topk_ids``.
+
+        The same ids and map as ``run``. The kernel maps the routes to this rank's
+        distinct local experts and prefetches their weights and scales in the order
+        the decode kernel consumes them (GEMM1 of every expert, then GEMM2), up to
+        ``budget_bytes``. It reads the ids and writes nothing, so it can run on a
+        side stream behind the routing kernel. With ``pdl`` it is launched as a
+        programmatic dependent of the kernel before it in the stream. ``dump`` (int64,
+        tests only) receives the (address, size) of the requests in place of the
+        prefetches.
+        """
+        torch.ops._muse_C.expert_prefetch(
+            topk_ids.to(torch.int32).contiguous(),
+            None if expert_map is None else expert_map.to(torch.int32).contiguous(),
+            self._w1,
+            self._w1_scale,
+            self._w2,
+            self._w2_scale,
+            self._up_first,
+            num_ctas,
+            budget_bytes,
+            pdl,
+            dump,
+        )
 
     def run(
         self,

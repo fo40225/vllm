@@ -149,6 +149,7 @@ if TYPE_CHECKING:
     VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL: bool | None = None
     VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_MIN_TOKENS: int = 512
     VLLM_MUSE_SPARK_SM120_L2_PREFETCH: bool = True
+    VLLM_MUSE_SPARK_SM120_EXPERT_PREFETCH: bool = True
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
     VLLM_ROCM_USE_AITER_LINEAR_HIPBMM: bool = False
     VLLM_ROCM_USE_AITER_MOE: bool = True
@@ -1404,6 +1405,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # nothing. Read once, when the model is constructed.
     "VLLM_MUSE_SPARK_SM120_L2_PREFETCH": lambda: bool(
         int(os.getenv("VLLM_MUSE_SPARK_SM120_L2_PREFETCH", "1"))
+    ),
+    # Muse Spark on SM120: in the decode CUDA graphs of up to 8 tokens, prefetch the head
+    # of the experts that the routing picked for this rank into L2 on the aux stream, behind
+    # the routing kernel and ahead of the muse decode kernel (a few microseconds before its
+    # first loads; the boundary kernel then also writes the FP32 router input, which moves
+    # the routing earlier). Decode TPOT -1.2% at batch 1 on 8 GPUs, bit-identical outputs.
+    # Needs the _muse_C extension and the muse decode engine; without them (or on another
+    # GPU) the flag does nothing. Read once, when the model is constructed.
+    "VLLM_MUSE_SPARK_SM120_EXPERT_PREFETCH": lambda: bool(
+        int(os.getenv("VLLM_MUSE_SPARK_SM120_EXPERT_PREFETCH", "1"))
     ),
     # use aiter linear op if aiter ops are enabled
     # The following list of related ops

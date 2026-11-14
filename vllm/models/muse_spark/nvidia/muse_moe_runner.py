@@ -1034,6 +1034,46 @@ class MuseMoERunner(MoERunner):
         self.routed_experts.quant_method.muse_after_gemm2_hook = hook
         return True
 
+    def _sm120_native_experts(self) -> MuseSparkSm120NvFp4Experts | None:
+        """The SM120 native NVFP4 experts of this layer, once they are built."""
+        quant_method = self.routed_experts.quant_method
+        if not (
+            isinstance(quant_method, MuseSparkModelOptNvFp4FusedMoE)
+            and quant_method.use_sm120_native
+            and quant_method.moe_kernel is not None
+        ):
+            return None
+        experts = quant_method.moe_kernel.fused_experts
+        return experts if isinstance(experts, MuseSparkSm120NvFp4Experts) else None
+
+    @property
+    def has_muse_decode_engine(self) -> bool:
+        """Whether the experts run the muse decode kernel in the decode graphs.
+
+        False until the first forward pass has prepared the engine, and for layers
+        on another expert path (the CUTLASS grouped GEMMs, b12x, BF16 Triton).
+        """
+        experts = self._sm120_native_experts()
+        return (
+            experts is not None and experts.use_muse_decode and experts.muse is not None
+        )
+
+    def prefetch_routed_experts(
+        self, topk_ids: torch.Tensor, budget_bytes: int
+    ) -> bool:
+        """Queue an L2 prefetch of the experts the decode kernel reads for ``topk_ids``.
+
+        Only the SM120 native NVFP4 experts with the muse decode engine have one; it
+        runs inside the capture of a decode graph, on the stream that is current.
+        Returns whether a prefetch was queued.
+        """
+        experts = self._sm120_native_experts()
+        if experts is None:
+            return False
+        return experts.prefetch_routed_experts(
+            topk_ids, self.routed_experts.expert_map, budget_bytes
+        )
+
     @property
     def _prepared_nvfp4_experts(self) -> MuseSparkTrtLlmNvFp4Experts | None:
         quant_method = self.routed_experts.quant_method

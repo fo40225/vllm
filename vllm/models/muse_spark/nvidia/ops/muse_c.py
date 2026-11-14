@@ -45,6 +45,7 @@ _SOURCES = (
     "muse_nvfp4_split_gemm1.cu",
     "muse_moe_route.cu",
     "muse_nvfp4_decode_moe.cu",
+    "muse_spark_expert_prefetch.cu",
     "muse_spark_l2_prefetch.cu",
     "muse_spark_mul_tanh_soft_cap.cu",
     "muse_spark_qknorm_rope_kv_insert.cu",
