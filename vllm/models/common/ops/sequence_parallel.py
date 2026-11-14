@@ -12,6 +12,9 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_reduce_scatter,
 )
+from vllm.distributed.device_communicators.all_reduce_utils import (
+    should_nccl_symm_mem_ag_rs,
+)
 
 
 def _custom_collective(name: str, x: torch.Tensor) -> torch.Tensor | None:
@@ -37,6 +40,30 @@ def sp_all_gather(x: torch.Tensor) -> torch.Tensor:
     if output is not None:
         return output
     return tensor_model_parallel_all_gather(x, 0)
+
+
+def sp_all_gather_columns(x: torch.Tensor) -> torch.Tensor:
+    """Concatenate the ranks' ``[T, w]`` column blocks into ``[T, tp * w]``.
+
+    The communicator is asked for the column layout (``dim=-1``), so one that can
+    write it directly skips the reorder copy. NCCL gathers rank-major and reorders
+    exactly as the model did before (a view for a single token), which keeps the
+    result bit-identical. The custom all-gather and NCCL symmetric memory only
+    gather along dim 0, so they keep the gather-then-reorder route.
+    """
+    assert x.ndim == 2
+    output = _custom_collective("custom_all_gather", x)
+    if output is None and not should_nccl_symm_mem_ag_rs():
+        return tensor_model_parallel_all_gather(x, -1)
+    if output is None:
+        output = tensor_model_parallel_all_gather(x, 0)
+    tp_size = get_tensor_model_parallel_world_size()
+    num_tokens, shard_size = x.shape
+    return (
+        output.view(tp_size, num_tokens, shard_size)
+        .transpose(0, 1)
+        .reshape(num_tokens, tp_size * shard_size)
+    )
 
 
 def sp_reduce_scatter(x: torch.Tensor) -> torch.Tensor:

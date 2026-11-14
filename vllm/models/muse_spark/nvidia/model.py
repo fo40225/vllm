@@ -82,6 +82,7 @@ from vllm.model_executor.models.utils import (
 from vllm.models.common.ops.sequence_parallel import (
     is_sequence_parallel_active,
     sp_all_gather,
+    sp_all_gather_columns,
     sp_reduce_scatter,
     sp_shard,
 )
@@ -157,14 +158,7 @@ _PREPARED_NVFP4_MAX_TOKENS = 256
 
 def gather_columns(shard: torch.Tensor) -> torch.Tensor:
     """Concatenate every TP rank's column block, in rank order."""
-    tp_size = get_tensor_model_parallel_world_size()
-    num_tokens, shard_size = shard.shape
-    return (
-        sp_all_gather(shard)
-        .view(tp_size, num_tokens, shard_size)
-        .transpose(0, 1)
-        .reshape(num_tokens, tp_size * shard_size)
-    )
+    return sp_all_gather_columns(shard)
 
 
 @dataclass(slots=True)
