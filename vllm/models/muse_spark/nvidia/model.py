@@ -380,15 +380,19 @@ def is_sequence_parallel_enabled(vllm_config: VllmConfig) -> bool:
     )
 
 
+def _on_sm120() -> bool:
+    return (
+        current_platform.is_cuda() and current_platform.is_device_capability_family(120)
+    )
+
+
 def _sm120_sequence_parallel_blocker(vllm_config: VllmConfig) -> str | None:
     """Why the sharded stream cannot run on this launch, None if it can."""
     pc = vllm_config.parallel_config
     mlp_layer_types = getattr(
         vllm_config.model_config.hf_text_config, "mlp_layer_types", None
     )
-    if not (
-        current_platform.is_cuda() and current_platform.is_device_capability_family(120)
-    ):
+    if not _on_sm120():
         return "the device is not SM120"
     if vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe":
         return "--moe-backend deep_gemm_mega_moe has its own sequence-parallel stream"
@@ -818,9 +822,14 @@ class MuseSpark1xMoE(nn.Module):
         ``ffn_in`` can produce the same tensor and save the cast kernel. That
         pays only where the cast is on the critical path: beside the pooler it
         hides, and the extra store would slow the boundary by about 0.5 us.
+
+        SM120 only: that is where the fused store was measured (and shown bitwise
+        equal). On the other GPUs the routers keep the cast of their own, even where
+        their last tier would accept the widened input (SM90).
         """
         if not (
-            not self.is_sequence_parallel
+            _on_sm120()
+            and not self.is_sequence_parallel
             and not self.wants_fp32_router_input(num_tokens)
             and not self.router_overlaps_pooler(num_tokens)
             and self.router.widens_bf16_input()
@@ -961,9 +970,13 @@ class MuseSpark1xMoE(nn.Module):
         pooler, its all-gather and the norm run on the main one, and the experts
         start with both ready (``_prepared_nvfp4_forward`` does the same for
         experts that take prepared inputs).
+
+        SM120 only: that is where the path was shown bitwise equal to the runner's
+        own routing; the other GPUs keep the routing inside the experts.
         """
         if not (
-            self.aux_stream_routing
+            _on_sm120()
+            and self.aux_stream_routing
             and not self.use_mega_moe
             and not self.use_sequence_parallel_moe
             and self.router_overlaps_pooler(num_tokens)

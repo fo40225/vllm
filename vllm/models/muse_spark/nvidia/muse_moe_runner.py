@@ -697,9 +697,15 @@ class MuseSparkModelOptNvFp4FusedMoE(ModelOptNvFp4FusedMoE):
         # weights; a layer that cannot load it demotes this for good.
         self.exact_gemm1 = envs.VLLM_MUSE_SPARK_SM120_EXACT_GEMM1
         if self.exact_gemm1 and (reason := muse_c.preflight()) is not None:
-            logger.info_once(
+            # A warning: the fold moves the outputs by about 3% rel L2 (at gate and
+            # up scales that differ), so hosts with and without the toolchain do
+            # not agree.
+            logger.warning_once(
                 "MuseSpark SM120 MoE: the CUTLASS grouped GEMMs fold the gate and up "
-                "global scales (the _muse_C extension is not available: %s).",
+                "global scales, which differs from a host with the _muse_C extension "
+                "by about 3%% rel L2 (the extension is not available: %s). Set "
+                "VLLM_MUSE_SPARK_SM120_EXACT_GEMM1=0 to get the folded result "
+                "everywhere.",
                 reason,
             )
             self.exact_gemm1 = False

@@ -251,9 +251,14 @@ def test_router_reads_the_fp32_copy_like_the_cast(dist_init, rows):
         assert torch.equal(router(out_fp32)[0], router(ffn_in)[0])
 
 
+class _RoutedRunner(model_ops.MuseMoERunner):
+    supports_routed_forward = True
+
+
 def make_moe_stub(monkeypatch, *, widens=True, aux_stream=True, fp32_feature=False):
     """A MuseSpark1xMoE with just the state the router-input predicates read."""
     moe = object.__new__(model_ops.MuseSpark1xMoE)
+    torch.nn.Module.__init__(moe)
     moe.pooler = object()
     moe._router_aux_stream = object() if aux_stream else None
     moe.is_sequence_parallel = False
@@ -262,6 +267,11 @@ def make_moe_stub(monkeypatch, *, widens=True, aux_stream=True, fp32_feature=Fal
     moe.fp32_router_input = fp32_feature
     moe.tp_size = 8
     moe.router = SimpleNamespace(widens_bf16_input=lambda: widens)
+    moe.aux_stream_routing = True
+    # An experts runner that supports routing done by the caller.
+    moe.experts = object.__new__(_RoutedRunner)
+    torch.nn.Module.__init__(moe.experts)
+    monkeypatch.setattr(model_ops, "_on_sm120", lambda: True)
     monkeypatch.setattr(
         model_ops.BreakableCUDAGraphCapture, "is_active", staticmethod(lambda: False)
     )
@@ -297,6 +307,23 @@ def test_cast_router_input_needs_a_router_that_casts(monkeypatch):
     assert make_moe_stub(monkeypatch, aux_stream=False).wants_cast_router_input(1)
     moe = make_moe_stub(monkeypatch)
     moe.is_sequence_parallel = True
+    assert not moe.wants_cast_router_input(8192)
+
+
+@pytest.mark.parametrize("rows", [1, 8192])
+def test_router_paths_of_b3a_are_sm120_only(monkeypatch, rows):
+    """Both the fused FP32 router copy and the routing on the aux stream stay off on
+    other GPUs: they were only shown bitwise equal on SM120, and e.g. the SM90 router
+    would otherwise take the widened input too."""
+    moe = make_moe_stub(monkeypatch)
+    if rows == 1:
+        assert moe._routes_on_aux_stream(rows)
+        assert not moe.wants_cast_router_input(rows)
+    else:
+        assert moe.wants_cast_router_input(rows)
+        assert not moe._routes_on_aux_stream(rows)
+    monkeypatch.setattr(model_ops, "_on_sm120", lambda: False)
+    assert not moe._routes_on_aux_stream(1)
     assert not moe.wants_cast_router_input(8192)
 
 
