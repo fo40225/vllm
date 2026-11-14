@@ -1620,9 +1620,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # modalities capped at zero by --limit-mm-per-prompt), PIECEWISE CUDA graphs,
     # context parallelism or VLLM_BATCH_INVARIANT: on such a launch the flag has no
     # effect (a warning if it was set explicitly), it never changes the model runner
-    # the launch gets. 0 turns it off. Two microbatches in flight hold about 0.6 GiB
-    # more per rank at 8192 tokens; the memory profile runs the split batch too, so
-    # the KV cache is sized for them (that much less KV cache).
+    # the launch gets. 0 turns it off. The microbatches share the kernel scratch of
+    # the experts; what stays is a second set of FlashInfer metadata builders (about
+    # 0.17 GiB per rank) and the activations of two halves in flight. The memory
+    # profile runs the split batch too, so a launch without --kv-cache-memory-bytes
+    # sizes its KV cache for them (RadixArk DFlash2 K=7: 4.6 % fewer tokens before the
+    # scratch is shared); with exact bytes the speculative profile needs 145 MiB less
+    # KV per rank (10,373,877,760 instead of 10,526,351,360 bytes) to keep the S1-7
+    # slack.
     "VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP": lambda: bool(
         int(os.getenv("VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP", "1"))
     ),
