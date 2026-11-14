@@ -147,7 +147,7 @@ if TYPE_CHECKING:
     VLLM_MUSE_SPARK_SM120_DECODE_MAX_TOKENS: int = 128
     VLLM_MUSE_SPARK_SM120_EXACT_GEMM1: bool = True
     VLLM_MUSE_SPARK_SM120_PREFILL_LOCAL_ROWS: bool = True
-    VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL: bool | None = None
+    VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL: bool | None = True
     VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL_MIN_TOKENS: int = 512
     VLLM_MUSE_SPARK_SM120_L2_PREFETCH: bool = True
     VLLM_MUSE_SPARK_SM120_L2_PREFETCH_AFTER_EXPERTS_CTAS: int = 4
@@ -1381,30 +1381,34 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # CUDA-graph and short prefill batches are unchanged. Needs SM120, expert
     # parallel, TP > 1, PP = DP = 1, and modular (not monolithic) experts; with
     # another layout an explicit 1 is ignored with a warning.
-    #   1: shard every batch of at least the _MIN_TOKENS flag's value. NCCL's
-    #      reduce-scatter + all-gather rounds the bf16 sums differently from its
-    #      all-reduce and cuBLAS runs the projections of ceil(T / 8) rows with
-    #      other kernels than those of T rows (split-K), so the outputs are not
-    #      bitwise equal to the replicated stream's; they are run-to-run
-    #      deterministic and identical on all ranks as long as the experts are
-    #      (the NVFP4 W4A4 and BF16 paths; the Marlin W4A16 experts are not
-    #      bitwise reproducible from run to run on their own, with or without
-    #      this flag).
+    #   1 (default): shard every batch of at least the _MIN_TOKENS flag's value.
+    #      Forced on by design (user decision 2026-10-24, "maximum throughput"):
+    #      rounding-level differences are accepted. NCCL's reduce-scatter +
+    #      all-gather rounds the bf16 sums differently from its all-reduce and
+    #      cuBLAS runs the projections of ceil(T / 8) rows with other kernels
+    #      than those of T rows (split-K), so the outputs are not bitwise equal
+    #      to the replicated stream's; they are run-to-run deterministic and
+    #      identical on all ranks as long as the experts are (the NVFP4 W4A4 and
+    #      BF16 paths; the Marlin W4A16 experts are not bitwise reproducible
+    #      from run to run on their own, with or without this flag). Prefill
+    #      +10 % .. +25 % with the host collectives (real weights, 8 GPUs).
     #   0: never.
-    #   auto (default, or unset): shard only where the outputs stay bit for bit
-    #      those of the replicated stream. That needs a TP communicator whose
+    #   auto: shard only where the outputs stay bit for bit those of the
+    #      replicated stream. That needs a TP communicator whose
     #      reduce-scatter + all-gather equals its all-reduce bitwise (the host
-    #      plugin's; NCCL's does not), and applies per batch size to the sizes at
-    #      which the sharded pooler, unpooler and router GEMMs reproduce the
-    #      replicated ones (a check on random data of the real shapes, once per
-    #      size; on 8 RTX PRO 6000 the full 8192-token prefill chunk, the chunks
-    #      that decode tokens fill up to 8192, and 4104-4224, 5312-5472 and
-    #      6920-7168 tokens; short prompts stay replicated).
+    #      plugin's with its fp32 exchange; NCCL's does not, and neither does
+    #      the plugin with the bf16 large exchange the host launch environment
+    #      now turns on, so under those defaults auto never engages), and
+    #      applies per batch size to the sizes at which the sharded pooler,
+    #      unpooler and router GEMMs reproduce the replicated ones (a check on
+    #      random data of the real shapes, once per size; on 8 RTX PRO 6000 the
+    #      full 8192-token prefill chunk, the chunks that decode tokens fill up
+    #      to 8192, and 4104-4224, 5312-5472 and 6920-7168 tokens; short prompts
+    #      stay replicated).
     "VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL": lambda: maybe_convert_bool(
         None
-        if os.getenv("VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL", "auto")
-        in ("", "auto")
-        else os.getenv("VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL")
+        if (os.getenv("VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL") or "1") == "auto"
+        else (os.getenv("VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL") or "1")
     ),
     # Muse Spark on SM120: smallest batch (in tokens) that takes the sharded
     # stream when VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL is on. Raised to one

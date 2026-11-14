@@ -4,6 +4,7 @@
 
 import inspect
 import math
+import os
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -585,31 +586,36 @@ def _sm120_sequence_parallel_blocker(vllm_config: VllmConfig) -> str | None:
 def is_sm120_sequence_parallel_enabled(vllm_config: VllmConfig) -> bool:
     """Whether large prefill batches may shard the stream along the sequence on SM120.
 
-    ``VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL=1`` shards every batch of at least
-    ``sm120_sequence_parallel_min_tokens`` and ``0`` never does. Unset (auto), the
-    stream is sharded only where that cannot change a bit: the TP communicator
-    must guarantee that reduce-scatter + all-gather equals its all-reduce, and
-    ``_SequenceParallelRowGate`` then admits the batch sizes whose row-sharded
-    projections equal the replicated ones. The experts still see every token,
-    through the same runner as the replicated stream.
+    ``VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL=1`` (the default) shards every batch
+    of at least ``sm120_sequence_parallel_min_tokens`` and ``0`` never does. With
+    ``auto`` the stream is sharded only where that cannot change a bit: the TP
+    communicator must guarantee that reduce-scatter + all-gather equals its
+    all-reduce, and ``_SequenceParallelRowGate`` then admits the batch sizes whose
+    row-sharded projections equal the replicated ones. The experts still see every
+    token, through the same runner as the replicated stream.
+
+    A launch that did not set the flag stays silent, and on the replicated stream,
+    where the sharded one cannot apply (another layout, or a backend that may hand
+    the routing to monolithic experts); one that set it to 1 is warned.
     """
     setting = envs.VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL
     if setting is False:
         return False
     blocker = _sm120_sequence_parallel_blocker(vllm_config)
-    if setting is None:
-        # Not a request: stay silent where it cannot apply. Another backend may
-        # hand the routing to monolithic experts, which the stream cannot feed.
-        return (
-            blocker is None
-            and vllm_config.kernel_config.moe_backend in _AUTO_SP_MOE_BACKENDS
-            and tp_reduce_scatter_matches_all_reduce()
-        )
+    if setting is True and os.environ.get("VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL"):
+        if blocker is not None:
+            logger.warning_once(
+                "VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL is set but ignored: %s.",
+                blocker,
+            )
+        return blocker is None
+    # Not a request: stay silent where it cannot apply. Another backend may hand
+    # the routing to monolithic experts, which the stream cannot feed.
     if blocker is not None:
-        logger.warning_once(
-            "VLLM_MUSE_SPARK_SM120_SEQUENCE_PARALLEL is set but ignored: %s.", blocker
-        )
-    return blocker is None
+        return False
+    if vllm_config.kernel_config.moe_backend not in _AUTO_SP_MOE_BACKENDS:
+        return False
+    return setting is True or tp_reduce_scatter_matches_all_reduce()
 
 
 def sm120_sequence_parallel_is_gated() -> bool:

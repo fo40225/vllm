@@ -70,10 +70,10 @@ def sm120_platform(monkeypatch):
 
 
 def test_sm120_sequence_parallel_flag_values(monkeypatch) -> None:
-    # Unset, "" and "auto" are the auto mode (None); 0 and 1 override it.
+    # Unset and "" are the default, forced on; "auto" is the auto mode (None).
     for value, expected in (
-        (None, None),
-        ("", None),
+        (None, True),
+        ("", True),
         ("auto", None),
         ("0", False),
         ("1", True),
@@ -100,7 +100,7 @@ def test_sm120_sequence_parallel_auto_follows_the_communicator(
     monkeypatch, sm120_platform
 ) -> None:
     config = _vllm_config()
-    monkeypatch.delenv(FLAG, raising=False)
+    monkeypatch.setenv(FLAG, "auto")
     _communicator_advertises(monkeypatch, True)
     assert muse_model.is_sm120_sequence_parallel_enabled(config)
     assert muse_model.sm120_sequence_parallel_is_gated()
@@ -123,7 +123,7 @@ def test_sm120_sequence_parallel_auto_is_silent_where_it_cannot_apply(
     monkeypatch.setattr(
         muse_model.logger, "warning_once", lambda *args: warnings.append(args)
     )
-    monkeypatch.delenv(FLAG, raising=False)
+    monkeypatch.setenv(FLAG, "auto")
     asked = _communicator_advertises(monkeypatch, True)
     for overrides in (
         dict(parallel=dict(enable_expert_parallel=False)),
@@ -148,6 +148,46 @@ def test_sm120_sequence_parallel_auto_is_silent_where_it_cannot_apply(
     assert muse_model.is_sm120_sequence_parallel_enabled(
         _vllm_config(moe_backend="flashinfer_b12x")
     )
+
+
+def test_sm120_sequence_parallel_default_is_forced_on(
+    monkeypatch, sm120_platform
+) -> None:
+    # The default (flag unset) shards the stream whatever the communicator says: the
+    # throughput decision of 2026-10-24. Only "auto" asks the communicator.
+    warnings: list[tuple] = []
+    monkeypatch.setattr(
+        muse_model.logger, "warning_once", lambda *args: warnings.append(args)
+    )
+    monkeypatch.delenv(FLAG, raising=False)
+    asked = _communicator_advertises(monkeypatch, False)
+    assert muse_model.is_sm120_sequence_parallel_enabled(_vllm_config())
+    assert muse_model.is_sm120_sequence_parallel_enabled(
+        _vllm_config(moe_backend="cutlass")
+    )
+    assert not muse_model.sm120_sequence_parallel_is_gated()
+    assert not asked
+    # Where the stream cannot apply, or the backend may hand the routing to
+    # monolithic experts, a launch that did not ask for it stays replicated, silently.
+    for overrides in (
+        dict(parallel=dict(enable_expert_parallel=False)),
+        dict(parallel=dict(tensor_parallel_size=1)),
+        dict(mlp_layer_types=["sparse", "dense"]),
+        dict(moe_backend="flashinfer_b12x"),
+        dict(moe_backend="marlin"),
+    ):
+        assert not muse_model.is_sm120_sequence_parallel_enabled(
+            _vllm_config(**overrides)
+        )
+    assert not warnings
+    # 0 turns it off, and an explicit 1 that cannot apply is warned about.
+    monkeypatch.setenv(FLAG, "0")
+    assert not muse_model.is_sm120_sequence_parallel_enabled(_vllm_config())
+    monkeypatch.setenv(FLAG, "1")
+    assert not muse_model.is_sm120_sequence_parallel_enabled(
+        _vllm_config(parallel=dict(tensor_parallel_size=1))
+    )
+    assert len(warnings) == 1 and FLAG in warnings[0][0], warnings
 
 
 def test_tp_reduce_scatter_capability(monkeypatch) -> None:
