@@ -1476,21 +1476,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # run-to-run deterministic and identical on all ranks, but not bitwise equal to
     # the unsplit batch (rounding-level differences, as with the sequence-parallel
     # stream). Needs the V2 model runner, SM120, expert parallel, TP > 1, PP = DP = 1
-    # and no speculative decoding, LoRA or multimodal inputs; on another layout the
-    # flag has no effect (a warning if it was set explicitly). 0 turns it off. Two
-    # microbatches in flight hold about 1.4 GiB more per rank at 8192 tokens, and the
-    # memory profile runs the whole batch: a launch at the memory limit may need a
-    # --gpu-memory-utilization 0.01 lower.
+    # and no speculative decoding, LoRA, multimodal inputs (all modalities capped at
+    # zero by --limit-mm-per-prompt), PIECEWISE CUDA graphs, context parallelism or
+    # VLLM_BATCH_INVARIANT: on such a launch the flag has no effect (a warning if it
+    # was set explicitly), it never changes the model runner the launch gets. 0
+    # turns it off. Two microbatches in flight hold about 0.6 GiB more per rank at
+    # 8192 tokens; the memory profile runs the split batch too, so the KV cache is
+    # sized for them (that much less KV cache).
     "VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP": lambda: bool(
         int(os.getenv("VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP", "1"))
     ),
     # Muse Spark on SM120: smallest eager batch (in tokens) that is split when
-    # VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP is on. Raised to the number of
-    # microbatches times (the sequence-parallel minimum, at least 1024, plus 1), 2050
-    # for two: both halves must take the same model path (the microbatches hand off
-    # at every collective and must issue the same number of them). A batch of 2100
-    # tokens prefills 25 % (replicated stream) / 9 % (sequence-parallel stream)
-    # faster split than whole.
+    # VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP is on. Raised to at least the number of
+    # microbatches times (the sequence-parallel minimum, at least 1024, plus 1):
+    # 2050 for two (the default of 2048 is below that floor), and, once the CUDA
+    # graph sizes are known, to the number of microbatches times the sequence-
+    # parallel minimum of the model, so that every microbatch takes the model path
+    # of the whole batch (the microbatches also run, with less overlap, if they do
+    # not). A batch of 2100 tokens prefills 25 % (replicated stream) / 9 %
+    # (sequence-parallel stream) faster split than whole.
     "VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_MIN_TOKENS": lambda: int(
         os.getenv("VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_MIN_TOKENS", "2048")
     ),

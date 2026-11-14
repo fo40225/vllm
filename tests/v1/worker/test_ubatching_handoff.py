@@ -65,7 +65,12 @@ def _run_step(
     compute, comm = _FakeStream(), _FakeStream()
     barrier = threading.Barrier(n + 1)
     contexts = ub.make_ubatch_contexts(
-        n, compute, comm, [object() for _ in range(n)], barrier, overlap_collectives=True
+        n,
+        compute,
+        comm,
+        [object() for _ in range(n)],
+        barrier,
+        overlap_collectives=True,
     )
     finished: list[int] = []
     errors: dict[int, BaseException] = {}

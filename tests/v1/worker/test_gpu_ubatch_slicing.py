@@ -62,6 +62,7 @@ from vllm.v1.worker.ubatch_utils import (
 from vllm.v1.worker.ubatching import (
     dbo_collective_output_stream,
     dbo_current_ubatch_id,
+    dbo_enabled,
     dbo_overlapping_context,
     dbo_register_recv_hook,
     dbo_yield,
@@ -1285,6 +1286,90 @@ def test_failing_microbatch_unwinds_its_parked_sibling():
     assert isinstance(result["error"], RuntimeError)
     assert "Microbatch 0" in str(result["error"])
     assert isinstance(result["error"].__cause__, ValueError)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="DBO needs a GPU")
+@pytest.mark.parametrize("counts", [(2, 3), (3, 2), (1, 4), (0, 2), (2, 0), (0, 0)])
+def test_microbatches_may_issue_different_numbers_of_collectives(counts):
+    """A model that takes a different path per microbatch (sequence-parallel above a
+    token minimum, replicated below it) issues different numbers of collectives;
+    the thread left alone runs on instead of parking for a handoff."""
+    vllm_config = VllmConfig(parallel_config=_tp_only_parallel_config())
+    device = torch.device("cuda:0")
+    runner = _make_execution_runner(vllm_config)
+
+    class _UnevenModel(torch.nn.Module):
+        def forward(self, input_ids, positions, intermediate_tensors=None, **kwargs):
+            ctx = dbo_overlapping_context()
+            assert ctx is not None
+            x = input_ids.float().unsqueeze(-1)
+            for _ in range(counts[dbo_current_ubatch_id()]):
+                x = ctx.run_collective(lambda t: t + 1, x)
+            return x
+
+    model_inputs = _make_model_inputs(16, device)
+    ubatch_state = _make_ubatch_state(
+        vllm_config,
+        [
+            UBatchSlice(slice(0, 4), slice(0, 8)),
+            UBatchSlice(slice(4, 8), slice(8, 16)),
+        ],
+    )
+    result: dict[str, Any] = {}
+
+    def _call():
+        try:
+            result["output"] = runner.run(_UnevenModel(), model_inputs, ubatch_state)
+        except BaseException as e:  # noqa: BLE001
+            result["error"] = e
+
+    caller = threading.Thread(target=_call, daemon=True)
+    caller.start()
+    caller.join(timeout=60.0)
+    assert not caller.is_alive(), "a microbatch was left waiting for a handoff"
+    assert "error" not in result, result.get("error")
+    ids = model_inputs["input_ids"].float().unsqueeze(-1)
+    expected = ids.clone()
+    expected[:8] += counts[0]
+    expected[8:] += counts[1]
+    torch.testing.assert_close(result["output"], expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="DBO needs a GPU")
+def test_a_failed_step_leaves_the_runner_usable_for_the_next_one():
+    """A microbatch that fails before its first handoff (the sibling is still
+    starting) leaves no registration behind: the next step runs and the main
+    thread can ask for its microbatch id (it is 0 outside the threads)."""
+    vllm_config = VllmConfig(parallel_config=_tp_only_parallel_config())
+    device = torch.device("cuda:0")
+    runner = _make_execution_runner(vllm_config)
+
+    class _FailsFirst(torch.nn.Module):
+        def forward(self, input_ids, positions, intermediate_tensors=None, **kwargs):
+            if dbo_current_ubatch_id() == 0:
+                raise ValueError("boom")
+            ctx = dbo_overlapping_context()
+            assert ctx is not None
+            return ctx.run_collective(lambda t: t * 2, input_ids.float().unsqueeze(-1))
+
+    model_inputs = _make_model_inputs(16, device)
+    ubatch_state = _make_ubatch_state(
+        vllm_config,
+        [
+            UBatchSlice(slice(0, 4), slice(0, 8)),
+            UBatchSlice(slice(4, 8), slice(8, 16)),
+        ],
+    )
+    with pytest.raises(RuntimeError, match="Microbatch 0"):
+        runner.run(_FailsFirst(), model_inputs, ubatch_state)
+    assert not dbo_enabled()
+    assert dbo_current_ubatch_id() == 0
+
+    output = runner.run(_CollectiveModel([]), model_inputs, ubatch_state)
+    x = model_inputs["input_ids"].float().unsqueeze(-1) + model_inputs[
+        "positions"
+    ].float().unsqueeze(-1)
+    torch.testing.assert_close(output, x * 2 + 1)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="DBO needs a GPU")

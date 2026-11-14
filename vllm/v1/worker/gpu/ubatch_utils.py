@@ -343,6 +343,7 @@ class UBatchRunner:
         # The microbatch threads plus the thread that starts them.
         self.ready_barrier = threading.Barrier(self.num_ubatches + 1)
         self._pending_finish: Callable[[], Any] | None = None
+        self._logged_first_step = False
         self.sm_control = create_sm_control_context(self.parallel_config)
 
     def prepare(
@@ -487,14 +488,16 @@ class UBatchRunner:
         ubatch_slices = ubatch_state.slices
         assert len(ubatch_slices) == len(ubatch_state.forward_contexts)
         assert len(ubatch_slices) == self.num_ubatches
-        logger.info_once(
-            "First microbatched step: %s tokens in %d microbatches, %s.",
-            tuple(s.num_tokens for s in ubatch_slices),
-            self.num_ubatches,
-            "tensor-parallel collectives overlap on a side stream"
-            if self.overlap_collectives
-            else "handing off at the expert all-to-all",
-        )
+        if not self._logged_first_step:
+            self._logged_first_step = True
+            logger.info(
+                "First microbatched step: %s tokens in %d microbatches, %s.",
+                tuple(s.num_tokens for s in ubatch_slices),
+                self.num_ubatches,
+                "tensor-parallel collectives overlap on a side stream"
+                if self.overlap_collectives
+                else "handing off at the expert all-to-all",
+            )
 
         compute_stream = self.capture_stream if for_capture else current_stream()
         ubatch_contexts = make_ubatch_contexts(
