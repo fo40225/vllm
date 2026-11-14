@@ -55,6 +55,9 @@ def _runner(rejection_sampler, *, max_num_reqs=4, query_len=4, max_tokens=64):
         rejection_sampler=rejection_sampler,
         speculator=SimpleNamespace(draft_logits=draft_logits),
         model=model,
+        topk_verify_level=0,
+        topk_verify_sampled=False,
+        topk_logits_k=64,
     )
 
 
@@ -109,6 +112,42 @@ def test_adaptive_verification_is_restored_when_the_call_fails():
         GPUModelRunner._dummy_rejection_sampler_run(runner, torch.zeros(64, 5))
 
     assert sampler.enable_adaptive_verification is True
+
+
+@pytest.mark.parametrize(
+    ("sampled", "shapes"),
+    [(False, [(1, False)]), (True, [(1, False), (64, True)])],
+    ids=["greedy-steps-only", "with-sampled-rows"],
+)
+def test_the_dummy_verify_step_compiles_the_candidate_path_after_the_full_one(
+    sampled, shapes
+):
+    """The full path runs first (fallback steps need its memory, so the memory profile
+    must cover it), then the verification from the top-k logits once per shape."""
+    events: list = []
+    sampler = _RecordingRejectionSampler()
+    sampler.verify_topk = lambda topk, batch, draft_logits, has_sampled: events.append(
+        ("verify_topk", topk, has_sampled)
+    )
+    runner = _runner(sampler)
+    runner.topk_verify_level = 2 if sampled else 1
+    runner.topk_verify_sampled = sampled
+    runner.model.compute_topk_logits = lambda hidden, k=None: ("topk", k)
+
+    GPUModelRunner._dummy_rejection_sampler_run(runner, torch.zeros(64, 5))
+
+    assert len(sampler.calls) == 1  # the full path, once
+    assert events == [("verify_topk", ("topk", k), has) for k, has in shapes]
+
+
+def test_a_launch_without_the_verify_path_compiles_nothing_extra():
+    sampler = _RecordingRejectionSampler()
+    sampler.verify_topk = lambda *args: pytest.fail("the candidate path ran")
+    runner = _runner(sampler)
+
+    GPUModelRunner._dummy_rejection_sampler_run(runner, torch.zeros(64, 5))
+
+    assert len(sampler.calls) == 1
 
 
 def test_a_watermarked_run_is_skipped():

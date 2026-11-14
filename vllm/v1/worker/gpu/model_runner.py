@@ -354,6 +354,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.topk_logits_min_tokens = 1
         self.topk_logits_stats: RouteStats | None = None
         self._topk_logits_logged = False
+        # Verification of the draft tokens from those candidates (0 off, 1 greedy steps,
+        # 2 also sampled rows), see VLLM_MUSE_SPARK_SM120_VERIFY_TOPK_LOGITS.
+        self.topk_verify_level = 0
+        self.topk_verify_sampled = False
+        self.topk_verify_stats: RouteStats | None = None
+        self._topk_verify_logged = False
         self.prompt_logprobs_worker: PromptLogprobsWorker | None = None
         self.structured_outputs_worker: StructuredOutputsWorker | None = None
         self.cudagraph_manager: ModelCudaGraphManager | None = None
@@ -533,6 +539,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     ),
                 )
             self.topk_logits_k = self._resolve_topk_logits_k()
+            self.topk_verify_level = self._resolve_topk_verify_level()
             self.prompt_logprobs_worker = PromptLogprobsWorker(
                 self.max_num_reqs,
                 self.device,
@@ -1132,6 +1139,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             rejection_sampler(logits, batch, self.speculator.draft_logits, None)
         finally:
             rejection_sampler.enable_adaptive_verification = adaptive
+        if self.topk_verify_level:
+            # Compile the kernels of the verification from the top-k logits before the
+            # first request: a greedy step (one candidate per rank) and, where sampled
+            # requests are verified from the candidates, a step with sampled rows. The
+            # fallback steps keep the full path, so the profile above still covers it.
+            del logits
+            shapes = [(1, False)]
+            if self.topk_verify_sampled:
+                shapes.append((self.topk_logits_k, True))
+            for k, has_sampled in shapes:
+                topk = self.model.compute_topk_logits(hidden_states[:num_logits], k=k)
+                rejection_sampler.verify_topk(
+                    topk, batch, self.speculator.draft_logits, has_sampled
+                )
 
     def _resolve_topk_logits_k(self) -> int:
         """Candidates per TP rank of the top-k logits sampling, 0 when it is off.
@@ -1167,6 +1188,119 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         self.topk_logits_stats = RouteStats(k)
         return k
+
+    def _resolve_topk_verify_level(self) -> int:
+        """Verification of draft tokens from the top-k logits: 0 off, 1 steps of greedy
+        requests, 2 also sampled rows (VLLM_MUSE_SPARK_SM120_VERIFY_TOPK_LOGITS).
+
+        It builds on the top-k logits path (candidates per rank) and the plain
+        rejection sampler of a speculative launch that verifies with fixed step
+        boundaries. Sampled rows need the block method and a draft distribution exactly
+        as wide as the target vocabulary (the full path restricts every sum to the
+        narrower of the two, which the candidates cannot do for a wider draft);
+        otherwise only the greedy steps are verified from the candidates.
+        """
+        level = envs.VLLM_MUSE_SPARK_SM120_VERIFY_TOPK_LOGITS
+        if level <= 0:
+            return 0
+        if level not in (1, 2):
+            logger.warning(
+                "VLLM_MUSE_SPARK_SM120_VERIFY_TOPK_LOGITS=%d is not 0, 1 or 2: "
+                "verifying from the full logits.",
+                level,
+            )
+            return 0
+        rejection_sampler = self.rejection_sampler
+        if self.topk_logits_k == 0 or rejection_sampler is None:
+            return 0
+        reason = rejection_sampler.topk_verify_launch_reason
+        if reason is not None:
+            logger.warning(
+                "Verifying drafts from the top-%d logits of every TP rank is off: %s.",
+                self.topk_logits_k,
+                reason,
+            )
+            return 0
+        speculator = self.speculator
+        draft_logits = None if speculator is None else speculator.draft_logits
+        self.topk_verify_sampled = (
+            level >= 2
+            and rejection_sampler.use_block_verification
+            and draft_logits is not None
+            and draft_logits.shape[-1] == self.vocab_size
+        )
+        if level >= 2 and not self.topk_verify_sampled:
+            logger.warning(
+                "Verifying drafts from the top-%d logits: sampled requests keep the "
+                "full path (it needs the block method and a draft distribution of "
+                "exactly the vocabulary's width).",
+                self.topk_logits_k,
+            )
+        self.topk_verify_stats = RouteStats(
+            self.topk_logits_k, label="verified steps", threshold_note=False
+        )
+        return level
+
+    def _topk_verify_plan(
+        self, input_batch: InputBatch, grammar_output: GrammarOutput | None
+    ) -> tuple[str | None, int]:
+        """Why this speculative step verifies from the full logits (None: from the
+        top-k logits), and the candidates per rank it needs.
+
+        Decided like `_topk_logits_fallback_reason`: from the batch shape and the host
+        copy of the request state, which every TP rank holds alike.
+        """
+        if grammar_output is not None:
+            return "grammar", 0
+        if self.pcp_manager is not None:
+            return "context-parallel", 0
+        if self.adaptive_verification is not None:
+            return "adaptive-verification", 0
+        assert self.sampler is not None
+        return self.sampler.topk_verify_plan(
+            input_batch.idx_mapping_np,
+            self.topk_logits_k,
+            sampled=self.topk_verify_sampled,
+        )
+
+    def _verify_from_topk_logits(
+        self,
+        sample_hidden_states: torch.Tensor,
+        input_batch: InputBatch,
+        grammar_output: GrammarOutput | None,
+    ) -> SamplerOutput | None:
+        """Verify the draft tokens of this step from the top-k logits of each TP rank.
+
+        Returns the sampler output, or None when the step takes the full path. Counts
+        the step and logs the counts now and then (``RouteStats``): one single request
+        of a batch that needs the logits sends all its rows down the full path.
+        """
+        reason, k = self._topk_verify_plan(input_batch, grammar_output)
+        assert self.topk_verify_stats is not None
+        line = self.topk_verify_stats.record(reason)
+        if line is not None:
+            logger.info("Verifying drafts from the top-k logits: %s.", line)
+        if reason is not None:
+            return None
+        if not self._topk_verify_logged:
+            self._topk_verify_logged = True
+            logger.info(
+                "The first verify step took %d candidates per TP rank (%d rows).",
+                k,
+                input_batch.logits_indices.shape[0],
+            )
+        assert self.sampler is not None and self.rejection_sampler is not None
+        assert self.speculator is not None
+        topk = self.model.compute_topk_logits(sample_hidden_states, k=k)
+        has_sampled = bool(
+            np.any(
+                self.sampler.sampling_states.temperature.np[input_batch.idx_mapping_np]
+                != 0.0
+            )
+        )
+        return self.rejection_sampler.verify_topk(
+            topk, input_batch, self.speculator.draft_logits, has_sampled
+        )
 
     def _topk_logits_fallback_reason(
         self, input_batch: InputBatch, grammar_output: GrammarOutput | None
@@ -1904,7 +2038,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             logits = logits[:, : self.vocab_size]
         else:
             sample_hidden_states = hidden_states[input_batch.logits_indices]
-            if self._sample_from_topk_logits(input_batch, grammar_output):
+            if self.topk_verify_level and input_batch.num_draft_tokens != 0:
+                # A step with draft tokens: verified from the candidates, or from the
+                # full logits below.
+                verified = self._verify_from_topk_logits(
+                    sample_hidden_states, input_batch, grammar_output
+                )
+                if verified is not None:
+                    return verified, verified.num_sampled, verified.num_rejected
+            elif self._sample_from_topk_logits(input_batch, grammar_output):
                 # Gather the top-k logits of every rank, not the logits.
                 if not self._topk_logits_logged:
                     self._topk_logits_logged = True

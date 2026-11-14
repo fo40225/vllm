@@ -21,9 +21,11 @@ from vllm.v1.worker.gpu.sample.logprob import compute_topk_scores
 from vllm.v1.worker.gpu.sample.output import SamplerOutput, SamplingMaskTensors
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
+from vllm.v1.worker.gpu.sample.topk_logits import TopKLogits
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
     rejection_sample,
 )
+from vllm.v1.worker.gpu.spec_decode.topk_rejection import topk_verify
 
 # Cap on the FP32 target-logits buffer materialized by apply_sampling_params.
 # TODO(mgoin): Chunking is a workaround. The rejection kernels already upcast
@@ -179,6 +181,82 @@ class RejectionSampler:
         elif rejection_sample_method == "fly":
             assert spec_config.fly_window_size is not None
             self.fly_window_size = spec_config.fly_window_size
+
+    @property
+    def topk_verify_launch_reason(self) -> str | None:
+        """Why this launch cannot verify any draft from the top-k logits (None: it can).
+
+        The path reproduces the verification of an unwatermarked sampler with fixed
+        step boundaries: a watermark keys the draws of the resampling, synthetic
+        acceptance rates replace the acceptance test, adaptive verification compacts
+        the rows on the device, and FLY verification (window of deferred rejections)
+        changes the accepted length of greedy rows too.
+        """
+        if self.watermark_key is not None:
+            return "a watermark is on"
+        if self.synthetic_conditional_rates is not None:
+            return "synthetic acceptance rates are on"
+        if self.enable_adaptive_verification:
+            return "adaptive verification is on"
+        if self.fly_window_size > 0:
+            return "FLY verification is on"
+        return None
+
+    def verify_topk(
+        self,
+        topk: TopKLogits,
+        input_batch: InputBatch,
+        draft_logits: torch.Tensor | None,
+        has_sampled: bool,
+    ) -> SamplerOutput:
+        """`__call__` on the candidates of `topk` instead of the full logits.
+
+        The caller has checked `Sampler.topk_verify_plan` (and, for ``has_sampled``,
+        that the block method and a draft distribution are there). The accepted tokens
+        and the resampled token of every request are those of `__call__` for the same
+        logits: bit for bit for a greedy request, with the same draws (the uniforms and
+        Gumbel noise are keyed by seed, position and token id) for the others.
+        """
+        draft_sampled, pos = gather_draft_sampled(
+            input_batch.input_ids,
+            input_batch.positions,
+            input_batch.logits_indices,
+            input_batch.expanded_idx_mapping,
+            input_batch.expanded_local_pos,
+            self.sampler.req_states.prefill_len.gpu,
+        )
+        states = self.sampler.sampling_states
+        sampled, num_sampled = topk_verify(
+            topk,
+            draft_sampled,
+            pos,
+            input_batch.cu_num_logits,
+            input_batch.idx_mapping,
+            input_batch.expanded_idx_mapping,
+            input_batch.expanded_local_pos,
+            states.temperature.gpu,
+            states.top_k.gpu,
+            states.seeds.gpu,
+            self.num_speculative_steps,
+            draft_logits=draft_logits,
+            has_sampled=has_sampled,
+            use_fp64=self.sampler.use_fp64_gumbel,
+        )
+        num_sampled, num_rejected = get_num_sampled_and_rejected(
+            num_sampled,
+            input_batch.seq_lens,
+            input_batch.cu_num_logits,
+            input_batch.idx_mapping,
+            self.sampler.req_states.prefill_len.gpu,
+        )
+        return SamplerOutput(
+            sampled_token_ids=sampled,
+            logprobs_tensors=None,
+            num_nans=None,
+            num_sampled=num_sampled,
+            num_rejected=num_rejected,
+            sampling_mask_tensors=None,
+        )
 
     def _get_logprobs_tensors(
         self,

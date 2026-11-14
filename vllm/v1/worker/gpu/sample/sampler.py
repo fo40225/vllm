@@ -211,6 +211,27 @@ class Sampler:
         """Whether `sample_topk_logits` can sample these requests."""
         return self.topk_logits_fallback_reason(idx_mapping_np, k) is None
 
+    def topk_verify_plan(
+        self, idx_mapping_np: np.ndarray, k: int, sampled: bool
+    ) -> tuple[str | None, int]:
+        """Why a speculative step cannot verify its drafts from the top-k logits (None:
+        it can) and the candidates per TP rank it needs.
+
+        The step needs what `sample_topk_logits` needs (`topk_logits_fallback_reason`,
+        which also covers a step of greedy requests only: the argmax of each row, one
+        candidate per rank). A request with temperature > 0 is verified from the ``k``
+        candidates only when ``sampled`` says the launch can (block method with a draft
+        distribution). Host state only: every TP rank decides alike.
+        """
+        reason = self.topk_logits_fallback_reason(idx_mapping_np, k)
+        if reason is not None:
+            return reason, 0
+        if not np.any(self.sampling_states.temperature.np[idx_mapping_np] != 0.0):
+            return None, 1
+        if not sampled:
+            return "sampled-rows", 0
+        return None, k
+
     def sample_topk_logits(
         self, topk: TopKLogits, input_batch: InputBatch
     ) -> SamplerOutput:

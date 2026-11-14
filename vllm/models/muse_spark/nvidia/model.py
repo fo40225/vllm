@@ -3679,7 +3679,10 @@ class MuseSpark1xForCausalLM(LlamaForCausalLM, SupportsLoRA, MixtureOfExperts):
         return k
 
     def compute_topk_logits(
-        self, hidden_states: torch.Tensor, ties: TieDraw | None = None
+        self,
+        hidden_states: torch.Tensor,
+        ties: TieDraw | None = None,
+        k: int | None = None,
     ) -> TopKLogits:
         """The top-``topk_logits_k`` logits of every TP rank, gathered, for sampling.
 
@@ -3693,9 +3696,14 @@ class MuseSpark1xForCausalLM(LlamaForCausalLM, SupportsLoRA, MixtureOfExperts):
         ``ties`` (``Sampler.topk_logits_tie_draw``) asks for a step that keeps every
         token tied with the top_k-th logit: each rank then adds the words that close the
         ties it could not list (``fill_tie_closure``) to the same gather.
+
+        ``k`` (at most ``topk_logits_k``) asks for fewer candidates per rank: the
+        verification of an all-greedy speculative step needs the argmax of each row
+        only (``k = 1``, 4 bytes per row and rank).
         """
-        k = self.topk_logits_k
-        assert k > 0
+        if k is None:
+            k = self.topk_logits_k
+        assert 0 < k <= self.topk_logits_k
         head = self.lm_head
         hidden_states = hidden_states.to(head.weight.dtype)
         # Plain shard logits: the head takes no scale or soft cap of its own here.

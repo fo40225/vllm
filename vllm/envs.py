@@ -170,6 +170,7 @@ if TYPE_CHECKING:
     VLLM_MUSE_SPARK_SM120_TOPK_LOGITS: bool = True
     VLLM_MUSE_SPARK_SM120_TOPK_LOGITS_K: int = 64
     VLLM_MUSE_SPARK_SM120_TOPK_LOGITS_MIN_TOKENS: int = 2
+    VLLM_MUSE_SPARK_SM120_VERIFY_TOPK_LOGITS: int = 0
     VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT: bool = True
     VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT_TABLE: str | None = None
     VLLM_MUSE_SPARK_SM120_DENSE_Q: bool = True
@@ -1751,6 +1752,28 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # two rows, so the default keeps batch 1 on the full path.
     "VLLM_MUSE_SPARK_SM120_TOPK_LOGITS_MIN_TOKENS": lambda: int(
         os.getenv("VLLM_MUSE_SPARK_SM120_TOPK_LOGITS_MIN_TOKENS", "2")
+    ),
+    # Muse Spark on SM120: verify the draft tokens of a speculative step from the top-K
+    # logits of every tensor-parallel rank (VLLM_MUSE_SPARK_SM120_TOPK_LOGITS_K
+    # candidates each, 1 for a step of greedy requests only) instead of the gathered
+    # [rows, vocab] logits, their fp32 copy and the full-vocabulary passes of the
+    # rejection sampler. 0: the full verification; 1: steps in which every request is
+    # greedy (the argmax of each row: the tokens of the full path, bit for bit); 2: also
+    # steps with requests of temperature > 0 and top_k <= K (the default top_k of the
+    # Muse Spark checkpoint is 64), with the block method and a draft distribution (the
+    # production drafter): the accepted length and the resampled token are drawn with
+    # the uniforms and Gumbel noise of the full path from the candidates, which carry
+    # all the target probability under the top-k mask, so the tokens are those of the
+    # full path up to fp32 rounding of the sums. A step takes the full path (all ranks
+    # decide alike, from the request state) when any request asks for logprobs,
+    # penalties, logit bias / allowed token ids / bad words, a thinking budget, a
+    # grammar bitmask, or, at temperature > 0, min_p, top_p, or a top_k above K, and
+    # for adaptive verification, a watermark or synthetic acceptance rates (launch).
+    # Needs VLLM_MUSE_SPARK_SM120_TOPK_LOGITS=1. The share of verified steps on the path
+    # and the reasons of the others are logged every 30 s. Read once, when the model
+    # runner is constructed.
+    "VLLM_MUSE_SPARK_SM120_VERIFY_TOPK_LOGITS": lambda: int(
+        os.getenv("VLLM_MUSE_SPARK_SM120_VERIFY_TOPK_LOGITS", "0")
     ),
     # Muse Spark on SM120: place the experts of every MoE layer on the EP ranks by the
     # table of the model snapshot (vllm/models/muse_spark/nvidia/data/

@@ -655,8 +655,12 @@ class RouteStats:
         k: int,
         interval_s: float = 30.0,
         clock: Callable[[], float] = time.monotonic,
+        label: str = "sampled steps",
+        threshold_note: bool = True,
     ) -> None:
         self.k = k
+        self.label = label
+        self.threshold_note = threshold_note
         self.taken = 0
         self.taken_threshold = 0  # of the taken steps, those that keep every tie
         self.fallbacks: dict[str, int] = {}
@@ -672,11 +676,14 @@ class RouteStats:
         steps = self.steps
         share = 100.0 * self.taken / steps
         line = (
-            f"{self.taken} of {steps} sampled steps ({share:.1f}%) drew from the "
-            f"top-{self.k} logits of every TP rank ({self.taken_threshold} of them on "
-            "FlashInfer's rule at the top_k boundary, the others on exactly top_k "
-            "tokens)"
+            f"{self.taken} of {steps} {self.label} ({share:.1f}%) drew from the "
+            f"top-{self.k} logits of every TP rank"
         )
+        if self.threshold_note:
+            line += (
+                f" ({self.taken_threshold} of them on FlashInfer's rule at the top_k "
+                "boundary, the others on exactly top_k tokens)"
+            )
         if self.fallbacks:
             reasons = ", ".join(f"{r}: {n}" for r, n in sorted(self.fallbacks.items()))
             line += f"; the others gathered the logits ({reasons})"

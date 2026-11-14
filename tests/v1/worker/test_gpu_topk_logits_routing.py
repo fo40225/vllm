@@ -663,6 +663,7 @@ def sample_runner(events: list, speculative: bool, refuse: str | None = None):
         topk_logits_k=K,
         topk_logits_min_tokens=1,
         topk_logits_stats=RouteStats(K),
+        topk_verify_level=0,
         pcp_manager=None,
         _topk_logits_logged=True,
     )
