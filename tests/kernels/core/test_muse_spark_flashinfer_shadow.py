@@ -101,6 +101,24 @@ def test_changed_missing_or_other_version_is_detected(monkeypatch, tmp_path):
     assert reason is not None and "0.0.1" in reason
 
 
+def test_shipped_manifest_matches_the_installed_flashinfer():
+    """A stale manifest silently turns the shadow off, so it has to fail here."""
+    manifest = Path(shadow.__file__).parent / "xqa" / "stock.md5"
+    assert shadow.stock_mismatch(manifest) is None
+
+
+def test_stock_version_is_the_pinned_flashinfer():
+    requirements = Path(__file__).parents[3] / "requirements" / "cuda.txt"
+    if not requirements.is_file():
+        pytest.skip("requirements/cuda.txt is not next to the tests")
+    pins = [
+        line.split("==", 1)[1].strip()
+        for line in requirements.read_text().splitlines()
+        if line.startswith("flashinfer-python==")
+    ]
+    assert pins == [shadow.STOCK_FLASHINFER_VERSION]
+
+
 def test_derive_spec_renames_and_replaces_only_the_shadowed_source(
     monkeypatch, tmp_path
 ):

@@ -4,8 +4,8 @@
   * limitations under the License.
   */
  
-+// Muse Spark shadow of FlashInfer v0.7.0.post1 csrc/xqa/mha.cu (md5
-+// b6dca30aa3afe606723e75f3d97ae8ae).
++// Muse Spark shadow of FlashInfer csrc/xqa/mha.cu (md5 b6dca30aa3afe606723e75f3d97ae8ae,
++// the same bytes in v0.7.0.post1 and v0.7.2.post1).
 +// The changes are the "Active merge" block in front of the Q load of kernel_mha_impl, the
 +// nbActiveSubSeq uses in its multi-block merge, and (MUSE_XQA_SPEC_ONE_WAVE, off unless the module
 +// is built with it) the split count of the spec-dec launch in launchMHAFlashInfer;

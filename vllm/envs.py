@@ -1696,7 +1696,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_MUSE_SPARK_SM120_PREFILL_OVERLAP_UBATCHES", "2")
     ),
     # Muse Spark on SM120: the FlashInfer XQA decode kernel (kernel_mha, FlashInfer
-    # 0.7.0.post1) launches one CTA per 256 tokens of --max-model-len (at most one per
+    # 0.7.2.post1) launches one CTA per 256 tokens of --max-model-len (at most one per
     # SM) per KV head, because it takes the maximum length from the width of the block
     # table, and its last CTA merges the partials of all of them whatever the context
     # is: 13.4 us per layer at batch 1 for 7 us of attention on a short context. On,
@@ -1706,7 +1706,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # kernel's. The patched module is compiled through FlashInfer's JIT under its own
     # name at the first XQA call (about 5 s per variant, cached; the ranks take turns
     # on FlashInfer's file lock) and the stock kernel runs when it cannot be built or
-    # FlashInfer is not 0.7.0.post1. Read once, when the model is constructed.
+    # FlashInfer is not 0.7.2.post1. Read once, when the model is constructed.
     "VLLM_MUSE_SPARK_SM120_XQA_ACTIVE_MERGE": lambda: bool(
         int(os.getenv("VLLM_MUSE_SPARK_SM120_XQA_ACTIVE_MERGE", "1"))
     ),

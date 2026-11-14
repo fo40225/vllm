@@ -54,8 +54,10 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-# The FlashInfer version every manifest in this package was taken from.
-STOCK_FLASHINFER_VERSION = "0.7.0.post1"
+# The FlashInfer version every manifest in this package was taken from (the pin of
+# requirements/cuda.txt; a bump of that pin needs the shadows rebased, see
+# xqa/stock.md5 and the stock file diff between the two tags).
+STOCK_FLASHINFER_VERSION = "0.7.2.post1"
 # Left in the build directory of a shadow that the compiler rejected.
 FAILED_MARKER = ".muse_shadow_failed"
 # Compiler output that blames the machine, not the source.
