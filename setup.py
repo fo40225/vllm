@@ -1633,6 +1633,8 @@ package_data = {
         "models/muse_spark/nvidia/csrc/*.cu",
         "models/muse_spark/nvidia/csrc/*.cuh",
         "models/muse_spark/nvidia/csrc/*.h",
+        # Muse Spark expert placement tables (one per model snapshot)
+        "models/muse_spark/nvidia/data/*.json",
         # Muse Spark shadow FlashInfer sources, compiled through FlashInfer's JIT
         "models/muse_spark/nvidia/flashinfer_shadow/xqa/*.cu",
         "models/muse_spark/nvidia/flashinfer_shadow/xqa/*.md5",

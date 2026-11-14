@@ -7,6 +7,8 @@ This module contains the ExpertMapManager class which manages expert ID
 mappings and placement strategies for Expert Parallelism in MoE models.
 """
 
+from typing import Literal
+
 import torch
 
 from vllm.config.parallel import ExpertPlacementStrategy
@@ -231,6 +233,9 @@ class ExpertMapManager:
             placement_strategy
         )
 
+        # Set by install_expert_map: the map is then not the one the strategy computes.
+        self._custom_expert_map = False
+
         # Calculate expert mappings
         self._calculate_expert_maps()
 
@@ -320,9 +325,10 @@ class ExpertMapManager:
         return self._expert_mask
 
     @property
-    def placement_strategy(self) -> ExpertPlacementStrategy:
-        """Expert placement strategy ('linear' or 'round_robin')."""
-        return self._placement_strategy
+    def placement_strategy(self) -> ExpertPlacementStrategy | Literal["custom"]:
+        """Expert placement strategy ('linear' or 'round_robin'), or 'custom' once a
+        map was installed with ``install_expert_map``."""
+        return "custom" if self._custom_expert_map else self._placement_strategy
 
     @property
     def routing_tables(
@@ -359,6 +365,46 @@ class ExpertMapManager:
             return True
         return self._expert_map[global_id] != -1
 
+    def get_local_expert_ids(self) -> list[int]:
+        """Get list of global IDs for experts on this rank."""
+        if self._expert_map is None:
+            return list(range(self.global_num_experts))
+
+        return torch.where(self._expert_map != -1)[0].tolist()
+
+    def install_expert_map(self, expert_map: torch.Tensor) -> None:
+        """Replace the global-to-local map of this rank by ``expert_map``.
+
+        For a placement that no strategy computes (e.g. a table made from routing
+        statistics). Install it before the weights load: ``map_global_to_local`` is
+        what puts every loaded expert into its local slot, and the kernels read the
+        same map to find the local routes. The new map must hold this rank's
+        ``local_num_experts`` experts in the slots ``0 .. local_num_experts - 1``, each
+        slot once, and lives on the device the layer's map is on (the caller's to
+        pick; the layer takes it up with ``RoutedExperts.update_expert_map_info``).
+        The routing keeps the global ids. The map cannot be recomputed afterwards
+        (``update`` refuses: the weights sit where it put them).
+        """
+        old = self._expert_map
+        if old is None:
+            raise ValueError("expert_map: there is no map to replace (EP is off)")
+        if tuple(expert_map.shape) != tuple(old.shape) or expert_map.dtype != old.dtype:
+            raise ValueError(
+                f"expert_map: expected {old.dtype} {tuple(old.shape)}, got "
+                f"{expert_map.dtype} {tuple(expert_map.shape)}"
+            )
+        slots = expert_map[expert_map >= 0].sort().values
+        if slots.numel() != self._local_num_experts - self.num_fused_shared_experts or (
+            slots != torch.arange(slots.numel(), dtype=slots.dtype, device=slots.device)
+        ).any():
+            raise ValueError(
+                "expert_map: the local slots must be each of 0 .. "
+                f"{self._local_num_experts - self.num_fused_shared_experts - 1} once"
+            )
+        # On the device the caller gives it: the layer registers it as its buffer.
+        self._expert_map = expert_map.contiguous()
+        self._custom_expert_map = True
+
     def update(
         self,
         moe_parallel_config: FusedMoEParallelConfig,
@@ -374,6 +420,12 @@ class ExpertMapManager:
                                  ep_rank, backend flags)
 
         """
+        if self._custom_expert_map:
+            raise RuntimeError(
+                "The expert map was installed with install_expert_map: it cannot be "
+                "recomputed for another EP configuration (the weights are loaded "
+                "for it)."
+            )
         self.moe_parallel_config = moe_parallel_config
         self.global_num_experts = global_num_experts
 
