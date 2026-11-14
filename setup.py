@@ -1628,6 +1628,11 @@ package_data = {
         "entrypoints/serve/instrumentator/static/*.js",
         "entrypoints/serve/instrumentator/static/*.css",
         "distributed/kv_transfer/kv_connector/v1/hf3fs/utils/*.cpp",
+        # Muse Spark JIT-built _muse_C extension sources
+        "models/muse_spark/nvidia/csrc/*.cpp",
+        "models/muse_spark/nvidia/csrc/*.cu",
+        "models/muse_spark/nvidia/csrc/*.cuh",
+        "models/muse_spark/nvidia/csrc/*.h",
         # Built-in multimodal chat template fallbacks (registry.py)
         "transformers_utils/chat_templates/*.jinja",
         "third_party/flash_linear_attention/LICENSE",

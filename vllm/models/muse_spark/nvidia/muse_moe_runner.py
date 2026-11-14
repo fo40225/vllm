@@ -68,6 +68,7 @@ from vllm.models.muse_spark.common.moe import (
     MuseSparkMoEConfig as CommonMuseSparkMoEConfig,
 )
 from vllm.models.muse_spark.common.ops.fused_finalize import fused_post_expert_finalize
+from vllm.models.muse_spark.nvidia.ops import muse_c
 from vllm.models.muse_spark.nvidia.ops.cute_dsl.moe_finalize_rmsnorm import (
     moe_finalize_with_rmsnorm,
     supports_moe_finalize,
@@ -77,9 +78,12 @@ from vllm.models.muse_spark.nvidia.ops.mnnvl_fusions import (
     tp_group_spans_nodes,
 )
 from vllm.models.muse_spark.nvidia.sm120_nvfp4_moe import (
+    B12X_MAX_TOKENS,
     MuseSparkSm120NvFp4Experts,
+    b12x_decode_engine_enabled,
     check_sm120_nvfp4_supported,
     make_sm120_nvfp4_quant_config,
+    swap_gate_up_halves_,
 )
 from vllm.platforms import current_platform
 
@@ -672,7 +676,15 @@ class MuseSparkModelOptNvFp4FusedMoE(ModelOptNvFp4FusedMoE):
         # Load the input scales of every expert, so that their global max (the
         # TRT-LLM semantics) is the same on all ranks under EP.
         self.use_global_sf = True
-        logger.info_once("MuseSpark NVFP4: native FP4 grouped GEMMs on SM120.")
+        # The CUDA graph and batch invariance settings are in scope here.
+        self.use_b12x_decode = b12x_decode_engine_enabled(moe_config.moe_backend)
+        logger.info_once(
+            "MuseSpark NVFP4: native FP4 MoE on SM120 with %s.",
+            f"b12x for up to {B12X_MAX_TOKENS} padded tokens in CUDA graphs and "
+            "CUTLASS grouped GEMMs otherwise"
+            if self.use_b12x_decode
+            else "CUTLASS grouped GEMMs",
+        )
 
     def process_weights_after_loading(self, layer: "MuseSparkRoutedExperts") -> None:
         if self.use_sm120_native:
@@ -746,9 +758,19 @@ class MuseSparkModelOptNvFp4FusedMoE(ModelOptNvFp4FusedMoE):
         self.moe_kernel.fused_experts.process_weights_after_loading(layer)
 
     def _process_sm120_native_weights(self, layer: "MuseSparkRoutedExperts") -> None:
-        # The packed weights are used as loaded. The generic ModelOpt flow would
-        # keep only column 0 of w13_weight_scale_2 [E, 2] and fuse the alphas
-        # into it in place; neither is acceptable here.
+        # The generic ModelOpt flow would keep only column 0 of w13_weight_scale_2
+        # [E, 2] and fuse the alphas into it in place; neither is acceptable here.
+        # The packed weights are used as loaded, except that a layer which runs
+        # the b12x engine reorders w13 to [up; gate] in place, before its block
+        # scales are swizzled. That layout needs the _muse_C extension, so it is
+        # loaded first: if it cannot be built, the layer keeps the checkpoint's
+        # order and the stock kernels.
+        # A weight reload (layerwise reload, refit) runs this again on freshly
+        # loaded tensors in the checkpoint's order, so swapping again is right.
+        up_gate_layout = self.use_b12x_decode and self._load_muse_c()
+        self.use_b12x_decode = up_gate_layout
+        if up_gate_layout:
+            swap_gate_up_halves_(layer.w13_weight.data, layer.w13_weight_scale.data)
         w13_scale, w2_scale, self.moe_quant_config = make_sm120_nvfp4_quant_config(
             layer.w13_weight_scale.data,
             layer.w2_weight_scale.data,
@@ -767,6 +789,28 @@ class MuseSparkModelOptNvFp4FusedMoE(ModelOptNvFp4FusedMoE):
             backend=NvFp4MoeBackend.VLLM_CUTLASS,
             routing_tables=layer._expert_routing_tables(),
         )
+        experts = self.moe_kernel.fused_experts
+        assert isinstance(experts, MuseSparkSm120NvFp4Experts)
+        experts.up_gate_layout = up_gate_layout
+        experts.use_b12x_decode = up_gate_layout
+        experts.process_weights_after_loading(layer)
+
+    @staticmethod
+    def _load_muse_c() -> bool:
+        # Build the JIT extension now, never inside a forward pass (or a CUDA
+        # graph capture).
+        try:
+            muse_c.load()
+        except Exception as e:
+            logger.warning_once(
+                "MuseSpark SM120 MoE: the _muse_C extension could not be built "
+                "(%s: %s); the b12x decode engine is off and the CUTLASS grouped "
+                "GEMMs run every batch.",
+                type(e).__name__,
+                e,
+            )
+            return False
+        return True
 
     def _process_hopper_marlin_weights(self, layer: "MuseSparkRoutedExperts") -> None:
         # Keep the SiLU gate input exact; the up-side gain is compensated in

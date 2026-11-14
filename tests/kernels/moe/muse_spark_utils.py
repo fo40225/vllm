@@ -101,8 +101,21 @@ def run_moe(runner, vllm_config, x, logits):
         return runner.forward(hidden_states=x, router_logits=logits)
 
 
-def assert_cudagraph_replays(runner, vllm_config, x, logits, next_x, next_logits):
-    """A captured forward replayed on new inputs matches an eager forward."""
+def assert_cudagraph_replays(
+    runner,
+    vllm_config,
+    x,
+    logits,
+    next_x,
+    next_logits,
+    *,
+    max_rel_l2: float | None = None,
+):
+    """A captured forward replayed on new inputs matches an eager forward.
+
+    Experts that are not bitwise deterministic pass ``max_rel_l2`` for a bound on
+    the relative L2 error instead of the default elementwise tolerance.
+    """
     with set_current_vllm_config(vllm_config), set_forward_context(None, vllm_config):
         # FlashInfer autotuning must happen before capture.
         for _ in range(3):
@@ -122,7 +135,11 @@ def assert_cudagraph_replays(runner, vllm_config, x, logits, next_x, next_logits
         x_static.copy_(next_x)
         logits_static.copy_(next_logits)
         graph.replay()
-    torch.testing.assert_close(out_static, expected)
+    if max_rel_l2 is None:
+        torch.testing.assert_close(out_static, expected)
+        return
+    error = (out_static.float() - expected.float()).norm() / expected.float().norm()
+    assert error <= max_rel_l2, f"replay differs from eager by {error:.4f} (rel L2)"
 
 
 def swiglu_moe_ref(
