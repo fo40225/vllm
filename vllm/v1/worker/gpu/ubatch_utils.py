@@ -265,15 +265,27 @@ def slice_model_inputs(
     return sliced
 
 
-def _cat_rows(parts: tuple[Any, ...]) -> Any:
+def _cat_rows(parts: list[Any]) -> Any:
     """Concatenate one output slot of the microbatches along the token dim.
 
     A slot is a tensor, or a list/tuple of tensors (the auxiliary hidden states of a
-    drafter, one tensor per tapped layer), merged element by element.
+    drafter, one tensor per tapped layer), merged element by element. The list
+    ``parts`` is consumed: an entry is dropped once merged, so that the pieces of a
+    tapped layer are freed before the next layer is merged, not all alive beside the
+    merged tensors (the taps of a full chunk are 6 x [T, 8192] bf16).
     """
     first = parts[0]
     if isinstance(first, (list, tuple)):
-        return type(first)(_cat_rows(column) for column in zip(*parts))
+        container, size = type(first), len(first)
+        del first
+        parts[:] = [list(part) for part in parts]
+        columns = []
+        for k in range(size):
+            column = [part[k] for part in parts]
+            for part in parts:
+                part[k] = None
+            columns.append(_cat_rows(column))
+        return container(columns)
     return torch.cat(parts, dim=0)
 
 
@@ -283,7 +295,8 @@ def merge_ubatch_outputs(outputs: list[Any]) -> Any:
     Models return hidden states, a tuple of those plus auxiliary hidden states
     (EAGLE3, DFlash: a list with one tensor per tapped layer), or IntermediateTensors
     on non-final pipeline ranks. Rows come back in batch order: the microbatches are
-    consecutive token slices.
+    consecutive token slices. ``outputs`` is consumed (its entries are released as
+    they are merged; see ``_cat_rows``): the caller keeps no other reference.
     """
     first = outputs[0]
     if isinstance(first, IntermediateTensors):
@@ -294,7 +307,17 @@ def merge_ubatch_outputs(outputs: list[Any]) -> Any:
             }
         )
     if isinstance(first, tuple):
-        return tuple(_cat_rows(slot) for slot in zip(*outputs))
+        size = len(first)
+        del first
+        per_ubatch = [list(out) for out in outputs]
+        outputs.clear()
+        slots = []
+        for k in range(size):
+            column = [out[k] for out in per_ubatch]
+            for out in per_ubatch:
+                out[k] = None
+            slots.append(_cat_rows(column))
+        return tuple(slots)
     return torch.cat(outputs, dim=0)
 
 
@@ -587,7 +610,9 @@ class UBatchRunner:
                 raise RuntimeError(
                     f"Microbatch {failed} of {self.num_ubatches} failed"
                 ) from errors[failed]
-            return merge_ubatch_outputs([outputs[i] for i in range(self.num_ubatches)])
+            return merge_ubatch_outputs(
+                [outputs.pop(i) for i in range(self.num_ubatches)]
+            )
 
         self._pending_finish = finish
         return finish

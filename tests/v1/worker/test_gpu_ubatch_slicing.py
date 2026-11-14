@@ -742,6 +742,42 @@ def test_merge_ubatch_outputs_keeps_the_structure_of_the_model_output():
     assert torch.equal(merged["hidden_states"], expected)
 
 
+def test_merge_ubatch_outputs_frees_the_pieces_tap_by_tap(monkeypatch):
+    """The microbatches' pieces of one tapped layer are freed before the next layer
+    is merged: at most one layer's merged tensor lives beside the unmerged pieces."""
+    import weakref
+
+    from vllm.v1.worker.gpu import ubatch_utils
+
+    num_taps = 5
+    pieces: list[list[weakref.ref]] = []
+
+    def make_output(rows):
+        hidden = torch.zeros(rows, 4)
+        taps = [torch.full((rows, 4), float(i)) for i in range(num_taps)]
+        pieces.append([weakref.ref(hidden), *[weakref.ref(t) for t in taps]])
+        return hidden, taps
+
+    outputs = [make_output(3), make_output(5)]
+    real_cat = torch.cat
+    alive_at_cat: list[int] = []
+
+    def counting_cat(tensors, dim=0):
+        alive_at_cat.append(sum(r() is not None for per in pieces for r in per))
+        return real_cat(tensors, dim=dim)
+
+    monkeypatch.setattr(ubatch_utils.torch, "cat", counting_cat)
+    hidden, taps = ubatch_utils.merge_ubatch_outputs(outputs)
+    monkeypatch.undo()
+
+    assert hidden.shape == (8, 4) and [t.shape[0] for t in taps] == [8] * num_taps
+    for i, tap in enumerate(taps):
+        assert torch.all(tap == float(i))
+    # Every cat sees only the pieces not yet merged: 12, 10, 8, ... of 12 pieces.
+    assert alive_at_cat == [12, 10, 8, 6, 4, 2]
+    assert all(r() is None for per in pieces for r in per)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="DBO needs a GPU")
 @pytest.mark.parametrize("failed_ubatch", [0, 1])
 def test_ubatch_runner_names_the_microbatch_that_failed(failed_ubatch):
