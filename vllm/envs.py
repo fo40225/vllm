@@ -172,9 +172,9 @@ if TYPE_CHECKING:
     VLLM_MUSE_SPARK_SM120_EXPERT_PLACEMENT_TABLE: str | None = None
     VLLM_MUSE_SPARK_SM120_DENSE_Q: bool = True
     VLLM_MUSE_SPARK_SM120_DECODE_GEMM: bool = True
-    VLLM_MUSE_SPARK_SM120_AUX_PLAN: bool = False
+    VLLM_MUSE_SPARK_SM120_AUX_PLAN: bool = True
     VLLM_MUSE_SPARK_SM120_AUX_PLAN_MAX_TOKENS: int = 64
-    VLLM_MUSE_SPARK_SM120_FUSED_NORM_QUANT: bool = False
+    VLLM_MUSE_SPARK_SM120_FUSED_NORM_QUANT: bool = True
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
     VLLM_ROCM_USE_AITER_LINEAR_HIPBMM: bool = False
     VLLM_ROCM_USE_AITER_MOE: bool = True
@@ -1754,16 +1754,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # pre-expert norm; the launch in front of the experts then only quantizes. The bytes of
     # the plan and of the map are the ones the preparation launch writes, so the output does
     # not change. Only where the routing already runs on the aux stream (CUDA graph
-    # capture, ``_routes_on_aux_stream``). Default off. Read when a decode graph is
-    # captured, so it must not change between a capture and its replay. It pays next to
-    # an external quantization only (a plan on the aux stream alone is 0 to 4 us per
-    # layer slower than the preparation launch), so it takes effect only where
-    # VLLM_MUSE_SPARK_SM120_FUSED_NORM_QUANT (or the communicator's quantizing gather)
-    # hands the kernel its quantized input: not at the sizes where the communicator's
-    # plain gather + norm kind serves (the host plugin up to 16 rows), and not without
-    # the flag.
+    # capture, ``_routes_on_aux_stream``). Default on (0 keeps the preparation
+    # launch). Read when a decode graph is captured, so it must not change between a
+    # capture and its replay. It pays next to an external quantization only (a plan on
+    # the aux stream alone is 0 to 4 us per layer slower than the preparation launch),
+    # so it takes effect only where VLLM_MUSE_SPARK_SM120_FUSED_NORM_QUANT (or the
+    # communicator's quantizing gather) hands the kernel its quantized input: not at
+    # the sizes where the communicator's plain gather + norm kind serves (the host
+    # plugin up to 16 rows), and not without that flag. Real weights, TP8 + EP8, host
+    # plugin, 3 alternating cold sessions per arm together with FUSED_NORM_QUANT, TPOT
+    # against the preparation launch: c64 -0.7 %, c128 -0.3 %, real-prompt c64 -0.9 %,
+    # c1 / c24 flat; two cold processes, 553 of 553 requests identical, and 40 of 40
+    # rows with a draft model.
     "VLLM_MUSE_SPARK_SM120_AUX_PLAN": lambda: bool(
-        int(os.getenv("VLLM_MUSE_SPARK_SM120_AUX_PLAN", "0"))
+        int(os.getenv("VLLM_MUSE_SPARK_SM120_AUX_PLAN", "1"))
     ),
     # Muse Spark on SM120: the largest padded decode batch whose plan is built on the aux
     # stream (VLLM_MUSE_SPARK_SM120_AUX_PLAN=1); larger batches keep the preparation launch
@@ -1786,11 +1790,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # CUDA mirror proven against it) and the codes and scales are the preparation launch's,
     # so the output does not change. Only where the layer's experts run that kernel in a
     # CUDA graph capture, and not where the TP communicator fuses the pooler gather with
-    # this norm (the host plugin up to 16 rows: the norm is hidden there). Default off. Read
-    # when a decode graph is captured, so it must not change between a capture and its
-    # replay.
+    # this norm (the host plugin up to 16 rows: the norm is hidden there). Default on (0
+    # keeps the Triton norm and the quantization in the preparation launch). Read when a
+    # decode graph is captured, so it must not change between a capture and its replay.
+    # Measured together with VLLM_MUSE_SPARK_SM120_AUX_PLAN (see there).
     "VLLM_MUSE_SPARK_SM120_FUSED_NORM_QUANT": lambda: bool(
-        int(os.getenv("VLLM_MUSE_SPARK_SM120_FUSED_NORM_QUANT", "0"))
+        int(os.getenv("VLLM_MUSE_SPARK_SM120_FUSED_NORM_QUANT", "1"))
     ),
     # Muse Spark on SM120: run the QKV projection and the sharded pooler / unpooler of up
     # to 64 rows (padded decode batches) as one kernel, ``_muse_C::decode_gemm``, instead

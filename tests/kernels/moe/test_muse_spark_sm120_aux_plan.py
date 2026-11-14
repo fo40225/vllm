@@ -622,11 +622,11 @@ def test_the_aux_plan_follows_the_quantization_ahead_of_the_kernel(
     assert moe._builds_large_plan(t)
 
 
-def test_the_flag_is_off_by_default(monkeypatch):
+def test_the_flag_is_on_by_default(monkeypatch):
     monkeypatch.delenv("VLLM_MUSE_SPARK_SM120_AUX_PLAN", raising=False)
-    assert envs.VLLM_MUSE_SPARK_SM120_AUX_PLAN is False
-    monkeypatch.setenv("VLLM_MUSE_SPARK_SM120_AUX_PLAN", "1")
     assert envs.VLLM_MUSE_SPARK_SM120_AUX_PLAN is True
+    monkeypatch.setenv("VLLM_MUSE_SPARK_SM120_AUX_PLAN", "0")
+    assert envs.VLLM_MUSE_SPARK_SM120_AUX_PLAN is False
 
 
 class _FakeRunner:
@@ -999,8 +999,9 @@ def test_the_norm_quantizes_for_the_large_batch_sizes_in_a_capture_only(
     monkeypatch.setenv("VLLM_MUSE_SPARK_SM120_FUSED_NORM_QUANT", "1")
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     assert not moe()._quantizes_in_norm(64)
-    monkeypatch.setenv("VLLM_MUSE_SPARK_SM120_FUSED_NORM_QUANT", "")
     monkeypatch.delenv("VLLM_MUSE_SPARK_SM120_FUSED_NORM_QUANT")
+    assert envs.VLLM_MUSE_SPARK_SM120_FUSED_NORM_QUANT is True  # on by default
+    monkeypatch.setenv("VLLM_MUSE_SPARK_SM120_FUSED_NORM_QUANT", "0")
     assert envs.VLLM_MUSE_SPARK_SM120_FUSED_NORM_QUANT is False
 
 
