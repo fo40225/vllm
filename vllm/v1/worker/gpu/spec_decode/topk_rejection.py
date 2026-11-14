@@ -27,7 +27,8 @@ verification of a request in one program:
   ``apply_top_k_top_p``), the target log-sum-exp is taken over it, a draft token that
   is not in it has target probability 0, the residual mass sums over it, and the
   resampled token is the Gumbel-max draw over it with the noise the full path keys by
-  (seed, position, token id). The acceptance uniform is keyed by (seed, position) too.
+  (seed, position, token id). The acceptance uniform is keyed by (seed with the draft
+  step mixed in, position), as the block method of ``_rejection_kernel``.
   So the draws are those of the full path for the same logits, up to the order in which
   fp32 terms are summed (the full path adds per 8192-column block, this adds in
   candidate order): a draw differs only where the acceptance uniform or the Gumbel
@@ -42,7 +43,11 @@ Everything is deterministic and free of host synchronisation.
 import torch
 
 from vllm.triton_utils import tl, tldevice, triton
-from vllm.v1.worker.gpu.sample.gumbel import gumbel_noised_argmax, tl_rand32
+from vllm.v1.worker.gpu.sample.gumbel import (
+    gumbel_noised_argmax,
+    spec_step_seed,
+    tl_rand32,
+)
 from vllm.v1.worker.gpu.sample.topk_logits import (
     _INT32_MAX,
     MAX_CANDIDATES,
@@ -270,7 +275,9 @@ def _topk_verify_kernel(
             draft_token = tl.load(draft_sampled_ptr + row + 1).to(tl.int64)
             verifying &= draft_token >= 0
             if verifying:
-                u = tl_rand32(seed, tl.load(pos_ptr + row), includes_zero=False)
+                u = tl_rand32(
+                    spec_step_seed(seed, i), tl.load(pos_ptr + row), includes_zero=False
+                )
                 value, token_id, keep = _target_row(
                     words_ptr,
                     capped_ptr,
